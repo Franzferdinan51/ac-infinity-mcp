@@ -5,7 +5,7 @@ from datetime import datetime
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from ac_infinity_mcp.schema import ACInfinityAuthError
+from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -81,40 +81,45 @@ class ACInfinityClient:
         ),
         reraise=True,
     )
-    def get_devices(self) -> list[dict] | None:
-        """Fetch all connected devices"""
+    def get_devices(self) -> list[dict]:
+        """Fetch all connected devices.
+
+        Returns:
+            List of raw device dicts from the AC Infinity API.
+
+        Raises:
+            ACInfinityAuthError: If not authenticated (token is None).
+            ACInfinityAPIError: If the API returns a non-200 code.
+            requests.exceptions.Timeout: After tenacity exhausts retries.
+            requests.exceptions.ConnectionError: After tenacity exhausts retries.
+        """
         if not self.token:
-            logger.warning("Cannot fetch devices: not authenticated")
-            return None
+            raise ACInfinityAuthError("Not authenticated — call authenticate() first")
 
-        try:
-            params = {"userId": self.token}
-            headers = {
-                "token": self.token,
-                "Host": "www.acinfinityserver.com",
-                "User-Agent": "okhttp/3.10.0",
-            }
+        params = {"userId": self.token}
+        headers = {
+            "token": self.token,
+            "Host": "www.acinfinityserver.com",
+            "User-Agent": "okhttp/3.10.0",
+        }
 
-            resp = self.session.post(
-                self.DEVICES_ENDPOINT, params=params, headers=headers, timeout=10
-            )
-            resp.raise_for_status()
+        resp = self.session.post(
+            self.DEVICES_ENDPOINT, params=params, headers=headers, timeout=10
+        )
+        resp.raise_for_status()
 
-            result = resp.json()
-            if result.get("code") != 200:
-                error_msg = result.get("msg", "Unknown error")
-                logger.error("Failed to get devices: %s", error_msg)
-                return None
+        result = resp.json()
+        if result.get("code") != 200:
+            error_msg = result.get("msg", "Unknown error")
+            code = result.get("code")
+            logger.error("Failed to get devices: %s", error_msg)
+            if code == 401:
+                raise ACInfinityAuthError(f"Token rejected by API (code 401): {error_msg}")
+            raise ACInfinityAPIError(f"API error {code}: {error_msg}")
 
-            devices = result.get("data", [])
-            logger.info("Fetched %d devices", len(devices))
-            return devices
-
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            raise  # let tenacity retry these
-        except Exception as e:
-            logger.error("Error fetching devices: %s", e)
-            return None
+        devices = result.get("data", [])
+        logger.info("Fetched %d devices", len(devices))
+        return devices
 
     @retry(
         stop=stop_after_attempt(3),
@@ -130,7 +135,7 @@ class ACInfinityClient:
         start_timestamp: int,
         end_timestamp: int,
         page_size: int = 2000,
-    ) -> list[dict] | None:
+    ) -> list[dict]:
         """Fetch historical sensor data from AC Infinity cloud API.
 
         Uses POST /api/log/dataPage.  The API ignores the pageNum parameter
@@ -146,11 +151,16 @@ class ACInfinityClient:
             page_size: Records per request (default 2000; API caps at ~1257/day)
 
         Returns:
-            List of raw history record dicts, or None on failure
+            List of raw history record dicts.
+
+        Raises:
+            ACInfinityAuthError: If not authenticated (token is None).
+            ACInfinityAPIError: If any pagination chunk returns a non-200 code.
+            requests.exceptions.Timeout: After tenacity exhausts retries.
+            requests.exceptions.ConnectionError: After tenacity exhausts retries.
         """
         if not self.token:
-            logger.warning("Cannot fetch history: not authenticated")
-            return None
+            raise ACInfinityAuthError("Not authenticated — call authenticate() first")
 
         all_records: list[dict] = []
         current_start = start_timestamp
@@ -158,57 +168,53 @@ class ACInfinityClient:
 
         while True:
             chunk_num += 1
-            try:
-                data = {
-                    "appId": self.token,
-                    "devId": dev_id,
-                    "time": current_start,
-                    "endTime": end_timestamp,
-                    "pageNum": 1,       # API ignores pageNum; always 1
-                    "pageSize": page_size,
-                }
-                headers = {
-                    "token": self.token,
-                    "Host": "www.acinfinityserver.com",
-                    "User-Agent": "okhttp/3.10.0",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                }
+            data = {
+                "appId": self.token,
+                "devId": dev_id,
+                "time": current_start,
+                "endTime": end_timestamp,
+                "pageNum": 1,       # API ignores pageNum; always 1
+                "pageSize": page_size,
+            }
+            headers = {
+                "token": self.token,
+                "Host": "www.acinfinityserver.com",
+                "User-Agent": "okhttp/3.10.0",
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            }
 
-                resp = self.session.post(
-                    self.HISTORY_ENDPOINT, data=data, headers=headers, timeout=30
+            resp = self.session.post(
+                self.HISTORY_ENDPOINT, data=data, headers=headers, timeout=30
+            )
+            resp.raise_for_status()
+
+            result = resp.json()
+            if result.get("code") != 200:
+                error_msg = result.get("msg", "Unknown error")
+                logger.error(
+                    "History fetch failed (chunk %d): %s", chunk_num, error_msg
                 )
-                resp.raise_for_status()
+                raise ACInfinityAPIError(
+                    f"API error {result.get('code')}: {error_msg}"
+                )
 
-                result = resp.json()
-                if result.get("code") != 200:
-                    logger.error(
-                        "History fetch failed (chunk %d): %s", chunk_num, result.get("msg")
-                    )
-                    break
-
-                rows = result.get("data", {}).get("rows", [])
-                if not rows:
-                    break
-
-                for row in rows:
-                    create_time = row.get("createTime", 0)
-                    if start_timestamp <= create_time <= end_timestamp:
-                        all_records.append(row)
-
-                if len(rows) < page_size:
-                    break
-
-                # Advance time cursor past the last record's timestamp
-                last_ts = rows[-1].get("createTime", 0)
-                if last_ts <= current_start or last_ts >= end_timestamp:
-                    break
-                current_start = last_ts + 1
-
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                raise  # let tenacity retry these
-            except Exception as e:
-                logger.error("Error fetching history chunk %d: %s", chunk_num, e)
+            rows = result.get("data", {}).get("rows", [])
+            if not rows:
                 break
+
+            for row in rows:
+                create_time = row.get("createTime", 0)
+                if start_timestamp <= create_time <= end_timestamp:
+                    all_records.append(row)
+
+            if len(rows) < page_size:
+                break
+
+            # Advance time cursor past the last record's timestamp
+            last_ts = rows[-1].get("createTime", 0)
+            if last_ts <= current_start or last_ts >= end_timestamp:
+                break
+            current_start = last_ts + 1
 
         logger.info(
             "Fetched %d history records for devId=%s in %d chunk(s)",

@@ -207,6 +207,9 @@ tempCodeRunnerFile.py
 .claude/settings*.json
 .claude/projects/
 
+# Throwaway scripts (API sniffers, one-shot utils)
+scripts/
+
 # Ruff stuff:
 .ruff_cache/
 

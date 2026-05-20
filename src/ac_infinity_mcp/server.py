@@ -16,7 +16,12 @@ from ac_infinity_mcp.analytics import (
     detect_trends,
 )
 from ac_infinity_mcp.client import ACInfinityClient
-from ac_infinity_mcp.schema import ACIReading, VPDTargets
+from ac_infinity_mcp.schema import (
+    ACInfinityAPIError,
+    ACInfinityAuthError,
+    ACIReading,
+    VPDTargets,
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -42,6 +47,19 @@ async def discover_devices() -> str:
     Discover all AC Infinity devices from the cloud API.
     Returns device IDs, names, and online status.
     Use this to find device_ids for use in other tools.
+
+    Returns:
+        JSON example::
+
+            {
+              "devices": [
+                {"device_id": "C58ZA", "device_name": "Towlie Tent", "status": "online"},
+                {"device_id": "D91XB", "device_name": "Veg Tent",    "status": "online"}
+              ]
+            }
+
+        Empty account returns ``{"devices": [], "message": "No devices found"}``.
+        On failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
         devices = await asyncio.to_thread(_client().get_devices)
@@ -59,8 +77,17 @@ async def discover_devices() -> str:
 
         return json.dumps({"devices": result}, indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in discover_devices: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in discover_devices: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in discover_devices: %s", e)
+        logger.error("Unexpected error in discover_devices: %s", e)
         return json.dumps({"error": str(e)})
 
 
@@ -72,11 +99,29 @@ async def get_device_reading(device_id: str) -> str:
 
     Args:
         device_id: The AC Infinity device code (from discover_devices)
+
+    Returns:
+        JSON example::
+
+            {
+              "timestamp": "2026-05-20T14:32:00Z",
+              "device_id": "C58ZA",
+              "device_name": "Towlie Tent",
+              "temperature_c": 24.3,
+              "temperature_f": 75.7,
+              "humidity": 58.2,
+              "vpd": 1.31,
+              "ports": [
+                {"port": 1, "name": "Inline Fan", "speed": 5, "load": 0},
+                ...
+              ],
+              "external_sensors": []
+            }
+
+        On failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
         devices = await asyncio.to_thread(_client().get_devices)
-        if not devices:
-            return json.dumps({"error": "Failed to fetch devices from AC Infinity"})
 
         device = next((d for d in devices if d.get("devCode") == device_id), None)
         if not device:
@@ -87,8 +132,17 @@ async def get_device_reading(device_id: str) -> str:
 
         return json.dumps(reading.to_dict(), indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in get_device_reading: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in get_device_reading: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in get_device_reading: %s", e)
+        logger.error("Unexpected error in get_device_reading: %s", e)
         return json.dumps({"error": str(e)})
 
 
@@ -117,8 +171,12 @@ async def get_historical_readings(
         time_end: Optional UTC time filter in HH:MM format (e.g., "16:15").
             If provided, only readings at or before this time are returned.
 
-    Returns: List of readings (filtered by time_start/time_end if provided) with
-        aggregated statistics (min/avg/max per metric)
+    Returns:
+        JSON with ``"readings"`` list and ``"statistics"`` summary. Each reading contains
+        timestamp, temperature_c/f, humidity, vpd, and ports list. Statistics include
+        min/avg/max per metric across the returned window. See docs/API.md for full shape.
+
+        On failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
         try:
@@ -137,8 +195,6 @@ async def get_historical_readings(
                 return json.dumps({"error": str(exc)})
 
         devices = await asyncio.to_thread(_client().get_devices)
-        if not devices:
-            return json.dumps({"error": "Failed to fetch devices from AC Infinity"})
 
         device = next((d for d in devices if d.get("devCode") == device_id), None)
         if not device:
@@ -241,8 +297,17 @@ async def get_historical_readings(
             "statistics": stats,
         }, indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in get_historical_readings: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in get_historical_readings: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in get_historical_readings: %s", e)
+        logger.error("Unexpected error in get_historical_readings: %s", e)
         return json.dumps({"error": str(e)})
 
 
@@ -254,6 +319,22 @@ async def check_vpd_drift(device_id: str, stage: str = "veg") -> str:
     Args:
         device_id: The AC Infinity device code (from discover_devices)
         stage: Growth stage - one of: clones, seedling, veg, early_flower, mid_flower, late_flower
+
+    Returns:
+        JSON example::
+
+            {
+              "device_id": "C58ZA",
+              "current_vpd": 1.58,
+              "target_range": [1.0, 1.5],
+              "stage": "veg",
+              "status": "HIGH",
+              "alert": "VPD 1.58 exceeds target 1.00-1.50. Increase circulation."
+            }
+
+        ``status`` is one of ``"OK"``, ``"LOW"``, or ``"HIGH"``.
+        ``alert`` is ``null`` when status is ``"OK"``.
+        On failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
         reading_json = await get_device_reading(device_id)
@@ -293,8 +374,17 @@ async def check_vpd_drift(device_id: str, stage: str = "veg") -> str:
             "alert": alert,
         }, indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in check_vpd_drift: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in check_vpd_drift: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in check_vpd_drift: %s", e)
+        logger.error("Unexpected error in check_vpd_drift: %s", e)
         return json.dumps({"error": str(e)})
 
 
@@ -304,11 +394,15 @@ async def get_all_device_readings() -> str:
     Get current sensor readings for all AC Infinity devices.
     Useful for a full status check across all controllers.
     Returns a list of readings keyed by device_id.
+
+    Returns:
+        JSON with ``"readings"`` list — one entry per device, same shape as
+        ``get_device_reading``. Devices that fail to parse individually include
+        an ``"error"`` key instead of sensor fields.
+        On auth/API failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
         devices = await asyncio.to_thread(_client().get_devices)
-        if not devices:
-            return json.dumps({"error": "Failed to fetch devices from AC Infinity"})
 
         readings = []
         for device in devices:
@@ -330,8 +424,17 @@ async def get_all_device_readings() -> str:
 
         return json.dumps({"readings": readings}, indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in get_all_device_readings: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in get_all_device_readings: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in get_all_device_readings: %s", e)
+        logger.error("Unexpected error in get_all_device_readings: %s", e)
         return json.dumps({"error": str(e)})
 
 
@@ -365,8 +468,17 @@ async def get_environment_health(device_id: str, stage: str = "veg") -> str:
         result["stage"] = stage
         return json.dumps(result, indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in get_environment_health: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in get_environment_health: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in get_environment_health: %s", e)
+        logger.error("Unexpected error in get_environment_health: %s", e)
         return json.dumps({"error": str(e)})
 
 
@@ -410,8 +522,17 @@ async def detect_environment_trends(device_id: str, days: int = 7) -> str:
             "trends": [dataclasses.asdict(t) for t in trends],
         }, indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in detect_environment_trends: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in detect_environment_trends: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in detect_environment_trends: %s", e)
+        logger.error("Unexpected error in detect_environment_trends: %s", e)
         return json.dumps({"error": str(e)})
 
 
@@ -451,8 +572,17 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
             "ports": [dataclasses.asdict(p) for p in ports],
         }, indent=2)
 
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in get_port_activity_report: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in get_port_activity_report: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
-        logger.error("Error in get_port_activity_report: %s", e)
+        logger.error("Unexpected error in get_port_activity_report: %s", e)
         return json.dumps({"error": str(e)})
 
 

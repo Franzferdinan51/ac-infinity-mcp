@@ -81,6 +81,25 @@ All checks are required to pass before merge.
 
 ---
 
+## Branch Protection (main)
+
+The following GitHub branch protection rules are required on `main`:
+
+| Rule | Setting |
+|------|---------|
+| Require status checks to pass | ✅ Required |
+| Required checks | `test (3.11)`, `test (3.12)`, `Analyze Python` |
+| Require branches to be up to date | ✅ Required |
+| Dismiss stale reviews on new push | ✅ Required |
+| Require linear history | ✅ Required |
+| Restrict direct pushes to main | ✅ Enabled (no direct pushes) |
+
+These rules are enforced in GitHub Settings → Branches → Branch protection rules.
+All CI checks + CodeQL must pass and the branch must be up-to-date with main before
+any PR can be merged.
+
+---
+
 ## API Quirk Documentation
 
 The AC Infinity cloud API has 15 documented quirks that affect correct implementation.

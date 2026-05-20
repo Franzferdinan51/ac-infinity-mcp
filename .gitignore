@@ -203,8 +203,9 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
-# Claude Code
-.claude/
+# Claude Code settings (plan files in .claude/ are tracked intentionally)
+.claude/settings*.json
+.claude/projects/
 
 # Ruff stuff:
 .ruff_cache/

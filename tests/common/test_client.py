@@ -5,6 +5,7 @@ import requests
 import responses as responses_lib
 
 from ac_infinity_mcp.client import ACInfinityClient
+from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError
 from tests.fixtures.mock_api_responses import (
     AUTH_FAILURE,
     AUTH_SUCCESS,
@@ -257,22 +258,55 @@ def test_get_devices_empty(authed_client):
 
 
 def test_get_devices_not_authenticated(client):
-    result = client.get_devices()
-    assert result is None
+    with pytest.raises(ACInfinityAuthError):
+        client.get_devices()
 
 
 @responses_lib.activate
 def test_get_devices_api_error_code(authed_client):
     responses_lib.add(responses_lib.POST, DEVICES_URL, json=DEVICES_API_ERROR, status=200)
-    result = authed_client.get_devices()
-    assert result is None
+    with pytest.raises(ACInfinityAPIError):
+        authed_client.get_devices()
 
 
 @responses_lib.activate
 def test_get_devices_http_error(authed_client):
     responses_lib.add(responses_lib.POST, DEVICES_URL, status=503)
-    result = authed_client.get_devices()
-    assert result is None
+    with pytest.raises(requests.exceptions.HTTPError):
+        authed_client.get_devices()
+
+
+@responses_lib.activate
+def test_get_devices_code_401_raises_auth_error(authed_client):
+    responses_lib.add(
+        responses_lib.POST,
+        DEVICES_URL,
+        json={"code": 401, "msg": "Unauthorized"},
+        status=200,
+    )
+    with pytest.raises(ACInfinityAuthError, match="Token rejected"):
+        authed_client.get_devices()
+
+
+@responses_lib.activate
+def test_get_devices_code_500_raises_api_error(authed_client):
+    responses_lib.add(
+        responses_lib.POST,
+        DEVICES_URL,
+        json={"code": 500, "msg": "Internal server error"},
+        status=200,
+    )
+    with pytest.raises(ACInfinityAPIError, match="API error 500"):
+        authed_client.get_devices()
+
+
+def test_get_devices_auth_error_makes_no_http_call(client):
+    """Token=None check happens before any HTTP call."""
+    import responses as _r
+    with _r.RequestsMock() as rsps:
+        with pytest.raises(ACInfinityAuthError):
+            client.get_devices()
+        assert len(rsps.calls) == 0
 
 
 # ============ get_historical_data ============
@@ -353,10 +387,24 @@ def test_get_historical_data_empty(authed_client):
 
 
 def test_get_historical_data_not_authenticated(client):
-    result = client.get_historical_data(
-        dev_id="12345", start_timestamp=1714000000, end_timestamp=1714086400
+    with pytest.raises(ACInfinityAuthError):
+        client.get_historical_data(
+            dev_id="12345", start_timestamp=1714000000, end_timestamp=1714086400
+        )
+
+
+@responses_lib.activate
+def test_get_historical_data_api_error_raises(authed_client):
+    responses_lib.add(
+        responses_lib.POST,
+        HISTORY_URL,
+        json={"code": 500, "msg": "Server fault"},
+        status=200,
     )
-    assert result is None
+    with pytest.raises(ACInfinityAPIError, match="API error 500"):
+        authed_client.get_historical_data(
+            dev_id="12345", start_timestamp=1714000000, end_timestamp=1714086400
+        )
 
 
 @responses_lib.activate

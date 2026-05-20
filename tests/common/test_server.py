@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError
 from ac_infinity_mcp.server import (
     _filter_readings_by_time,
     _parse_duration_seconds,
@@ -60,12 +61,25 @@ async def test_discover_devices_empty(mock_client):
     assert data["devices"] == []
 
 
-async def test_discover_devices_none(mock_client):
-    mock_client.get_devices.return_value = None
+async def test_discover_devices_api_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAPIError("API error 500: server fault")
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await discover_devices()
     data = json.loads(result)
-    assert data["devices"] == []
+    assert data["error"] == "AC Infinity API error"
+    assert "detail" in data
+
+
+async def test_discover_devices_auth_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAuthError("Not authenticated")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await discover_devices()
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+    assert "detail" in data
+    # Verify no actual credential values appear in the response
+    assert "test@example.com" not in result
+    assert "testpassword123" not in result
 
 
 async def test_discover_devices_online_offline_status(mock_client):
@@ -108,12 +122,22 @@ async def test_get_device_reading_device_not_found(mock_client):
     assert "NOTEXIST" in data["error"]
 
 
-async def test_get_device_reading_no_devices(mock_client):
-    mock_client.get_devices.return_value = None
+async def test_get_device_reading_api_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAPIError("API error 500: server fault")
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await get_device_reading("C58ZA")
     data = json.loads(result)
-    assert "error" in data
+    assert data["error"] == "AC Infinity API error"
+    assert "detail" in data
+
+
+async def test_get_device_reading_auth_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAuthError("Not authenticated")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_device_reading("C58ZA")
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+    assert "detail" in data
 
 
 # ============ get_all_device_readings ============
@@ -128,12 +152,22 @@ async def test_get_all_device_readings_success(mock_client):
     assert len(data["readings"]) == 2
 
 
-async def test_get_all_device_readings_no_devices(mock_client):
-    mock_client.get_devices.return_value = None
+async def test_get_all_device_readings_api_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAPIError("API error 500: server fault")
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await get_all_device_readings()
     data = json.loads(result)
-    assert "error" in data
+    assert data["error"] == "AC Infinity API error"
+    assert "detail" in data
+
+
+async def test_get_all_device_readings_auth_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAuthError("Not authenticated")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_all_device_readings()
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+    assert "detail" in data
 
 
 async def test_get_all_device_readings_parse_error_isolated(mock_client):

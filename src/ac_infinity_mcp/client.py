@@ -1,0 +1,318 @@
+import logging
+import time
+from datetime import datetime
+
+import requests
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from ac_infinity_mcp.schema import ACInfinityAuthError
+
+logger = logging.getLogger(__name__)
+
+
+class ACInfinityClient:
+    """Client for AC Infinity cloud API"""
+
+    BASE_URL = "http://www.acinfinityserver.com/api"
+    LOGIN_ENDPOINT = f"{BASE_URL}/user/appUserLogin"
+    DEVICES_ENDPOINT = f"{BASE_URL}/user/devInfoListAll"
+    HISTORY_ENDPOINT = f"{BASE_URL}/log/dataPage"
+    MODE_SETTINGS_ENDPOINT = f"{BASE_URL}/dev/getdevModeSettingList"
+    ADD_DEV_MODE_ENDPOINT = f"{BASE_URL}/dev/addDevMode"
+    MODE_AND_SETTING_ENDPOINT = f"{BASE_URL}/dev/modeAndSetting"
+
+    def __init__(self, email: str, password: str):
+        self.email = email
+        self.password = password[:25]  # API silently truncates to 25 chars
+        self.token: str | None = None
+        self.session = requests.Session()
+        self._last_write_time: float = 0.0
+
+    def _enforce_write_rate_limit(self) -> None:
+        """Enforce 1.5s minimum between write API calls (returns 403 if exceeded)."""
+        elapsed = time.monotonic() - self._last_write_time
+        if elapsed < 1.5:
+            time.sleep(1.5 - elapsed)
+        self._last_write_time = time.monotonic()
+
+    def authenticate(self) -> bool:
+        """Login and get API token"""
+        try:
+            # NOTE: API parameter name has intentional typo — 'appPasswordl' with 'l' at end
+            data = {
+                "appEmail": self.email,
+                "appPasswordl": self.password,
+            }
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+                "User-Agent": "ACController/1.8.2 (com.acinfinity.humiture; build:489; iOS 16.5.1)",
+            }
+
+            resp = self.session.post(self.LOGIN_ENDPOINT, data=data, headers=headers, timeout=10)
+            resp.raise_for_status()
+
+            result = resp.json()
+            if result.get("code") != 200:
+                error_msg = result.get("msg", "Unknown error")
+                logger.error("AC Infinity login failed: %s", error_msg)
+                raise ACInfinityAuthError(f"Authentication failed: {error_msg}")
+
+            self.token = result["data"]["appId"]
+            logger.info("AC Infinity authentication successful")
+            return True
+
+        except requests.exceptions.Timeout:
+            logger.error("AC Infinity authentication timeout (10s)")
+            return False
+        except requests.exceptions.ConnectionError as e:
+            logger.error("Failed to connect to AC Infinity: %s", e)
+            return False
+        except ACInfinityAuthError:
+            return False
+        except Exception as e:
+            logger.error("AC Infinity authentication error: %s", e)
+            return False
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+        ),
+        reraise=True,
+    )
+    def get_devices(self) -> list[dict] | None:
+        """Fetch all connected devices"""
+        if not self.token:
+            logger.warning("Cannot fetch devices: not authenticated")
+            return None
+
+        try:
+            params = {"userId": self.token}
+            headers = {
+                "token": self.token,
+                "Host": "www.acinfinityserver.com",
+                "User-Agent": "okhttp/3.10.0",
+            }
+
+            resp = self.session.post(
+                self.DEVICES_ENDPOINT, params=params, headers=headers, timeout=10
+            )
+            resp.raise_for_status()
+
+            result = resp.json()
+            if result.get("code") != 200:
+                error_msg = result.get("msg", "Unknown error")
+                logger.error("Failed to get devices: %s", error_msg)
+                return None
+
+            devices = result.get("data", [])
+            logger.info("Fetched %d devices", len(devices))
+            return devices
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            raise  # let tenacity retry these
+        except Exception as e:
+            logger.error("Error fetching devices: %s", e)
+            return None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+        ),
+        reraise=True,
+    )
+    def get_historical_data(
+        self,
+        dev_id: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        page_size: int = 2000,
+    ) -> list[dict] | None:
+        """Fetch historical sensor data from AC Infinity cloud API.
+
+        Uses POST /api/log/dataPage.  The API ignores the pageNum parameter
+        and always returns the first page_size records starting at 'time'.
+        To retrieve more records than page_size, we use time-cursor pagination:
+        after each fetch the next request's 'time' is set to the last returned
+        record's createTime + 1.
+
+        Args:
+            dev_id: Device ID (devId field from devInfoListAll — string or int)
+            start_timestamp: Unix timestamp (seconds) for start of range
+            end_timestamp: Unix timestamp (seconds) for end of range
+            page_size: Records per request (default 2000; API caps at ~1257/day)
+
+        Returns:
+            List of raw history record dicts, or None on failure
+        """
+        if not self.token:
+            logger.warning("Cannot fetch history: not authenticated")
+            return None
+
+        all_records: list[dict] = []
+        current_start = start_timestamp
+        chunk_num = 0
+
+        while True:
+            chunk_num += 1
+            try:
+                data = {
+                    "appId": self.token,
+                    "devId": dev_id,
+                    "time": current_start,
+                    "endTime": end_timestamp,
+                    "pageNum": 1,       # API ignores pageNum; always 1
+                    "pageSize": page_size,
+                }
+                headers = {
+                    "token": self.token,
+                    "Host": "www.acinfinityserver.com",
+                    "User-Agent": "okhttp/3.10.0",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+                }
+
+                resp = self.session.post(
+                    self.HISTORY_ENDPOINT, data=data, headers=headers, timeout=30
+                )
+                resp.raise_for_status()
+
+                result = resp.json()
+                if result.get("code") != 200:
+                    logger.error(
+                        "History fetch failed (chunk %d): %s", chunk_num, result.get("msg")
+                    )
+                    break
+
+                rows = result.get("data", {}).get("rows", [])
+                if not rows:
+                    break
+
+                for row in rows:
+                    create_time = row.get("createTime", 0)
+                    if start_timestamp <= create_time <= end_timestamp:
+                        all_records.append(row)
+
+                if len(rows) < page_size:
+                    break
+
+                # Advance time cursor past the last record's timestamp
+                last_ts = rows[-1].get("createTime", 0)
+                if last_ts <= current_start or last_ts >= end_timestamp:
+                    break
+                current_start = last_ts + 1
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                raise  # let tenacity retry these
+            except Exception as e:
+                logger.error("Error fetching history chunk %d: %s", chunk_num, e)
+                break
+
+        logger.info(
+            "Fetched %d history records for devId=%s in %d chunk(s)",
+            len(all_records),
+            dev_id,
+            chunk_num,
+        )
+        return all_records
+
+    def parse_device_data(self, device_data: dict, role: str | None = None) -> dict:
+        """Extract readable values from AC Infinity device response"""
+        info = device_data.get("deviceInfo", {})
+
+        # API returns values * 100 — divide to get actual readings
+        temp_c = info.get("temperature", 0) / 100.0
+        temp_f = info.get("temperatureF", 0) / 100.0
+        humidity = info.get("humidity", 0) / 100.0
+        vpd = round(info.get("vpdnums", 0) / 100.0, 2)
+
+        raw_ports = info.get("ports", [])
+        ports = [
+            {
+                "port": p.get("port"),
+                "name": p.get("portName", f"Port {p.get('port')}"),
+                "speed": p.get("speak", 0),  # 0-10 scale from API
+                "load": p.get("portsLoad", 0),
+            }
+            for p in raw_ports
+        ]
+
+        sensors = info.get("sensors")
+        external = []
+        if sensors:
+            external = [
+                {
+                    "sensor_id": f"{s.get('accessPort')}.{s.get('sensorType')}",
+                    "value": s.get("sensorData", 0) / 100.0,
+                }
+                for s in sensors
+            ]
+
+        return {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "device_id": device_data.get("devCode"),
+            "device_name": device_data.get("devName", "Unknown"),
+            "temperature_c": round(temp_c, 1),
+            "temperature_f": round(temp_f, 1),
+            "humidity": round(humidity, 1),
+            "vpd": vpd,
+            "ports": ports,
+            "external_sensors": external,
+        }
+
+    def parse_history_record(
+        self, record: dict, port_names: dict[int, str] | None = None
+    ) -> dict:
+        """Parse a historical data record from the AC Infinity API.
+
+        The API encodes port data as bitmask integers rather than a ports array:
+        - ``portSpead``: 4 bits (one nibble) per port, LSB = Port 1.
+          Values 0-10 are fan/dimmer speeds; 0xF (15) means ON for
+          on/off devices (lights, heaters, humidifiers, heat pads).
+        - ``portStatus``: 1 bit per port, LSB = Port 1.  Indicates
+          whether the port was actively triggered by automation.
+
+        Args:
+            record: Raw historical record from get_historical_data API call
+            port_names: Optional mapping of port number -> name from live
+                device info.  When provided the names are attached to
+                each decoded port entry.
+
+        Returns:
+            Dict with parsed timestamp, temperature, humidity, VPD, and port data
+        """
+        create_time = record.get("createTime", 0)
+        timestamp = (
+            datetime.utcfromtimestamp(int(create_time)).isoformat() + "Z"
+            if create_time
+            else None
+        )
+
+        # Decode port speeds from portSpead bitmask (4 bits per port)
+        port_spead = record.get("portSpead", 0) or 0
+        port_status = record.get("portStatus", 0) or 0
+        port_count = record.get("devPortCount") or 8
+
+        ports = []
+        for i in range(port_count):
+            nibble = (port_spead >> (i * 4)) & 0xF
+            on = bool((port_status >> i) & 1) or nibble > 0
+            speed = 1 if nibble == 0xF else nibble  # 0xF = ON for toggle devices
+            name = (port_names or {}).get(i + 1, f"Port {i + 1}")
+            ports.append({
+                "port": i + 1,
+                "name": name,
+                "speed": speed,
+                "on": on,
+            })
+
+        return {
+            "timestamp": timestamp,
+            "temperature_c": round(record.get("temperature", 0) / 100.0, 1),
+            "temperature_f": round(record.get("fTemperature", 0) / 100.0, 1),
+            "humidity": round(record.get("humidity", 0) / 100.0, 1),
+            "vpd": round(record.get("vpdNums", 0) / 100.0, 2),
+            "ports": ports,
+        }

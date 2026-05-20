@@ -1,13 +1,20 @@
 import asyncio
+import dataclasses
 import json
 import logging
 import os
 import re
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
 
+from ac_infinity_mcp.analytics import (
+    STAGE_TARGETS,
+    build_activity_report,
+    calculate_health_score,
+    detect_trends,
+)
 from ac_infinity_mcp.client import ACInfinityClient
 from ac_infinity_mcp.schema import ACIReading, VPDTargets
 
@@ -325,6 +332,127 @@ async def get_all_device_readings() -> str:
 
     except Exception as e:
         logger.error("Error in get_all_device_readings: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def get_environment_health(device_id: str, stage: str = "veg") -> str:
+    """
+    Calculate composite environment health score (0–100) for a device.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+        stage: Growth stage — one of: clones, seedling, veg,
+               early_flower, mid_flower, late_flower. Default: veg.
+
+    Returns:
+        JSON with score (0–100), grade (A–F), per-metric sub-scores,
+        and a top actionable recommendation.
+    """
+    try:
+        if stage not in STAGE_TARGETS:
+            valid = ", ".join(STAGE_TARGETS)
+            return json.dumps({"error": f"Unknown stage: {stage}. Valid: {valid}"})
+
+        reading_json = await get_device_reading(device_id)
+        reading = json.loads(reading_json)
+        if "error" in reading:
+            return json.dumps(reading)
+
+        health = calculate_health_score(reading, stage)
+        result = dataclasses.asdict(health)
+        result["device_id"] = device_id
+        result["stage"] = stage
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        logger.error("Error in get_environment_health: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def detect_environment_trends(device_id: str, days: int = 7) -> str:
+    """
+    Detect linear trends in temperature, humidity, and VPD over a look-back window.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+        days: Number of days to look back. Default: 7. Must be 1–30.
+
+    Returns:
+        JSON with per-metric trend reports: slope (change/hour), direction,
+        7-day projection, and alert flag.
+
+    Note:
+        The AC Infinity history API returns a maximum of ~1257 records per day
+        regardless of page_size. For longer windows the data may be sparse.
+    """
+    try:
+        if not 1 <= days <= 30:
+            return json.dumps({"error": "days must be between 1 and 30"})
+
+        today = datetime.utcnow()
+        start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        end_date = today.strftime("%Y-%m-%d")
+
+        hist_json = await get_historical_readings(device_id, start_date, end_date, "1h")
+        hist = json.loads(hist_json)
+        if "error" in hist:
+            return json.dumps(hist)
+
+        readings = hist.get("readings", [])
+        trends = detect_trends(readings, days)
+
+        return json.dumps({
+            "device_id": device_id,
+            "days_analyzed": days,
+            "readings_used": len(readings),
+            "trends": [dataclasses.asdict(t) for t in trends],
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("Error in detect_environment_trends: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def get_port_activity_report(device_id: str, days: int = 7) -> str:
+    """
+    Build a per-port runtime activity report from historical data.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+        days: Number of days to analyze. Default: 7. Must be 1–30.
+
+    Returns:
+        JSON with per-port on_hours, off_hours, transitions, avg_speed_when_running,
+        uptime_pct, and peak_hour (UTC).
+    """
+    try:
+        if not 1 <= days <= 30:
+            return json.dumps({"error": "days must be between 1 and 30"})
+
+        today = datetime.utcnow()
+        start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        end_date = today.strftime("%Y-%m-%d")
+
+        hist_json = await get_historical_readings(device_id, start_date, end_date, "raw")
+        hist = json.loads(hist_json)
+        if "error" in hist:
+            return json.dumps(hist)
+
+        readings = hist.get("readings", [])
+        ports = build_activity_report(readings)
+
+        return json.dumps({
+            "device_id": device_id,
+            "days_analyzed": days,
+            "readings_used": len(readings),
+            "ports": [dataclasses.asdict(p) for p in ports],
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("Error in get_port_activity_report: %s", e)
         return json.dumps({"error": str(e)})
 
 

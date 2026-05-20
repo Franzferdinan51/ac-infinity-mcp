@@ -11,10 +11,13 @@ from ac_infinity_mcp.server import (
     apply_sampling,
     average_readings,
     check_vpd_drift,
+    detect_environment_trends,
     discover_devices,
     get_all_device_readings,
     get_device_reading,
+    get_environment_health,
     get_historical_readings,
+    get_port_activity_report,
     mcp_server,
 )
 from tests.conftest import MOCK_DEVICE_LEGACY
@@ -462,3 +465,262 @@ def test_average_readings_with_ports():
     result = average_readings(readings)
     assert len(result["ports"]) == 1
     assert result["ports"][0]["speed"] == 5.0
+
+
+# ============ get_environment_health ============
+
+async def test_get_environment_health_happy_path(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_environment_health("C58ZA", "veg")
+    data = json.loads(result)
+    assert "score" in data
+    assert "grade" in data
+    assert 0 <= data["score"] <= 100
+    assert data["grade"] in ("A", "B", "C", "D", "F")
+    assert "top_recommendation" in data
+    assert data["device_id"] == "C58ZA"
+    assert data["stage"] == "veg"
+
+
+async def test_get_environment_health_bad_stage(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_environment_health("C58ZA", "bloom")
+    data = json.loads(result)
+    assert "error" in data
+    assert "bloom" in data["error"]
+    assert "Unknown stage" in data["error"]
+
+
+async def test_get_environment_health_unknown_device(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_environment_health("NOTEXIST", "veg")
+    data = json.loads(result)
+    assert "error" in data
+    assert "NOTEXIST" in data["error"]
+
+
+async def test_get_environment_health_temp_out_of_range(mock_client):
+    mock_client.parse_device_data.return_value = {
+        **mock_client.parse_device_data.return_value,
+        "temperature_c": 35.0,
+        "vpd": 1.24,
+        "humidity": 60.0,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_environment_health("C58ZA", "veg")
+    data = json.loads(result)
+    assert "temperature" in data["top_recommendation"].lower() or data["temp_score"] < 100
+
+
+async def test_get_environment_health_vpd_low_recommendation(mock_client):
+    mock_client.parse_device_data.return_value = {
+        **mock_client.parse_device_data.return_value,
+        "vpd": 0.3,
+        "temperature_c": 24.0,
+        "humidity": 60.0,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_environment_health("C58ZA", "veg")
+    data = json.loads(result)
+    assert "VPD is low" in data["top_recommendation"]
+
+
+# ============ detect_environment_trends ============
+
+def _make_hourly_readings(n: int = 7) -> list[dict]:
+    """Generate n hourly readings for trend tests."""
+    from datetime import datetime, timedelta
+    base = datetime(2024, 4, 18, 0, 0, 0)
+    return [
+        {
+            "timestamp": (base + timedelta(hours=i)).isoformat() + "Z",
+            "temperature_c": 24.0,
+            "humidity": 55.0,
+            "vpd": 1.4,
+            "ports": [],
+        }
+        for i in range(n)
+    ]
+
+
+async def test_detect_environment_trends_happy_path(mock_client):
+    readings = _make_hourly_readings(7)
+    mock_client.get_historical_data.return_value = [{}] * 7
+    mock_client.parse_history_record.side_effect = lambda r, port_names=None: readings[0]
+
+    hist_payload = json.dumps({
+        "device_id": "C58ZA",
+        "readings": readings,
+        "statistics": {},
+    })
+
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=hist_payload):
+            result = await detect_environment_trends("C58ZA", 7)
+
+    data = json.loads(result)
+    assert data["device_id"] == "C58ZA"
+    assert data["days_analyzed"] == 7
+    assert len(data["trends"]) == 3
+    for trend in data["trends"]:
+        assert "metric" in trend
+        assert "slope" in trend
+        assert "direction" in trend
+        assert "alert" in trend
+
+
+async def test_detect_environment_trends_days_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await detect_environment_trends("C58ZA", 0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "days must be between 1 and 30" in data["error"]
+
+
+async def test_detect_environment_trends_days_thirty_one(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await detect_environment_trends("C58ZA", 31)
+    data = json.loads(result)
+    assert "error" in data
+    assert "days must be between 1 and 30" in data["error"]
+
+
+async def test_detect_environment_trends_historical_error_propagated(mock_client):
+    error_payload = json.dumps({"error": "Device NOTEXIST not found"})
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=error_payload):
+            result = await detect_environment_trends("NOTEXIST", 7)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_detect_environment_trends_single_reading_flat(mock_client):
+    single = [_make_hourly_readings(1)[0]]
+    hist_payload = json.dumps({
+        "device_id": "C58ZA",
+        "readings": single,
+        "statistics": {},
+    })
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=hist_payload):
+            result = await detect_environment_trends("C58ZA", 1)
+    data = json.loads(result)
+    assert data["readings_used"] == 1
+    for trend in data["trends"]:
+        assert trend["slope"] == 0.0
+        assert trend["direction"] == "flat"
+
+
+# ============ get_port_activity_report ============
+
+def _make_port_readings(n: int, speed: int, on: bool) -> list[dict]:
+    from datetime import datetime, timedelta
+    base = datetime(2024, 4, 18, 0, 0, 0)
+    return [
+        {
+            "timestamp": (base + timedelta(hours=i)).isoformat() + "Z",
+            "temperature_c": 24.0,
+            "humidity": 55.0,
+            "vpd": 1.4,
+            "ports": [{"port": 1, "name": "Inline Fan", "speed": speed, "on": on}],
+        }
+        for i in range(n)
+    ]
+
+
+async def test_get_port_activity_report_happy_path(mock_client):
+    readings = _make_port_readings(24, speed=5, on=True)
+    hist_payload = json.dumps({
+        "device_id": "C58ZA",
+        "readings": readings,
+        "statistics": {},
+    })
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=hist_payload):
+            result = await get_port_activity_report("C58ZA", 1)
+    data = json.loads(result)
+    assert data["device_id"] == "C58ZA"
+    assert data["days_analyzed"] == 1
+    assert len(data["ports"]) == 1
+    port = data["ports"][0]
+    assert "on_hours" in port
+    assert "uptime_pct" in port
+    assert "transitions" in port
+
+
+async def test_get_port_activity_report_days_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_activity_report("C58ZA", 0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "days must be between 1 and 30" in data["error"]
+
+
+async def test_get_port_activity_report_days_thirty_one(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_activity_report("C58ZA", 31)
+    data = json.loads(result)
+    assert "error" in data
+    assert "days must be between 1 and 30" in data["error"]
+
+
+async def test_get_port_activity_report_no_ports(mock_client):
+    readings = [
+        {
+            "timestamp": "2024-04-18T00:00:00Z",
+            "temperature_c": 24.0,
+            "humidity": 55.0,
+            "vpd": 1.4,
+            "ports": [],
+        }
+    ]
+    hist_payload = json.dumps({
+        "device_id": "C58ZA",
+        "readings": readings,
+        "statistics": {},
+    })
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=hist_payload):
+            result = await get_port_activity_report("C58ZA", 1)
+    data = json.loads(result)
+    assert data["ports"] == []
+
+
+async def test_get_port_activity_report_port_always_off(mock_client):
+    readings = _make_port_readings(24, speed=0, on=False)
+    hist_payload = json.dumps({
+        "device_id": "C58ZA",
+        "readings": readings,
+        "statistics": {},
+    })
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=hist_payload):
+            result = await get_port_activity_report("C58ZA", 1)
+    data = json.loads(result)
+    port = data["ports"][0]
+    assert port["uptime_pct"] == 0.0
+    assert port["on_hours"] == 0.0
+    assert port["avg_speed_when_running"] == 0.0
+
+
+async def test_get_port_activity_report_port_always_on(mock_client):
+    readings = _make_port_readings(24, speed=5, on=True)
+    hist_payload = json.dumps({
+        "device_id": "C58ZA",
+        "readings": readings,
+        "statistics": {},
+    })
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=hist_payload):
+            result = await get_port_activity_report("C58ZA", 1)
+    data = json.loads(result)
+    port = data["ports"][0]
+    assert port["uptime_pct"] == 100.0
+    assert port["avg_speed_when_running"] == 5.0

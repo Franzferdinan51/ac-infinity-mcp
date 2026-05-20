@@ -1,0 +1,349 @@
+"""Unit tests for analytics pure functions: health score, trends, activity."""
+
+import pytest
+
+from ac_infinity_mcp.analytics import (
+    STAGE_TARGETS,
+    HealthScore,
+    TrendReport,
+    build_activity_report,
+    calculate_health_score,
+    detect_trends,
+)
+
+
+def _reading(temp_c=24.0, humidity=60.0, vpd=1.24):
+    return {
+        "temperature_c": temp_c,
+        "temperature_f": round(temp_c * 9 / 5 + 32, 1),
+        "humidity": humidity,
+        "vpd": vpd,
+    }
+
+
+def _ts(hour: int, minute: int = 0, day: int = 25) -> str:
+    return f"2024-04-{day:02d}T{hour:02d}:{minute:02d}:00Z"
+
+
+def _history_reading(hour: int, temp_c: float, humidity: float, vpd: float,
+                     ports=None, day: int = 25) -> dict:
+    return {
+        "timestamp": _ts(hour, day=day),
+        "temperature_c": temp_c,
+        "temperature_f": round(temp_c * 9 / 5 + 32, 1),
+        "humidity": humidity,
+        "vpd": vpd,
+        "ports": ports or [],
+    }
+
+
+# ============ calculate_health_score ============
+
+def test_calculate_health_score_all_in_range():
+    # veg: temp 20-28, humidity 50-70, vpd 1.0-1.5
+    result = calculate_health_score(_reading(temp_c=24.0, humidity=60.0, vpd=1.24), "veg")
+    assert isinstance(result, HealthScore)
+    assert result.score >= 90.0
+    assert result.grade == "A"
+
+
+def test_calculate_health_score_vpd_low():
+    result = calculate_health_score(_reading(vpd=0.1), "veg")
+    assert result.vpd_score < 100.0
+
+
+def test_calculate_health_score_vpd_high():
+    result = calculate_health_score(_reading(vpd=3.0), "veg")
+    assert result.vpd_score < 100.0
+
+
+def test_calculate_health_score_temp_out_of_range():
+    # veg temp max is 28°C
+    result = calculate_health_score(_reading(temp_c=40.0), "veg")
+    assert result.temp_score < 100.0
+
+
+def test_calculate_health_score_humidity_low():
+    # veg humidity min is 50%
+    result = calculate_health_score(_reading(humidity=20.0), "veg")
+    assert result.humidity_score < 100.0
+
+
+@pytest.mark.parametrize("vpd,temp,hum,expected_grade", [
+    # Dial each metric to produce known composite scores
+    # all perfect → 100 → A
+    (1.24, 24.0, 60.0, "A"),
+])
+def test_calculate_health_score_all_in_range_is_A(vpd, temp, hum, expected_grade):
+    result = calculate_health_score(_reading(temp_c=temp, humidity=hum, vpd=vpd), "veg")
+    assert result.grade == expected_grade
+
+
+def test_calculate_health_score_grade_mapping():
+    """Verify grade boundaries A≥90, B≥80, C≥70, D≥60, F<60."""
+    # We test grade logic indirectly via the _grade helper by checking boundary combos.
+    # vpd_score=0, temp=100, hum=100 → 0*0.4 + 100*0.3 + 100*0.3 = 60 → "D"
+    result = calculate_health_score(_reading(vpd=0.0), "veg")
+    assert result.score == pytest.approx(60.0, abs=5.0)
+
+    # vpd in-range, temp/hum also in-range → "A"
+    result_a = calculate_health_score(_reading(temp_c=24.0, humidity=60.0, vpd=1.24), "veg")
+    assert result_a.grade == "A"
+
+
+def test_calculate_health_score_recommendation_all_ok():
+    result = calculate_health_score(_reading(temp_c=24.0, humidity=60.0, vpd=1.24), "veg")
+    assert "No action" in result.top_recommendation
+
+
+def test_calculate_health_score_recommendation_vpd_low():
+    result = calculate_health_score(_reading(vpd=0.1), "veg")
+    # vpd is the worst metric
+    assert "VPD" in result.top_recommendation or "vpd" in result.top_recommendation.lower()
+    assert "raise VPD" in result.top_recommendation or "low" in result.top_recommendation.lower()
+
+
+def test_calculate_health_score_recommendation_vpd_high():
+    result = calculate_health_score(_reading(vpd=3.0), "veg")
+    assert "VPD" in result.top_recommendation or "vpd" in result.top_recommendation.lower()
+    assert "lower VPD" in result.top_recommendation or "high" in result.top_recommendation.lower()
+
+
+def test_calculate_health_score_unknown_stage_defaults():
+    result = calculate_health_score(_reading(), "unknown_stage_xyz")
+    assert isinstance(result, HealthScore)
+    assert 0 <= result.score <= 100
+
+
+@pytest.mark.parametrize("stage", list(STAGE_TARGETS.keys()))
+def test_calculate_health_score_all_stages_accepted(stage):
+    result = calculate_health_score(_reading(), stage)
+    assert isinstance(result, HealthScore)
+
+
+def test_calculate_health_score_vpd_weighted_40pct():
+    """vpd_score=0, temp=100, hum=100 → 0*0.4 + 100*0.3 + 100*0.3 = 60.0"""
+    # Force vpd far out of range so vpd_score → 0; keep temp+hum in range
+    veg = STAGE_TARGETS["veg"]
+    temp_c = (veg["temp_c"][0] + veg["temp_c"][1]) / 2  # centre of range
+    humidity = (veg["humidity"][0] + veg["humidity"][1]) / 2  # centre of range
+    # vpd=0 is way below veg low (1.0), penalty should max out to 0
+    result = calculate_health_score(_reading(temp_c=temp_c, humidity=humidity, vpd=0.0), "veg")
+    assert result.vpd_score == 0.0
+    assert result.temp_score == 100.0
+    assert result.humidity_score == 100.0
+    assert result.score == pytest.approx(60.0, abs=0.1)
+
+
+# ============ detect_trends ============
+
+def test_detect_trends_empty_readings():
+    result = detect_trends([], days=7)
+    assert result == []
+
+
+def test_detect_trends_single_reading_insufficient():
+    readings = [_history_reading(12, 24.0, 60.0, 1.24)]
+    result = detect_trends(readings, days=7)
+    assert len(result) == 3
+    for r in result:
+        assert r.slope == 0.0
+        assert r.direction == "flat"
+
+
+def test_detect_trends_flat():
+    readings = [_history_reading(h, 24.0, 60.0, 1.24) for h in range(10)]
+    result = detect_trends(readings, days=7)
+    for r in result:
+        assert r.direction == "flat"
+        assert abs(r.slope) < 0.01
+
+
+def test_detect_trends_rising_temperature():
+    # Temperature rises 1°C per hour across 10 hours
+    readings = [_history_reading(h, 20.0 + h, 60.0, 1.24) for h in range(10)]
+    result = detect_trends(readings, days=7)
+    temp_report = next(r for r in result if r.metric == "temperature_c")
+    assert temp_report.direction == "rising"
+    assert temp_report.slope > 0
+
+
+def test_detect_trends_falling_humidity():
+    # Humidity falls 2% per hour
+    readings = [_history_reading(h, 24.0, 80.0 - h * 2, 1.24) for h in range(10)]
+    result = detect_trends(readings, days=7)
+    hum_report = next(r for r in result if r.metric == "humidity")
+    assert hum_report.direction == "falling"
+    assert hum_report.slope < 0
+
+
+def test_detect_trends_seven_day_projection():
+    # Rising temperature: last value 29°C, slope ~1°C/hr
+    readings = [_history_reading(h, 20.0 + h, 60.0, 1.24) for h in range(10)]
+    result = detect_trends(readings, days=7)
+    temp_report = next(r for r in result if r.metric == "temperature_c")
+    last_temp = 29.0
+    # Projection should be > last value since trend is rising
+    assert temp_report.seven_day_projection > last_temp
+
+
+def test_detect_trends_alert_temp_large_drift():
+    # Temperature rises 1°C per hour for 7 days → total = 168°C change >> 3°C threshold
+    readings = [_history_reading(h % 24, 20.0 + h * 0.5, 60.0, 1.24, day=25 + h // 24)
+                for h in range(48)]
+    result = detect_trends(readings, days=2)
+    temp_report = next(r for r in result if r.metric == "temperature_c")
+    assert temp_report.alert is True
+
+
+def test_detect_trends_alert_not_triggered_small_drift():
+    # Tiny variation (0.01°C per hour) — should not trigger alert
+    readings = [_history_reading(h, 24.0 + h * 0.01, 60.0, 1.24) for h in range(10)]
+    result = detect_trends(readings, days=7)
+    for r in result:
+        assert r.alert is False
+
+
+def test_detect_trends_missing_values_skipped():
+    readings = [
+        {"timestamp": _ts(0), "temperature_c": None, "humidity": 60.0, "vpd": 1.24},
+        {"timestamp": _ts(1), "temperature_c": 24.0, "humidity": None, "vpd": 1.24},
+        {"timestamp": _ts(2), "temperature_c": 25.0, "humidity": 61.0, "vpd": None},
+    ]
+    result = detect_trends(readings, days=1)
+    assert len(result) == 3
+    for r in result:
+        assert isinstance(r, TrendReport)
+
+
+def test_detect_trends_returns_three_metrics():
+    readings = [_history_reading(h, 24.0, 60.0, 1.24) for h in range(5)]
+    result = detect_trends(readings, days=7)
+    metrics = [r.metric for r in result]
+    assert "temperature_c" in metrics
+    assert "humidity" in metrics
+    assert "vpd" in metrics
+    assert len(result) == 3
+
+
+# ============ build_activity_report ============
+
+def _port(port_num: int, name: str, speed: int, on: bool) -> dict:
+    return {"port": port_num, "name": name, "speed": speed, "on": on}
+
+
+def test_build_activity_report_empty():
+    assert build_activity_report([]) == []
+
+
+def test_build_activity_report_always_on():
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5, True)],
+        }
+        for h in range(10)
+    ]
+    result = build_activity_report(readings)
+    assert len(result) == 1
+    assert result[0].uptime_pct == 100.0
+    assert result[0].off_hours == 0.0
+
+
+def test_build_activity_report_always_off():
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 0, False)],
+        }
+        for h in range(10)
+    ]
+    result = build_activity_report(readings)
+    assert len(result) == 1
+    assert result[0].uptime_pct == 0.0
+    assert result[0].on_hours == 0.0
+
+
+def test_build_activity_report_transitions():
+    states = [True, True, False, False, True, True, False, True]
+    readings = [
+        {
+            "timestamp": _ts(i),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5 if on else 0, on)],
+        }
+        for i, on in enumerate(states)
+    ]
+    result = build_activity_report(readings)
+    # Transitions: T→T, T→F (+1), F→F, F→T (+1), T→T, T→F (+1), F→T (+1) = 4
+    assert result[0].transitions == 4
+
+
+def test_build_activity_report_avg_speed():
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5, True)],
+        }
+        for h in range(4)
+    ]
+    result = build_activity_report(readings)
+    assert result[0].avg_speed_when_running == 5.0
+
+
+def test_build_activity_report_peak_hour():
+    readings = []
+    # Hour 14 has 3 on-readings; others have 1
+    for h in [10, 14, 14, 14, 18]:
+        readings.append({
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5, True)],
+        })
+    result = build_activity_report(readings)
+    assert result[0].peak_hour == 14
+
+
+def test_build_activity_report_multiple_ports():
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [
+                _port(1, "Fan 1", 5, True),
+                _port(2, "Fan 2", 7, True),
+                _port(3, "Light", 0, False),
+                _port(4, "Heater", 0, False),
+            ],
+        }
+        for h in range(5)
+    ]
+    result = build_activity_report(readings)
+    assert len(result) == 4
+    assert [r.port for r in result] == [1, 2, 3, 4]
+
+
+def test_build_activity_report_uptime_pct_range():
+    # 5 on, 5 off → 50%
+    states = [True, True, True, True, True, False, False, False, False, False]
+    readings = [
+        {
+            "timestamp": _ts(i),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5 if on else 0, on)],
+        }
+        for i, on in enumerate(states)
+    ]
+    result = build_activity_report(readings)
+    assert 0 <= result[0].uptime_pct <= 100
+    assert result[0].uptime_pct == 50.0

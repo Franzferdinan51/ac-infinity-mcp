@@ -1,0 +1,488 @@
+import asyncio
+import json
+import logging
+import os
+import re
+import sys
+from datetime import UTC, datetime
+
+from mcp.server.fastmcp import FastMCP
+
+from ac_infinity_mcp.client import ACInfinityClient
+from ac_infinity_mcp.schema import ACIReading, VPDTargets
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+mcp_server = FastMCP(name="ac-infinity-mcp")
+
+# Initialized at startup via main()
+aci_client: ACInfinityClient | None = None
+
+
+def _client() -> ACInfinityClient:
+    """Return the initialized client; raises RuntimeError if main() was not called."""
+    if aci_client is None:
+        raise RuntimeError("AC Infinity client not initialized — call main() first")
+    return aci_client
+
+
+# ============ MCP Tools ============
+
+@mcp_server.tool()
+async def discover_devices() -> str:
+    """
+    Discover all AC Infinity devices from the cloud API.
+    Returns device IDs, names, and online status.
+    Use this to find device_ids for use in other tools.
+    """
+    try:
+        devices = await asyncio.to_thread(_client().get_devices)
+        if not devices:
+            return json.dumps({"devices": [], "message": "No devices found"})
+
+        result = [
+            {
+                "device_id": d.get("devCode"),
+                "device_name": d.get("devName"),
+                "status": "online" if d.get("online") else "offline",
+            }
+            for d in devices
+        ]
+
+        return json.dumps({"devices": result}, indent=2)
+
+    except Exception as e:
+        logger.error("Error in discover_devices: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def get_device_reading(device_id: str) -> str:
+    """
+    Get current sensor reading for a device by its AC Infinity device_id.
+    Returns temperature, humidity, VPD, and timestamp.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+    """
+    try:
+        devices = await asyncio.to_thread(_client().get_devices)
+        if not devices:
+            return json.dumps({"error": "Failed to fetch devices from AC Infinity"})
+
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        parsed = _client().parse_device_data(device)
+        reading = ACIReading(**parsed)
+
+        return json.dumps(reading.to_dict(), indent=2)
+
+    except Exception as e:
+        logger.error("Error in get_device_reading: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def get_historical_readings(
+    device_id: str,
+    start_date: str,
+    end_date: str,
+    sample_interval: str = "1h",
+    time_start: str | None = None,
+    time_end: str | None = None,
+) -> str:
+    """
+    Query AC Infinity environment data across a date range with configurable sampling.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        sample_interval: Bucket size for averaging readings. Use "raw" for all records
+            unmodified, or a duration string like "1m", "5m", "15m", "30m", "1h",
+            "2h", "6h", "12h", "1d". "daily" is accepted as an alias for "1d".
+            Default: "1h" (one averaged reading per hour).
+        time_start: Optional UTC time filter in HH:MM format (e.g., "16:00").
+            If provided, only readings at or after this time are returned.
+        time_end: Optional UTC time filter in HH:MM format (e.g., "16:15").
+            If provided, only readings at or before this time are returned.
+
+    Returns: List of readings (filtered by time_start/time_end if provided) with
+        aggregated statistics (min/avg/max per metric)
+    """
+    try:
+        try:
+            start = datetime.fromisoformat(f"{start_date}T00:00:00+00:00")
+            end = datetime.fromisoformat(f"{end_date}T23:59:59+00:00")
+        except ValueError:
+            return json.dumps({"error": "Dates must be in YYYY-MM-DD format"})
+
+        if start > end:
+            return json.dumps({"error": "start_date must be before or equal to end_date"})
+
+        if sample_interval != "raw":
+            try:
+                _parse_duration_seconds(sample_interval)
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        if not devices:
+            return json.dumps({"error": "Failed to fetch devices from AC Infinity"})
+
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        import calendar
+        start_ts = int(calendar.timegm(start.timetuple()))
+        end_ts = int(calendar.timegm(end.replace(hour=23, minute=59, second=59).timetuple()))
+
+        dev_id_numeric = device.get("devId")
+        readings: list[dict] = []
+
+        device_info = device.get("deviceInfo", {})
+        port_names: dict = {}
+        for p in device_info.get("ports", []):
+            port_num = p.get("port")
+            if port_num is not None:
+                port_names[port_num] = p.get("portName", f"Port {port_num}")
+
+        if dev_id_numeric:
+            raw_records = await asyncio.to_thread(
+                _client().get_historical_data, dev_id_numeric, start_ts, end_ts
+            )
+            if raw_records:
+                readings = [
+                    _client().parse_history_record(r, port_names=port_names)
+                    for r in raw_records
+                ]
+                logger.info(
+                    "Retrieved %d readings from cloud API for %s", len(readings), device_id
+                )
+
+        if not readings:
+            return json.dumps({
+                "error": (
+                    f"No readings available for device {device_id} "
+                    f"in range {start_date} to {end_date}"
+                ),
+            })
+
+        sampled = apply_sampling(readings, sample_interval)
+
+        if time_start or time_end:
+            sampled = _filter_readings_by_time(sampled, time_start, time_end)
+
+        if sampled:
+            temps_c = [r.get("temperature_c", 0) for r in sampled if "temperature_c" in r]
+            temps_f = [r.get("temperature_f", 0) for r in sampled if "temperature_f" in r]
+            humidities = [r.get("humidity", 0) for r in sampled if "humidity" in r]
+            vpds = [r.get("vpd", 0) for r in sampled if "vpd" in r]
+
+            port_stats: dict = {}
+            for r in sampled:
+                for port in r.get("ports", []):
+                    name = port.get("name", f"Port {port.get('port')}")
+                    port_stats.setdefault(name, []).append(port.get("speed", 0))
+
+            port_statistics = {
+                name: {
+                    "min": round(min(speeds), 2),
+                    "avg": round(sum(speeds) / len(speeds), 2),
+                    "max": round(max(speeds), 2),
+                }
+                for name, speeds in sorted(port_stats.items())
+                if any(s > 0 for s in speeds)
+            }
+
+            stats = {
+                "readings_count": len(sampled),
+                "sample_interval": sample_interval,
+                "date_range": {"start": start_date, "end": end_date},
+                "temperature_c": {
+                    "min": round(min(temps_c), 2) if temps_c else None,
+                    "avg": round(sum(temps_c) / len(temps_c), 2) if temps_c else None,
+                    "max": round(max(temps_c), 2) if temps_c else None,
+                },
+                "temperature_f": {
+                    "min": round(min(temps_f), 2) if temps_f else None,
+                    "avg": round(sum(temps_f) / len(temps_f), 2) if temps_f else None,
+                    "max": round(max(temps_f), 2) if temps_f else None,
+                },
+                "humidity": {
+                    "min": round(min(humidities), 2) if humidities else None,
+                    "avg": round(sum(humidities) / len(humidities), 2) if humidities else None,
+                    "max": round(max(humidities), 2) if humidities else None,
+                },
+                "vpd": {
+                    "min": round(min(vpds), 2) if vpds else None,
+                    "avg": round(sum(vpds) / len(vpds), 2) if vpds else None,
+                    "max": round(max(vpds), 2) if vpds else None,
+                },
+                "port_statistics": port_statistics,
+            }
+        else:
+            stats = {"error": "No data available after sampling"}
+
+        return json.dumps({
+            "device_id": device_id,
+            "readings": sampled,
+            "statistics": stats,
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("Error in get_historical_readings: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def check_vpd_drift(device_id: str, stage: str = "veg") -> str:
+    """
+    Check if current VPD is within target range for a growth stage.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+        stage: Growth stage - one of: clones, seedling, veg, early_flower, mid_flower, late_flower
+    """
+    try:
+        reading_json = await get_device_reading(device_id)
+        reading = json.loads(reading_json)
+
+        if "error" in reading:
+            return json.dumps(reading)
+
+        targets = VPDTargets()
+        target_range = getattr(targets, stage, targets.veg)
+        current_vpd = reading["vpd"]
+
+        status = "OK"
+        alert = None
+
+        if current_vpd < target_range[0]:
+            status = "LOW"
+            alert = (
+                f"VPD {current_vpd:.2f} is below target "
+                f"{target_range[0]:.2f}–{target_range[1]:.2f}. "
+                "Lower fan speed or increase humidity."
+            )
+        elif current_vpd > target_range[1]:
+            status = "HIGH"
+            alert = (
+                f"VPD {current_vpd:.2f} exceeds target "
+                f"{target_range[0]:.2f}–{target_range[1]:.2f}. "
+                "Increase air circulation or reduce humidity."
+            )
+
+        return json.dumps({
+            "device_id": device_id,
+            "current_vpd": current_vpd,
+            "target_range": target_range,
+            "stage": stage,
+            "status": status,
+            "alert": alert,
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("Error in check_vpd_drift: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def get_all_device_readings() -> str:
+    """
+    Get current sensor readings for all AC Infinity devices.
+    Useful for a full status check across all controllers.
+    Returns a list of readings keyed by device_id.
+    """
+    try:
+        devices = await asyncio.to_thread(_client().get_devices)
+        if not devices:
+            return json.dumps({"error": "Failed to fetch devices from AC Infinity"})
+
+        readings = []
+        for device in devices:
+            device_id = device.get("devCode")
+            try:
+                parsed = _client().parse_device_data(device)
+                reading = ACIReading(**parsed)
+                readings.append({
+                    "device_id": device_id,
+                    "device_name": device.get("devName"),
+                    **reading.to_dict(),
+                })
+            except Exception as e:
+                readings.append({
+                    "device_id": device_id,
+                    "device_name": device.get("devName"),
+                    "error": str(e),
+                })
+
+        return json.dumps({"readings": readings}, indent=2)
+
+    except Exception as e:
+        logger.error("Error in get_all_device_readings: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+# ============ Helpers ============
+
+_DURATION_RE = re.compile(r"^(\d+)(m|h|d)$", re.IGNORECASE)
+_DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_duration_seconds(interval: str) -> int:
+    """Parse a duration string into a bucket size in seconds.
+
+    Accepts e.g. "1m", "5m", "15m", "30m", "1h", "2h", "6h", "12h", "1d".
+    "daily" is accepted as an alias for "1d".
+    Raises ValueError for unrecognised formats.
+    """
+    if interval in ("daily", "1d"):
+        return 86400
+    m = _DURATION_RE.fullmatch(interval)
+    if not m:
+        raise ValueError(
+            f"Invalid sample_interval {interval!r}. "
+            "Use 'raw' for unsampled data, or a duration like '1m', '5m', '15m', "
+            "'30m', '1h', '2h', '6h', '12h', '1d'."
+        )
+    value, unit = int(m.group(1)), m.group(2).lower()
+    return value * _DURATION_UNITS[unit]
+
+
+def _filter_readings_by_time(
+    readings: list, time_start: str | None = None, time_end: str | None = None
+) -> list:
+    """Filter readings to only include those within a UTC time window (HH:MM format)."""
+    if not time_start and not time_end:
+        return readings
+
+    filtered = []
+    for reading in readings:
+        timestamp_str = reading.get("timestamp", "")
+        try:
+            ts_dt = datetime.fromisoformat(timestamp_str.rstrip("Z").replace("+00:00", ""))
+            ts_dt = ts_dt.replace(tzinfo=UTC)
+            reading_time = ts_dt.strftime("%H:%M")
+
+            include = True
+            if time_start and reading_time < time_start:
+                include = False
+            if time_end and reading_time > time_end:
+                include = False
+
+            if include:
+                filtered.append(reading)
+        except Exception as e:
+            logger.warning("Could not parse timestamp %s: %s", timestamp_str, e)
+            continue
+
+    return filtered
+
+
+def apply_sampling(readings: list, interval: str) -> list:
+    """Bucket readings by the given duration interval and average each bucket.
+
+    "raw" returns all records unchanged.
+    Any duration string (e.g. "1m", "15m", "1h", "6h", "1d") averages readings
+    into fixed-width time buckets of that size; each bucket is represented by
+    a single averaged record whose timestamp is the bucket-start time (UTC).
+    """
+    if interval == "raw":
+        return readings
+
+    bucket_secs = _parse_duration_seconds(interval)
+    sampled: dict = {}
+
+    for reading in readings:
+        timestamp_str = reading.get("timestamp", "")
+        try:
+            ts_dt = datetime.fromisoformat(timestamp_str.rstrip("Z"))
+            unix_ts = int(ts_dt.replace(tzinfo=UTC).timestamp())
+        except Exception:
+            continue
+        bucket_key = (unix_ts // bucket_secs) * bucket_secs
+        sampled.setdefault(bucket_key, []).append(reading)
+
+    result = []
+    for bucket_key in sorted(sampled.keys()):
+        avg = average_readings(sampled[bucket_key])
+        avg["timestamp"] = datetime.utcfromtimestamp(bucket_key).isoformat() + "Z"
+        result.append(avg)
+    return result
+
+
+def average_readings(readings: list) -> dict:
+    """Compute average of multiple readings."""
+    if not readings:
+        return {}
+
+    temps_c = [r.get("temperature_c", 0) for r in readings]
+    temps_f = [r.get("temperature_f", 0) for r in readings]
+    humidities = [r.get("humidity", 0) for r in readings]
+    vpds = [r.get("vpd", 0) for r in readings]
+
+    ports_by_number: dict = {}
+    for reading in readings:
+        for port in reading.get("ports", []):
+            port_num = port.get("port")
+            if port_num not in ports_by_number:
+                ports_by_number[port_num] = {
+                    "port": port_num,
+                    "name": port.get("name", f"Port {port_num}"),
+                    "speeds": [],
+                    "on_count": 0,
+                }
+            ports_by_number[port_num]["speeds"].append(port.get("speed", 0))
+            if port.get("on"):
+                ports_by_number[port_num]["on_count"] += 1
+
+    averaged_ports = [
+        {
+            "port": port_num,
+            "name": data["name"],
+            "speed": round(sum(data["speeds"]) / len(data["speeds"]), 2),
+            "on": data["on_count"] > 0,
+        }
+        for port_num, data in sorted(ports_by_number.items())
+    ]
+
+    return {
+        "timestamp": readings[0].get("timestamp"),
+        "temperature_c": round(sum(temps_c) / len(temps_c), 2) if temps_c else None,
+        "temperature_f": round(sum(temps_f) / len(temps_f), 2) if temps_f else None,
+        "humidity": round(sum(humidities) / len(humidities), 2) if humidities else None,
+        "vpd": round(sum(vpds) / len(vpds), 2) if vpds else None,
+        "ports": averaged_ports,
+    }
+
+
+def main() -> None:
+    email = os.getenv("AC_INFINITY_EMAIL")
+    password = os.getenv("AC_INFINITY_PASSWORD")
+
+    if not email or not password:
+        logger.error(
+            "Missing AC_INFINITY_EMAIL or AC_INFINITY_PASSWORD — set in .env"
+        )
+        sys.exit(1)
+
+    global aci_client
+    aci_client = ACInfinityClient(email, password)
+    if not aci_client.authenticate():
+        logger.error("Failed to authenticate with AC Infinity")
+        sys.exit(1)
+
+    async def _run() -> None:
+        logger.info("AC Infinity MCP Server ready (stdio)")
+        await mcp_server.run_stdio_async()
+
+    asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    main()

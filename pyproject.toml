@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ac-infinity-mcp"
+version = "0.1.0"
+description = "MCP server for AC Infinity grow environment control"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.14.1",
+    "requests>=2.33.0",
+    "tenacity>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+    "responses>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "types-requests",
+]
+
+[project.scripts]
+ac-infinity-mcp = "ac_infinity_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+ignore_missing_imports = true
+python_version = "3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

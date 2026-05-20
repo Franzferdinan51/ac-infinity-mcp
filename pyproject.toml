@@ -45,3 +45,4 @@ python_version = "3.11"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "--cov=ac_infinity_mcp --cov-report=term-missing --cov-fail-under=85"

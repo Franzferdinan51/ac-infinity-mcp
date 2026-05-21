@@ -58,7 +58,17 @@
 | ⚙️ **Automation** | `set_port_mode` | Switch to any mode: OFF, ON, AUTO, VPD, CYCLE, SCHEDULE, TIMER_TO_ON, TIMER_TO_OFF (`dry_run=True` by default) |
 | 🌱 **Intelligence** | `apply_grow_stage_template` | One-click VPD + temp + humidity automation for a named grow stage (`dry_run=True` by default) |
 
-> ✦ Write and Automation tools default to `dry_run=True` — they return the exact payload they *would* send without making any changes to your equipment. Pass `dry_run=False` only when you're ready to execute.
+> ✦ All write tools (Write, Automation, and Intelligence categories) default to `dry_run=True` — they return the exact payload they *would* send without making any changes to your equipment. Pass `dry_run=False` only when you're ready to execute.
+
+## MCP Prompts
+
+Three built-in prompts are registered alongside the tools. In Claude Desktop and other MCP clients, these appear as slash commands or prompt suggestions.
+
+| Prompt | What it does |
+|---|---|
+| `vpd_troubleshooting` | Step-by-step guide: diagnose HIGH or LOW VPD and which tools to call to fix it |
+| `new_grower_setup` | Onboarding walkthrough: discover devices → apply a stage template → check your health score |
+| `environment_alert_interpretation` | How to read `check_vpd_drift` status values and `get_environment_health` grades (A–F, score weighting, what to do) |
 
 ## Quick start
 
@@ -162,7 +172,7 @@ mypy src/ac_infinity_mcp/
 pytest tests/ -v
 
 # Security audit
-pip audit
+pip-audit
 ```
 
 ## License

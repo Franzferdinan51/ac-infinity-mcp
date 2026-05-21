@@ -15,7 +15,7 @@
 | 4 | Full API Documentation + Read Tool Polish | ✅ Complete | #4 |
 | 5 | CI/CD Pipeline | ✅ Complete | #5 |
 | 6 | Write Tools Foundation | ✅ Complete | #9 |
-| 7 | Write Tools MCP Layer | 🔲 Pending | — |
+| 7 | Write Tools MCP Layer | ✅ Complete | #10 |
 | 8 | Write Tools Full Implementation | 🔲 Pending | — |
 | 9 | Docker + Packaging + Claude Desktop | 🔲 Pending | — |
 | 10 | Integration Test Suite | 🔲 Pending | — |
@@ -222,7 +222,8 @@ Maintain ≥85% coverage.
 
 ## Phase 7 — Write Tools MCP Layer
 
-**Status:** 🔲 Pending
+**Status:** ✅ Complete
+**PR:** #10 (`feat/phase-7-write-mcp-layer`)
 
 ### Scope
 - `set_port_speed(device_id, port, speed, dry_run=True)` MCP tool
@@ -230,6 +231,17 @@ Maintain ≥85% coverage.
 - `set_port_off(device_id, port, dry_run=True)` MCP tool
 - All tools default to `dry_run=True` and return the payload they _would_ send
 - End-to-end wiring to client.py write methods
+
+---
+
+**Phase 7 Lessons Learned**
+- **What went well:** All three tools were implemented correctly on the first pass — zero Gate 1–4 restarts. The `asyncio.to_thread()` pattern from prior phases was well-established and applied cleanly. Smoke test steps 1–5 (dry-run, validation errors) all passed immediately. The `modeType=0` + `loadType=0` port on C58ZA confirmed the full live write round-trip including revert.
+- **Changed from plan:** Also fixed a Phase 6 bug discovered at Gate 5: Python `bool` values (`isUpdateVpdNums`, `restore`) were serializing as `"True"`/`"False"` strings in form encoding, causing 999999 rejections on every live write. Fixed in `build_write_payload` with `int(v) if isinstance(v, bool)`. One test added to `test_legacy_controller.py` to cover the fix.
+- **Watch out for next phase (Phase 8 — Write Tools Full Implementation):** Ports in `modeType=15` (smart automation) reject writes with 999999 — the API won't accept a manual speed override while automation is active. Phase 8 must handle this case explicitly (detect modeType, return a clear error, or switch to manual mode first). Also: `loadType=4` (on/off hardware) and `loadType=128` (possibly dimmer-type) reject `set_port_speed` — `set_port_on`/`set_port_off` are the correct tools for those. AI+ devices (devType=22, Q0KT4) use a different write path — `addDevMode` returns 100001 for them; Phase 8 must implement the correct AI+ write endpoint. The `modeAndSetting` endpoint returns 404 — it is not the AI+ write path.
+- **Actual effort vs estimate:** ~3 hours actual. No estimate given in planning.
+- **Investment time:** ~3:30 — wall-clock from session start to PR merged (includes extended Gate 5 write debugging).
+- **Defects found:**
+  - [D001] Python `bool` values serialized as `"True"`/`"False"` strings in form encoding — caused 999999 rejections from `addDevMode` for all live writes | Discovered: Gate 5 | Severity: high (all live writes silently failed) | Resolved: Y — `int(v) if isinstance(v, bool)` in `build_write_payload`
 
 ---
 

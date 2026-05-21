@@ -43,20 +43,13 @@ def live_device_id(authed_client: ACInfinityClient) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_live_authenticate() -> None:
-    email = os.getenv("AC_INFINITY_EMAIL", "")
-    password = os.getenv("AC_INFINITY_PASSWORD", "")
-    client = ACInfinityClient(email, password)
-    assert client.authenticate() is True
-    assert client.token is not None
+def test_live_authenticate(authed_client: ACInfinityClient) -> None:
+    # authed_client is already authenticated — verify token is present
+    assert authed_client.token is not None
 
 
-def test_live_get_devices() -> None:
-    email = os.getenv("AC_INFINITY_EMAIL", "")
-    password = os.getenv("AC_INFINITY_PASSWORD", "")
-    client = ACInfinityClient(email, password)
-    client.authenticate()
-    devices = client.get_devices()
+def test_live_get_devices(authed_client: ACInfinityClient) -> None:
+    devices = authed_client.get_devices()
     assert devices is not None
     assert len(devices) > 0
 

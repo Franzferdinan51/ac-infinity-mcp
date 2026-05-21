@@ -14,7 +14,7 @@
 | 3 | Analytics MCP Tools | ✅ Complete | #3 |
 | 4 | Full API Documentation + Read Tool Polish | ✅ Complete | #4 |
 | 5 | CI/CD Pipeline | ✅ Complete | #5 |
-| 6 | Write Tools Foundation | 🔲 Pending | — |
+| 6 | Write Tools Foundation | ✅ Complete | #9 |
 | 7 | Write Tools MCP Layer | 🔲 Pending | — |
 | 8 | Write Tools Full Implementation | 🔲 Pending | — |
 | 9 | Docker + Packaging + Claude Desktop | 🔲 Pending | — |
@@ -195,13 +195,28 @@ Maintain ≥85% coverage.
 
 ## Phase 6 — Write Tools Foundation
 
-**Status:** 🔲 Pending
+**Status:** ✅ Complete
+**PR:** #9 (`feat/phase-6-write-foundation`)
 
 ### Scope
-- Implement `controller.py`: `detect_controller_type` (already stubbed), `build_write_payload` (legacy read-before-write + AI+ static payload)
-- Add `client.py` write methods: `get_mode_settings`, `set_port_mode`
-- No MCP tools yet — foundation + tests only
-- All 15 API quirks relevant to writes must be handled (quirks 11–15)
+- Implemented `controller.py`: `build_write_payload` for both LEGACY and NEW_FRAMEWORK
+- Added `client.py`: `get_mode_settings(dev_id, port)` and `set_port_mode(device_data, port, updates, dry_run=True)`
+- No MCP tools — foundation + tests only
+- All 16 API quirks (11–16) handled
+- 30 new tests; 182 total; 87% coverage
+
+---
+
+**Phase 6 Lessons Learned**
+- **What went well:** Live API sniffing worked perfectly. All five gates passed in one pass — zero restarts. Both legacy (devType=11,18) and AI+ (devType=22) responded correctly to the sniff endpoint.
+- **Changed from plan:** Three major deviations: (1) `getdevModeSettingList` requires a `port` parameter (not documented — became Quirk 16); (2) response is a single 142-field dict per port, not a list of all ports — `get_mode_settings` signature changed from `-> list[dict]` to `(dev_id, port) -> dict`; (3) AI+ and legacy have identical response structure — the "static payload" concept in Quirk 14 is moot for Phase 6; read-before-write is used for both.
+- **Watch out for next phase (Phase 7 — Write Tools MCP Layer):** `set_port_mode` is synchronous — server.py must wrap it in `asyncio.to_thread()`. The `dry_run` parameter must be surfaced in the MCP tool signature. `get_mode_settings` takes `(dev_id, port)` not `(dev_id)` — server.py must resolve `dev_id` from `devCode` (Quirk 7) and pass the correct port number.
+- **Actual effort vs estimate:** ~3 hours actual. No estimate was given in planning.
+- **Investment time:** ~3 hours wall-clock from session start to PR open.
+- **Defects found:**
+  - [D001] getdevModeSettingList requires undocumented `port` parameter | Discovered: Step 0 sniff | Severity: high (would have caused 999999 errors in all write attempts) | Resolved: Y — Quirk 16 added, signature revised
+  - [D002] Response is a single dict per port, not list of all ports | Discovered: Step 0 sniff | Severity: medium (architectural misunderstanding) | Resolved: Y — signature updated, docs corrected
+  - [D003] Field count is ~140 flat (not ~77 as all prior docs stated) | Discovered: Step 0 sniff | Severity: low (docs only; no code impact) | Resolved: Y — docs/API.md and Quirk 13 updated
 
 ---
 

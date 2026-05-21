@@ -247,13 +247,28 @@ Maintain ≥85% coverage.
 
 ## Phase 8 — Write Tools Full Implementation
 
-**Status:** 🔲 Pending
+**Status:** ✅ Complete  
+**PR:** [#11](https://github.com/ober37/ac-infinity-mcp/pull/11)
 
 ### Scope
-- Complete `controller.py` `build_write_payload` for both legacy (all 77 params) and AI+ (static full payload)
-- Timer modes, auto schedules, target-VPD auto mode write tools
-- `dry_run=False` path verified against live API
-- Retry logic on 403 rate-limit responses
+- modeType=15 (smart automation) guard in `set_port_mode` — raises `ACInfinityDeviceError` before any write
+- loadType=4/128 (on/off hardware) guard via `require_variable_speed` kwarg — `set_port_speed` rejects on/off ports
+- AI+ (devType=22) write path: exhaustively probed 11 candidate endpoints — all failed; `dry_run=True` works, `dry_run=False` returns documented error; `docs/API.md` Quirk 14 updated
+- 403 rate-limit retry loop in write POST (3 attempts, 3s backoff); non-rate-limit 403s fail immediately
+- `dry_run=False` verified live against C58ZA (legacy) and Q0KT4 (AI+)
+- 9/9 Gate 5 smoke tests pass
+
+**Phase 8 Lessons Learned**
+- **What went well:** All 4 work streams completed in one session. Guard rail placement inside `set_port_mode` (modeType=15) and via kwarg (`require_variable_speed`) was cleaner than the original plan's device-dict approach. 9/9 smoke tests passing with live hardware.
+- **Changed from plan:** loadType guard moved from server.py device dict lookup to client.py `set_port_mode` via `require_variable_speed=True` kwarg — the device list API returns `portsLoad=None` for all C58ZA ports, making the device dict approach unreliable; `loadType` from `getdevModeSettingList` is authoritative. AI+ endpoint discovery exhausted 11 candidates (not just the 7 originally listed) — fallback documented-error path implemented as planned.
+- **Watch out for next phase (Phase 9 — Docker + Packaging):** The 1.5s write rate limit does not need an env-var override for Docker — it's enforced on the client and is wall-clock based, not config-based. Env vars needed for Docker: `AC_INFINITY_EMAIL`, `AC_INFINITY_PASSWORD` only. No other env changes required. Port 1 on C58ZA (Humidifier) rejects writes with 999999 even with loadType=0 — this is a device-level restriction invisible from mode settings; not a bug in Phase 8 code.
+- **Actual effort vs estimate:** ~3 hours actual vs ~3 hours estimated.
+- **Investment time:** ~3:00 — one session, start to PR merged.
+- **Defects found:**
+  - [D001] `portsLoad=None` in device list for C58ZA — `loadType` from mode settings is authoritative; server.py device dict guard unreliable | Discovered: Gate 5 (smoke tests) | Severity: high | Resolved: Y
+  - [D002] Port 1 (Humidifier, loadType=0) on C58ZA rejects writes with 999999 despite correct loadType — device-level restriction | Discovered: Gate 5 | Severity: medium | Resolved: Y (smoke test uses port 4)
+  - [D003] Test 7 revert called `set_port_speed(speed=0)` when port was off — speed=0 is out of range (1–10) | Discovered: Gate 5 | Severity: medium | Resolved: Y (use `set_port_off` when current_speed==0)
+  - [D004] `test_set_port_mode_dry_run_ai_plus` failed — AI+ fixture has modeType=15 from live device; modeType=15 guard fired before dry_run path | Discovered: Gate 4 | Severity: medium | Resolved: Y (override modeType=0 in test)
 
 ---
 

@@ -16,10 +16,11 @@
 | 5 | CI/CD Pipeline | ✅ Complete | #5 |
 | 6 | Write Tools Foundation | ✅ Complete | #9 |
 | 7 | Write Tools MCP Layer | ✅ Complete | #10 |
-| 8 | Write Tools Full Implementation | 🔲 Pending | — |
-| 9 | Docker + Packaging + Claude Desktop | 🔲 Pending | — |
-| 10 | Integration Test Suite | 🔲 Pending | — |
-| 11 | Project Report | 🔲 Pending | — |
+| 8 | Write Tools Full Implementation | ✅ Complete | #11 |
+| 9 | Docker + Packaging + Claude Desktop | ✅ Complete | #12 |
+| 10 | Integration Test Suite | ✅ Complete | #13 |
+| 11 | Deep Repo Audit + README Overhaul | 🔲 Pending | — |
+| 12 | Project Report | 🔲 Pending | — |
 
 ---
 
@@ -274,19 +275,28 @@ Maintain ≥85% coverage.
 
 ## Phase 9 — Docker + Packaging + Claude Desktop
 
-**Status:** 🔲 Pending
+**Status:** ✅ Complete
+**PR:** #12 (`feat/phase-9-docker-packaging`)
+**Merged:** 2026-05-20
 
 ### Scope
 - `Dockerfile` + `.dockerignore`
 - `docker-compose.yml`
 - Claude Desktop integration instructions in README
 - `pip install ac-infinity-mcp` install flow documented
+- CI Docker build job added
+
+---
+
+**Phase 9 Lessons Learned** — (not recorded; merged before this entry was written)
 
 ---
 
 ## Phase 10 — Integration Test Suite
 
-**Status:** 🔲 Pending
+**Status:** ✅ Complete
+**PR:** #13 (`feat/phase-10-integration-tests`)
+**Merged:** 2026-05-20
 
 ### Scope
 
@@ -305,9 +315,82 @@ These tests run in CI without real AC Infinity credentials (mock client or subpr
 - Expand `tests/integration/test_live.py` with live API tests (skipped in CI without credentials)
 - Full smoke test plan documented and executed against live hardware
 
+**Phase 10 Lessons Learned**
+- **What went well:** `mcp.shared.memory.create_connected_server_and_client_session` is the right
+  in-process testing primitive — no subprocess needed for wire protocol tests. All 32 CI tests and
+  13 live tests passed cleanly.
+- **Changed from plan:** Dropped the `mcp_session` pytest fixture in favour of inlining the async
+  context manager directly in each test. The fixture pattern caused anyio cancel-scope teardown
+  errors (cancel scope exiting in a different asyncio Task than it was entered in) — a known
+  pytest-asyncio + anyio interaction. Inlining avoids this entirely.
+- **Changed from plan:** The two original live tests (`test_live_authenticate`,
+  `test_live_get_devices`) were rewritten to use the `authed_client` module-scoped fixture.
+  The `autouse=True` `mock_env_vars` fixture in conftest overwrites `os.getenv()` inside any test
+  function body, so live tests that read credentials must use module-scoped fixtures (which run
+  before monkeypatching begins).
+- **Watch out for next phase:** `gh auth status` returns "not logged in" even when a valid PAT
+  exists in the macOS git keychain. Use `GH_TOKEN=$(git credential fill ...)` to extract the token
+  and prefix `gh` calls with `GH_TOKEN="$TOKEN"`.
+- **Actual effort vs estimate:** ~2h actual vs ~3h estimated.
+- **Investment time:** 1:45 wall-clock (planning through PR).
+- **Defects found:**
+  - [D001] `test_live_authenticate`/`test_live_get_devices` failed with wrong credentials because
+    `mock_env_vars` autouse fixture overwrote env vars inside test function scope | Discovered:
+    Gate 5 smoke test | Severity: medium | Resolved: Y
+
 ---
 
-## Phase 11 — Project Report
+## Phase 11 — Deep Repo Audit + README Overhaul
+
+**Status:** 🔲 Pending
+
+### Scope
+
+A comprehensive quality pass across the entire codebase before the project report. Six work streams run as an iterative analysis → fix → retest cycle.
+
+**Stream A — README Overhaul**
+- Rewrite `README.md` from stub to full project introduction: what it does, which controllers are supported, full Claude Desktop setup instructions (config JSON snippet), Docker setup, environment variables, tool reference table (all 11 tools with one-line descriptions), known limitations (AI+ write restriction, HTTP-only API), links to `docs/API.md` and `CONTRIBUTING.md`
+
+**Stream B — Deep Repo Analysis**
+- Gap analysis: any missing `__init__.py` exports, unused imports, stale TODO/FIXME comments, dead code paths, incomplete docstrings, inconsistencies between `docs/API.md` and actual implementation
+- Verify all 15 API quirks from `docs/API.md` have corresponding code comments at the point of enforcement in `client.py` / `controller.py`
+- Confirm `.env.example` matches every env var the server actually reads
+- Confirm `docs/DEPLOYMENT.md` referenced in `docs/API.md` exists (or note it as missing)
+
+**Stream C — Test Case Analysis**
+- Coverage audit: identify any code path with <85% branch coverage
+- Missing edge cases: for each public function, verify negative paths, boundary inputs, and async exception propagation are tested
+- Fixture hygiene: check that no fixture contains real credentials, device IDs, or tokens
+
+**Stream D — Expert Code Review**
+- Senior Python Engineer persona: idiomatic Python 3.11+, type annotation completeness, async safety (no blocking calls outside `to_thread`), error handling consistency, logging discipline (no credentials at any level)
+- Flag any inconsistency between Phase 4's exception-raising refactor and remaining call sites
+
+**Stream E — Expert Security Review**
+- Security Engineer persona: injection risks, credential handling, input sanitization on all tool parameters
+- `pip audit` — zero CVEs (confirm `pyjwt` suppression still appropriate)
+- Dockerfile security: non-root user, no secrets baked in, minimal attack surface
+- Log audit: grep all `logger.*` calls for any field that could contain credentials or PII
+
+**Stream F — Remediation + Retest Cycle**
+- Fix every finding from B–E
+- Re-run full gate loop after each fix batch: `ruff check`, `mypy`, `pytest -v`, `pip-audit`
+- Repeat until all tools exit clean with zero findings
+
+### Acceptance Criteria
+- `README.md` covers: purpose, supported hardware, Claude Desktop config, Docker setup, all 11 tools, known limitations
+- `ruff`, `mypy`, `pytest` all clean after all fixes
+- Zero `pip audit` findings (or all suppressed with documented justification)
+- Zero defects from code review or security review left unresolved
+- All 15 API quirk enforcement points have inline code comments
+
+---
+
+**Phase 11 Lessons Learned** — (to be written after merge)
+
+---
+
+## Phase 12 — Project Report
 
 **Status:** 🔲 Pending
 
@@ -315,7 +398,7 @@ These tests run in CI without real AC Infinity credentials (mock client or subpr
 - Final project report document covering:
   - Section 1: Feature summary
   - Section 2: Architecture decisions
-  - Section 3: Code review findings (all defects from gate loops)
+  - Section 3: Code review findings (all defects from gate loops, phases 1–11)
   - Section 4: Time investment summary (per-phase wall-clock from lessons learned)
   - Section 5: API quirks reference
 

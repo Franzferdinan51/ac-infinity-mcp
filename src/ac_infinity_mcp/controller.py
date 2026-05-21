@@ -1,8 +1,9 @@
 """Controller-type detection and write payload building.
 
-Implements the read-before-write pattern for legacy controllers and
-the static-payload pattern for AI+ (new framework) controllers.
-Phase 1: stubs only. Full implementation in Phase 8.
+Implements the read-before-write pattern for both legacy and AI+ controllers.
+Both devType 11/18 (legacy) and devType 22 (AI+) use the same 142-field response
+structure from getdevModeSettingList. The write payload is the flat scalar subset
+with modeSetid stripped (Quirk 11) and modeType enforced (Quirk 12).
 """
 
 from __future__ import annotations
@@ -40,8 +41,39 @@ def build_write_payload(
 ) -> dict[str, Any]:
     """Build the write payload for a port mode/speed change.
 
-    Legacy: deep merge updates into current_settings (all 77 params required).
-    New framework: start from static defaults, overlay target fields.
-    Phase 8 stub: not yet implemented.
+    Both legacy and AI+ use read-before-write: start from the flat scalar fields
+    of the getdevModeSettingList response, strip modeSetid (Quirk 11), overlay
+    updates, then enforce modeType=2 when onSpead > 0 (Quirk 12).
+
+    Non-scalar fields (devSetting dict, fieldSet list, ipcSetting) are excluded
+    because the write endpoint uses form-encoding and cannot represent nested objects.
+
+    Args:
+        current_settings: Full mode settings dict from get_mode_settings() — the
+            142-field response. Nested values (devSetting, fieldSet) are filtered out.
+        updates: Fields to change, e.g. {"onSpead": 5}.
+        controller_type: LEGACY or NEW_FRAMEWORK (same logic for both).
+
+    Returns:
+        Complete flat payload dict ready to POST to /dev/addDevMode (~138 fields).
     """
-    raise NotImplementedError("build_write_payload is implemented in Phase 8")
+    # Keep only flat scalar values — form-encoding cannot represent dicts or lists
+    payload: dict[str, Any] = {
+        k: v for k, v in current_settings.items() if not isinstance(v, (dict, list))
+    }
+
+    payload.update(updates)
+
+    # Quirk 11: modeSetid causes a 403 for legacy controllers; strip it for all types
+    payload.pop("modeSetid", None)
+
+    # Quirk 12: modeType must be 2 when onSpead > 0
+    if payload.get("onSpead", 0) > 0:
+        payload["modeType"] = 2
+
+    logger.debug(
+        "Built %s write payload (%d fields)",
+        controller_type.value,
+        len(payload),
+    )
+    return payload

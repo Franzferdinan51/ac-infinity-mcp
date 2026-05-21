@@ -5,7 +5,8 @@ from datetime import datetime
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError
+from ac_infinity_mcp.controller import build_write_payload, detect_controller_type
+from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError, ACInfinityDeviceError
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,146 @@ class ACInfinityClient:
             chunk_num,
         )
         return all_records
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+        ),
+        reraise=True,
+    )
+    def get_mode_settings(self, dev_id: str | int, port: int) -> dict:
+        """Fetch current mode settings for one port on a device.
+
+        Required for read-before-write (Quirk 13). The port parameter is mandatory
+        (Quirk 16) — the endpoint returns a single dict for that port, not a list.
+
+        Args:
+            dev_id: Numeric device ID (devId field from devInfoListAll — Quirk 7).
+            port: 1-based port number.
+
+        Returns:
+            142-field dict from the API response data. Nested fields (devSetting,
+            fieldSet, ipcSetting) are present but excluded by build_write_payload.
+
+        Raises:
+            ACInfinityAuthError: If not authenticated or token rejected (code 401).
+            ACInfinityAPIError: If the API returns a non-200 code.
+            requests.exceptions.Timeout: After tenacity exhausts retries.
+            requests.exceptions.ConnectionError: After tenacity exhausts retries.
+        """
+        if not self.token:
+            raise ACInfinityAuthError("Not authenticated — call authenticate() first")
+
+        headers = {
+            "token": self.token,
+            "Host": "www.acinfinityserver.com",
+            "User-Agent": "okhttp/3.10.0",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        }
+        data = {"devId": dev_id, "port": port, "appId": self.token}
+
+        resp = self.session.post(
+            self.MODE_SETTINGS_ENDPOINT, data=data, headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+
+        result = resp.json()
+        if result.get("code") != 200:
+            error_msg = result.get("msg", "Unknown error")
+            code = result.get("code")
+            logger.error(
+                "Failed to get mode settings (devId=%s port=%s): %s", dev_id, port, error_msg
+            )
+            if code == 401:
+                raise ACInfinityAuthError(f"Token rejected by API (code 401): {error_msg}")
+            raise ACInfinityAPIError(f"API error {code}: {error_msg}")
+
+        settings = result.get("data") or {}
+        logger.debug("Fetched mode settings for devId=%s port=%s", dev_id, port)
+        return settings
+
+    def set_port_mode(
+        self,
+        device_data: dict,
+        port: int,
+        updates: dict,
+        dry_run: bool = True,
+    ) -> dict:
+        """Write port mode settings using read-before-write.
+
+        Reads current settings, merges updates, and optionally POSTs to addDevMode.
+        Both legacy and AI+ controllers use the same read-before-write pattern since
+        getdevModeSettingList returns the same 142-field structure for both.
+
+        Args:
+            device_data: Full device dict from get_devices() — used for controller
+                type detection and devId lookup.
+            port: 1-based port number.
+            updates: Fields to change, e.g. {"onSpead": 5}.
+            dry_run: If True (default), build and return the payload without sending.
+
+        Returns:
+            Dict with keys:
+                "payload": the complete dict that would be / was sent
+                "dry_run": bool
+                "controller_type": "legacy" or "new_framework"
+                "sent": bool (True only when dry_run=False and HTTP succeeded)
+
+        Raises:
+            ACInfinityAuthError: If not authenticated.
+            ACInfinityAPIError: If the API returns a non-200 code (only when dry_run=False).
+            ACInfinityDeviceError: If devId is missing from device_data.
+        """
+        if not self.token:
+            raise ACInfinityAuthError("Not authenticated — call authenticate() first")
+
+        dev_id = device_data.get("devId")
+        if not dev_id:
+            raise ACInfinityDeviceError("device_data missing devId field")
+
+        controller_type = detect_controller_type(device_data)
+        current_settings = self.get_mode_settings(dev_id, port)
+        payload = build_write_payload(current_settings, updates, controller_type)
+
+        result: dict = {
+            "payload": payload,
+            "dry_run": dry_run,
+            "controller_type": controller_type.value,
+            "sent": False,
+        }
+
+        if dry_run:
+            logger.debug(
+                "Dry run — payload built for devId=%s port=%s (%d fields)",
+                dev_id, port, len(payload),
+            )
+            return result
+
+        self._enforce_write_rate_limit()
+
+        headers = {
+            "token": self.token,
+            "Host": "www.acinfinityserver.com",
+            "User-Agent": "okhttp/3.10.0",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        }
+        resp = self.session.post(
+            self.ADD_DEV_MODE_ENDPOINT, data=payload, headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+
+        write_result = resp.json()
+        if write_result.get("code") != 200:
+            error_msg = write_result.get("msg", "Unknown error")
+            code = write_result.get("code")
+            logger.error("Write failed for devId=%s port=%s: %s", dev_id, port, error_msg)
+            raise ACInfinityAPIError(f"Write API error {code}: {error_msg}")
+
+        logger.info("Wrote mode settings for devId=%s port=%s", dev_id, port)
+        result["sent"] = True
+        return result
 
     def parse_device_data(self, device_data: dict, role: str | None = None) -> dict:
         """Extract readable values from AC Infinity device response"""

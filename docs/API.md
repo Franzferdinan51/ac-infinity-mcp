@@ -238,7 +238,267 @@ next_request_time = last_ts + 1  # exclusive start for next page
 
 ---
 
-## All 15 Known API Quirks
+### POST /dev/getdevModeSettingList
+
+**Purpose:** Read current mode settings for one port on a device (required before every legacy write).
+
+**Headers:**
+```
+token: <appId>
+Host: www.acinfinityserver.com
+User-Agent: okhttp/3.10.0
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+```
+
+**Request parameters:**
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `devId` | string | Numeric device ID from `devInfoListAll` (Quirk 7) |
+| `port` | int | 1-based port number. **Required** — omitting returns code 999999 (Quirk 16) |
+| `appId` | string | Session token (`appId` from login) |
+
+**Request example:**
+```
+devId=REDACTED_DEV_ID&port=1&appId=REDACTED_TOKEN
+```
+
+**Response (success):**
+```json
+{
+  "code": 200,
+  "msg": "success.",
+  "data": {
+    "modeSetid": "REDACTED_MODE_SET_ID",
+    "devId": "REDACTED_DEV_ID",
+    "externalPort": 1,
+    "offSpead": 0,
+    "onSpead": 5,
+    "onSelfSpead": 0,
+    "activeHt": 0,
+    "devHt": 90,
+    "devHtf": 194,
+    "devLtf": 32,
+    "activeLt": 0,
+    "devLt": 0,
+    "activeHh": 0,
+    "devHh": 100,
+    "activeLh": 0,
+    "devLh": 0,
+    "acitveTimerOn": 0,
+    "acitveTimerOff": 0,
+    "activeCycleOn": 300,
+    "activeCycleOff": 60,
+    "schedStartTime": 65535,
+    "schedEndtTime": 65535,
+    "surplus": 0,
+    "modeType": 0,
+    "activeHtVpd": 0,
+    "activeLtVpd": 0,
+    "activeHtVpdNums": 99,
+    "activeLtVpdNums": 1,
+    "targetTSwitch": 0,
+    "targetHumiSwitch": 0,
+    "settingMode": 0,
+    "vpdSettingMode": 0,
+    "targetVpdSwitch": 0,
+    "targetVpd": 0,
+    "targetTemp": 0,
+    "targetTempF": 32,
+    "targetHumi": 65,
+    "isUpdateVpdNums": false,
+    "co2TargetSwitch": 0,
+    "co2SettingMode": 0,
+    "co2HighSwitch": 0,
+    "co2LowSwitch": 0,
+    "co2HighValue": 0,
+    "co2LowValue": 0,
+    "co2TargetValue": 0,
+    "co2Accuracy": 0,
+    "co2FanTargetSwitch": 0,
+    "co2FanSettingMode": 0,
+    "co2FanHighSwitch": 0,
+    "co2FanLowSwitch": 0,
+    "co2FanHighValue": 0,
+    "co2FanLowValue": 0,
+    "co2FanTargetValue": 0,
+    "co2FanAccuracy": 0,
+    "moistureTargetSwitch": 0,
+    "moistureSettingMode": 0,
+    "moistureHighSwitch": 0,
+    "moistureLowSwitch": 0,
+    "moistureHighValue": 0,
+    "moistureLowValue": 0,
+    "moistureTargetValue": 0,
+    "moistureAccuracy": 0,
+    "waterTempTargetSwitch": 0,
+    "waterTempSettingMode": 0,
+    "waterTempHighSwitch": 0,
+    "waterTempLowSwitch": 0,
+    "waterTempHighValueF": 32,
+    "waterTempHighValue": 0,
+    "waterTempLowValueF": 32,
+    "waterTempLowValue": 0,
+    "waterTempTargetValueF": 32,
+    "waterTempTargetValue": 0,
+    "waterTempAccuracy": 0,
+    "phTargetSwitch": 0,
+    "phSettingMode": 0,
+    "phHighSwitch": 0,
+    "phLowSwitch": 0,
+    "phHighValue": 0,
+    "phLowValue": 0,
+    "phTargetValue": 0,
+    "phAccuracy": 0,
+    "ecTdsTargetSwitch": 0,
+    "ecTdsSettingMode": 0,
+    "ecTdsHighSwitch": 0,
+    "ecTdsLowSwitchEc": 0,
+    "ecTdsLowSwitchTds": 0,
+    "ecTdsHighValueEcUs": 0,
+    "ecTdsHighValueEcMs": 0,
+    "ecTdsHighValueTdsPpm": 0,
+    "ecTdsHighValueTdsPpt": 0,
+    "ecTdsLowValueEcUs": 0,
+    "ecTdsLowValueEcMs": 0,
+    "ecTdsLowValueTdsPpm": 0,
+    "ecTdsLowValueTdsPpt": 0,
+    "ecTdsTargetValueEcUs": 0,
+    "ecTdsTargetValueEcMs": 0,
+    "ecTdsTargetValueTdsPpm": 0,
+    "ecTdsTargetValueTdsPpt": 0,
+    "ecTdsAccuracy": 0,
+    "waterLevelTargetSwitch": 0,
+    "waterLevelSettingMode": 0,
+    "waterLevelHighSwitch": 0,
+    "waterLevelLowSwitch": 0,
+    "waterLevelHighValue": 0,
+    "waterLevelLowValue": 0,
+    "waterLevelTargetValue": 0,
+    "waterLevelAccuracy": 0,
+    "ecOrTds": null,
+    "flowRate": null,
+    "quickRunTime": null,
+    "quickRunState": null,
+    "sensorModeFlowRate": null,
+    "maxWateringAmount": null,
+    "protection": null,
+    "schedModeFlowRate": null,
+    "waterDuration": 0,
+    "interval": 0,
+    "timestamp": null,
+    "reportSeq": null,
+    "fieldSet": [],
+    "humidity": 5714,
+    "temperature": 1792,
+    "tTrend": 0,
+    "hTrend": 0,
+    "unit": 0,
+    "speak": 0,
+    "trend": 0,
+    "atType": 1,
+    "temperatureF": 6426,
+    "isOpenAutomation": 0,
+    "devTimeZone": null,
+    "loadType": 0,
+    "loadState": 0,
+    "abnormalState": 0,
+    "devMacAddr": null,
+    "restore": false,
+    "masterPort": null,
+    "onlyUpdateSpeed": 0,
+    "tdsUnit": 0,
+    "ecUnit": 0,
+    "devSetting": { "...": "nested device config — not included in write payload" },
+    "ipcSetting": null
+  }
+}
+```
+
+**Structure notes:**
+
+| Aspect | Detail |
+|--------|--------|
+| Total fields | 142 per port response |
+| Flat scalar fields | 140 (these form the write payload basis) |
+| `fieldSet` | Always `[]` — exclude from write payload (Quirk 13) |
+| `devSetting` | Nested device config dict — exclude from write payload (Quirk 13) |
+| `ipcSetting` | Always `null` — exclude from write payload |
+| Response vs legacy vs AI+ | Identical 142-field structure for devType 11, 18, and 22 |
+
+**Field reference (140 flat fields):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `modeSetid` | string | Record ID — **exclude from write payload** (Quirk 11) |
+| `devId` | string | Device ID — include in write payload |
+| `externalPort` | int | Port number (1-based) |
+| `offSpead` | int | Off speed (0–10) |
+| `onSpead` | int | On speed (0–10) |
+| `onSelfSpead` | int | Self-start speed |
+| `modeType` | int | Mode type — must be 2 when `onSpead > 0` (Quirk 12) |
+| `activeHt` / `activeHh` / `activeLt` / `activeLh` | int | High/low temp/humidity trigger enables |
+| `devHt` / `devHtf` / `devLt` / `devLtf` | int | High/low temp thresholds (°C and °F) |
+| `devHh` / `devLh` | int | High/low humidity thresholds |
+| `acitveTimerOn` / `acitveTimerOff` | int | Timer enable flags (note typo in field name) |
+| `activeCycleOn` / `activeCycleOff` | int | Cycle mode on/off durations (seconds) |
+| `schedStartTime` / `schedEndtTime` | int | Schedule start/end (65535 = disabled; note typo in `schedEndtTime`) |
+| `surplus` | int or null | Legacy: 0; AI+: null |
+| `activeHtVpd` / `activeLtVpd` | int | VPD high/low trigger enables |
+| `activeHtVpdNums` / `activeLtVpdNums` | int | VPD thresholds |
+| `targetTSwitch` / `targetHumiSwitch` / `targetVpdSwitch` | int | Target mode enables |
+| `settingMode` / `vpdSettingMode` | int | Setting mode flags |
+| `targetVpd` / `targetTemp` / `targetTempF` / `targetHumi` | int | Target values |
+| `isUpdateVpdNums` | bool | VPD update flag |
+| `co2*` / `co2Fan*` | int | CO2 and CO2 fan automation settings (8 fields each) |
+| `moisture*` | int | Moisture sensor automation settings (8 fields) |
+| `waterTemp*` | int | Water temperature automation settings (11 fields) |
+| `ph*` | int | pH automation settings (8 fields) |
+| `ecTds*` | int | EC/TDS automation settings (17 fields) |
+| `waterLevel*` | int | Water level automation settings (8 fields) |
+| `waterDuration` / `interval` | int | Watering duration and interval |
+| `humidity` / `temperature` / `temperatureF` | int | Current sensor readings (raw ×100) — included in write payload |
+| `speak` / `trend` / `tTrend` / `hTrend` | int | Current port/trend state |
+| `atType` / `unit` | int | Automation type / unit flags |
+| `isOpenAutomation` | int | Automation enabled flag |
+| `loadType` / `loadState` / `abnormalState` | int | Port load info |
+| `restore` | bool | Restore flag |
+| `onlyUpdateSpeed` / `tdsUnit` / `ecUnit` | int | Misc flags |
+| Null fields | — | `ecOrTds`, `flowRate`, `quickRunTime`, `quickRunState`, `sensorModeFlowRate`, `maxWateringAmount`, `protection`, `schedModeFlowRate`, `timestamp`, `reportSeq`, `devTimeZone`, `devMacAddr`, `masterPort` |
+
+---
+
+### POST /dev/addDevMode
+
+**Purpose:** Write mode settings for one port. Used by both legacy and AI+ controllers.
+
+**Critical:** Strip `modeSetid` (Quirk 11). Set `modeType=2` when `onSpead > 0` (Quirk 12).
+Enforce 1.5s minimum between calls (Quirk 15).
+
+**Headers:** Same as `getdevModeSettingList`.
+
+**Request parameters:** All 140 flat scalar fields from `getdevModeSettingList` response,
+with `modeSetid` removed and desired changes overlaid. Do **not** include `fieldSet` (list)
+or `devSetting` (nested dict) — these cannot be form-encoded.
+
+**Request example (partial):**
+```
+devId=REDACTED_DEV_ID&externalPort=1&onSpead=5&modeType=2&offSpead=0&...
+```
+
+**Response (success):**
+```json
+{"code": 200, "msg": "success", "data": null}
+```
+
+**Response (rate limit exceeded — Quirk 15):**
+```json
+{"code": 403, "msg": "Data saving failed. Please try again later.", "data": null}
+```
+
+---
+
+## All 16 Known API Quirks
 
 ### Quirk 1 — Auth typo: `appPasswordl`
 
@@ -402,16 +662,21 @@ modeType=2&onSpead=5&...
 
 ---
 
-### Quirk 13 — Legacy controllers require read-before-write (all 77 params)
+### Quirk 13 — Legacy controllers require read-before-write (all ~138 flat fields)
 
-Legacy controllers (`newFrameworkDevice=false`) require the full set of ~77 parameters
-in every write request to `/dev/addDevMode`. Sending a partial payload results in the
-omitted fields being reset to zero/default, which can turn off ports or wipe schedules.
+Legacy controllers (`newFrameworkDevice=false`) require the full set of ~138 flat scalar
+fields in every write request to `/dev/addDevMode`. Sending a partial payload results in
+the omitted fields being reset to zero/default, which can turn off ports or wipe schedules.
 
 The correct pattern is:
-1. Read current mode settings via `GET /dev/getdevModeSettingList`
-2. Merge the desired change into the full existing payload
-3. Send the complete merged payload to `/dev/addDevMode`
+1. Call `getdevModeSettingList` with `devId` + `port` + auth to get the 142-field response
+2. Take all 140 flat scalar fields from `data`; exclude `modeSetid` (Quirk 11), `fieldSet`
+   (list), and `devSetting` (nested dict) — these cannot be form-encoded
+3. Overlay the desired change
+4. Send the complete merged payload (~138 fields) to `/dev/addDevMode`
+
+Note: AI+ controllers (`newFrameworkDevice=true`) return the same 142-field structure
+from `getdevModeSettingList` and benefit from the same read-before-write pattern.
 
 ---
 
@@ -448,4 +713,23 @@ def _enforce_write_rate_limit(self) -> None:
     self._last_write_time = time.monotonic()
 ```
 
-Read-only calls (`devInfoListAll`, `dataPage`) are not rate-limited.
+Read-only calls (`devInfoListAll`, `dataPage`, `getdevModeSettingList`) are not rate-limited.
+
+---
+
+### Quirk 16 — `getdevModeSettingList` requires `port` parameter; returns one dict per call
+
+The `/dev/getdevModeSettingList` endpoint requires a `port` parameter (1-based integer).
+Omitting `port` returns `{"code": 999999, "msg": "Operation failed, please try again"}`.
+The response `data` field is a **single dict** for that port — not a list of all ports.
+
+To read settings for all ports on a device, call the endpoint once per port:
+
+```python
+for port in range(1, port_count + 1):
+    settings = get_mode_settings(dev_id, port)
+    # settings is a dict with 142 fields for that port
+```
+
+The `externalPort` field in the response matches the `port` parameter sent.
+Both legacy and AI+ controllers return the same 142-field structure.

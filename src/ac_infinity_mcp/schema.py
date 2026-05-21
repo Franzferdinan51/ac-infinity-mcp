@@ -55,17 +55,6 @@ class ACIReading:
         }
 
 
-@dataclass
-class VPDTargets:
-    """VPD ranges by grow stage"""
-    clones: tuple = (0.8, 1.2)
-    seedling: tuple = (0.8, 1.2)
-    veg: tuple = (1.0, 1.5)
-    early_flower: tuple = (1.0, 1.8)
-    mid_flower: tuple = (1.2, 2.0)
-    late_flower: tuple = (1.2, 1.8)
-
-
 def calculate_vpd(temp_c: float, humidity: float) -> float:
     """Calculate VPD using Magnus formula"""
     a = 17.27

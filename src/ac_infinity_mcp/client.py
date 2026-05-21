@@ -1,6 +1,7 @@
 import logging
+import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -28,13 +29,46 @@ class ACInfinityClient:
         self.token: str | None = None
         self.session = requests.Session()
         self._last_write_time: float = 0.0
+        self._write_lock = threading.Lock()
+        self._auth_lock = threading.Lock()
+
+    def _raise_for_api_code(self, code: int | None, error_msg: str, context: str) -> None:
+        """Map API response code to the appropriate exception."""
+        if code == 401:
+            raise ACInfinityAuthError(f"Token rejected by API (code 401): {error_msg}")
+        raise ACInfinityAPIError(f"{context} API error {code}: {error_msg}")
+
+    def _call_with_token_refresh(self, fn, *args, **kwargs):
+        """Call fn(); on a 401 ACInfinityAuthError, re-authenticate once and retry.
+
+        Long-running servers can outlive the API's token TTL. Rather than failing
+        the call (forcing a server restart), refresh the token transparently.
+        """
+        token_at_start = self.token
+        try:
+            return fn(*args, **kwargs)
+        except ACInfinityAuthError:
+            if not self.token:
+                raise  # never authenticated; nothing to refresh
+            with self._auth_lock:
+                if self.token == token_at_start:
+                    logger.info("Token rejected by API — refreshing")
+                    if not self.authenticate():
+                        raise
+            return fn(*args, **kwargs)
 
     def _enforce_write_rate_limit(self) -> None:
-        """Enforce 1.5s minimum between write API calls (returns 403 if exceeded)."""
-        elapsed = time.monotonic() - self._last_write_time
-        if elapsed < 1.5:
-            time.sleep(1.5 - elapsed)
-        self._last_write_time = time.monotonic()
+        """Enforce 1.5s minimum between write API calls (returns 403 if exceeded).
+
+        Held under a lock so concurrent writers serialize correctly — without it,
+        parallel tool calls can pass the elapsed-time check simultaneously and
+        slam the API back-to-back.
+        """
+        with self._write_lock:
+            elapsed = time.monotonic() - self._last_write_time
+            if elapsed < 1.5:
+                time.sleep(1.5 - elapsed)
+            self._last_write_time = time.monotonic()
 
     def authenticate(self) -> bool:
         """Login and get API token"""
@@ -74,6 +108,20 @@ class ACInfinityClient:
             logger.error("AC Infinity authentication error: %s", e)
             return False
 
+    def get_devices(self) -> list[dict]:
+        """Fetch all connected devices.
+
+        Returns:
+            List of raw device dicts from the AC Infinity API.
+
+        Raises:
+            ACInfinityAuthError: If not authenticated or refresh fails.
+            ACInfinityAPIError: If the API returns a non-200, non-401 code.
+            requests.exceptions.Timeout: After tenacity exhausts retries.
+            requests.exceptions.ConnectionError: After tenacity exhausts retries.
+        """
+        return self._call_with_token_refresh(self._get_devices_inner)
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -82,18 +130,7 @@ class ACInfinityClient:
         ),
         reraise=True,
     )
-    def get_devices(self) -> list[dict]:
-        """Fetch all connected devices.
-
-        Returns:
-            List of raw device dicts from the AC Infinity API.
-
-        Raises:
-            ACInfinityAuthError: If not authenticated (token is None).
-            ACInfinityAPIError: If the API returns a non-200 code.
-            requests.exceptions.Timeout: After tenacity exhausts retries.
-            requests.exceptions.ConnectionError: After tenacity exhausts retries.
-        """
+    def _get_devices_inner(self) -> list[dict]:
         if not self.token:
             raise ACInfinityAuthError("Not authenticated — call authenticate() first")
 
@@ -114,13 +151,24 @@ class ACInfinityClient:
             error_msg = result.get("msg", "Unknown error")
             code = result.get("code")
             logger.error("Failed to get devices: %s", error_msg)
-            if code == 401:
-                raise ACInfinityAuthError(f"Token rejected by API (code 401): {error_msg}")
-            raise ACInfinityAPIError(f"API error {code}: {error_msg}")
+            self._raise_for_api_code(code, error_msg, "Devices")
 
         devices = result.get("data", [])
         logger.info("Fetched %d devices", len(devices))
         return devices
+
+    def get_historical_data(
+        self,
+        dev_id: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        page_size: int = 2000,
+    ) -> list[dict]:
+        """Fetch historical sensor data (with transparent 401 token refresh)."""
+        return self._call_with_token_refresh(
+            self._get_historical_data_inner,
+            dev_id, start_timestamp, end_timestamp, page_size,
+        )
 
     @retry(
         stop=stop_after_attempt(3),
@@ -130,7 +178,7 @@ class ACInfinityClient:
         ),
         reraise=True,
     )
-    def get_historical_data(
+    def _get_historical_data_inner(
         self,
         dev_id: str,
         start_timestamp: int,
@@ -192,12 +240,11 @@ class ACInfinityClient:
             result = resp.json()
             if result.get("code") != 200:
                 error_msg = result.get("msg", "Unknown error")
+                code = result.get("code")
                 logger.error(
                     "History fetch failed (chunk %d): %s", chunk_num, error_msg
                 )
-                raise ACInfinityAPIError(
-                    f"API error {result.get('code')}: {error_msg}"
-                )
+                self._raise_for_api_code(code, error_msg, "History")
 
             rows = result.get("data", {}).get("rows", [])
             if not rows:
@@ -225,6 +272,12 @@ class ACInfinityClient:
         )
         return all_records
 
+    def get_mode_settings(self, dev_id: str | int, port: int) -> dict:
+        """Fetch current mode settings (with transparent 401 token refresh)."""
+        return self._call_with_token_refresh(
+            self._get_mode_settings_inner, dev_id, port,
+        )
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -233,7 +286,7 @@ class ACInfinityClient:
         ),
         reraise=True,
     )
-    def get_mode_settings(self, dev_id: str | int, port: int) -> dict:
+    def _get_mode_settings_inner(self, dev_id: str | int, port: int) -> dict:
         """Fetch current mode settings for one port on a device.
 
         Required for read-before-write (Quirk 13). The port parameter is mandatory
@@ -276,15 +329,27 @@ class ACInfinityClient:
             logger.error(
                 "Failed to get mode settings (devId=%s port=%s): %s", dev_id, port, error_msg
             )
-            if code == 401:
-                raise ACInfinityAuthError(f"Token rejected by API (code 401): {error_msg}")
-            raise ACInfinityAPIError(f"API error {code}: {error_msg}")
+            self._raise_for_api_code(code, error_msg, "Mode settings")
 
         settings = result.get("data") or {}
         logger.debug("Fetched mode settings for devId=%s port=%s", dev_id, port)
         return settings
 
     def set_port_mode(
+        self,
+        device_data: dict,
+        port: int,
+        updates: dict,
+        dry_run: bool = True,
+        require_variable_speed: bool = False,
+    ) -> dict:
+        """Write port mode settings (with transparent 401 token refresh)."""
+        return self._call_with_token_refresh(
+            self._set_port_mode_inner,
+            device_data, port, updates, dry_run, require_variable_speed,
+        )
+
+    def _set_port_mode_inner(
         self,
         device_data: dict,
         port: int,
@@ -408,7 +473,7 @@ class ACInfinityClient:
                 continue
 
             logger.error("Write failed for devId=%s port=%s: %s", dev_id, port, error_msg)
-            raise ACInfinityAPIError(f"Write API error {code}: {error_msg}")
+            self._raise_for_api_code(code, error_msg, "Write")
 
         logger.info("Wrote mode settings for devId=%s port=%s", dev_id, port)
         result["sent"] = True
@@ -447,7 +512,7 @@ class ACInfinityClient:
             ]
 
         return {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(UTC).replace(tzinfo=None).isoformat() + "Z",
             "device_id": device_data.get("devCode"),
             "device_name": device_data.get("devName", "Unknown"),
             "temperature_c": round(temp_c, 1),
@@ -481,7 +546,7 @@ class ACInfinityClient:
         """
         create_time = record.get("createTime", 0)
         timestamp = (
-            datetime.utcfromtimestamp(int(create_time)).isoformat() + "Z"
+            datetime.fromtimestamp(int(create_time), UTC).replace(tzinfo=None).isoformat() + "Z"
             if create_time
             else None
         )

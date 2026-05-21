@@ -190,6 +190,41 @@ def test_enforce_write_rate_limit_is_callable(client):
     assert callable(client._enforce_write_rate_limit)
 
 
+def test_enforce_write_rate_limit_sleeps_when_elapsed_less_than_1_5s(client):
+    """Two back-to-back calls must enforce >=1.5s between them."""
+    import time
+    client._last_write_time = 0.0
+    client._enforce_write_rate_limit()  # primes _last_write_time
+    t0 = time.monotonic()
+    client._enforce_write_rate_limit()  # must sleep ~1.5s
+    elapsed = time.monotonic() - t0
+    assert elapsed >= 1.4  # allow small scheduling tolerance
+
+
+def test_enforce_write_rate_limit_lock_serializes_concurrent_writes(client):
+    """Concurrent rate-limit calls must serialize via the lock."""
+    import threading
+    import time
+
+    client._last_write_time = time.monotonic() - 10.0  # cold start
+    timestamps: list[float] = []
+
+    def call_and_record() -> None:
+        client._enforce_write_rate_limit()
+        timestamps.append(time.monotonic())
+
+    threads = [threading.Thread(target=call_and_record) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    timestamps.sort()
+    # First call passes immediately; subsequent calls must be >=1.5s apart
+    for i in range(1, len(timestamps)):
+        assert timestamps[i] - timestamps[i - 1] >= 1.4
+
+
 # ============ authenticate ============
 
 @responses_lib.activate
@@ -244,6 +279,225 @@ def test_authenticate_password_truncated_to_25_chars():
     c = ACInfinityClient("test@example.com", "a" * 30)
     assert len(c.password) == 25
     assert c.password == "a" * 25
+
+
+@responses_lib.activate
+def test_authenticate_generic_exception_returns_false(client):
+    """Bare except path in authenticate() must return False for unexpected errors."""
+    with patch.object(client.session, "post", side_effect=RuntimeError("unexpected boom")):
+        result = client.authenticate()
+    assert result is False
+
+
+# ============ Token refresh on 401 ============
+
+@responses_lib.activate
+def test_get_devices_refreshes_token_on_401(authed_client):
+    """A 401 from get_devices must trigger one re-auth and a retry that succeeds."""
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token_xyz"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL, json=DEVICES_SUCCESS, status=200,
+    )
+
+    devices = authed_client.get_devices()
+    assert len(devices) >= 1
+    assert authed_client.token == "fresh_token_xyz"
+
+
+@responses_lib.activate
+def test_get_devices_second_401_after_refresh_raises(authed_client):
+    """If the retry after refresh also returns 401, raise without further attempts."""
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "still expired"}, status=200,
+    )
+
+    with pytest.raises(ACInfinityAuthError):
+        authed_client.get_devices()
+
+
+@responses_lib.activate
+def test_get_devices_no_refresh_when_unauthenticated(client):
+    """If client was never authenticated, AuthError raises without attempting refresh."""
+    # client fixture has no token set
+    with pytest.raises(ACInfinityAuthError):
+        client.get_devices()
+    # No login call should have been made
+    login_calls = [c for c in responses_lib.calls if LOGIN_URL in c.request.url]
+    assert len(login_calls) == 0
+
+
+@responses_lib.activate
+def test_get_devices_no_refresh_if_authenticate_fails(authed_client):
+    """If re-authentication fails, the original AuthError propagates."""
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json=AUTH_FAILURE, status=200,
+    )
+
+    with pytest.raises(ACInfinityAuthError):
+        authed_client.get_devices()
+
+
+@responses_lib.activate
+def test_get_historical_data_refreshes_token_on_401(authed_client):
+    """get_historical_data must also refresh on 401."""
+    responses_lib.add(
+        responses_lib.POST, HISTORY_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, HISTORY_URL, json=HISTORY_EMPTY, status=200,
+    )
+
+    result = authed_client.get_historical_data("12345", 1714000000, 1714086400)
+    assert result == []
+
+
+def test_call_with_token_refresh_serializes_concurrent_401s(authed_client):
+    """Concurrent 401s must coalesce into a SINGLE re-authentication.
+
+    Without coordination, N parallel tool calls hitting an expired token would
+    each call authenticate(), wasting roundtrips and potentially triggering
+    upstream rate limits. The _auth_lock + token_at_start snapshot in
+    _call_with_token_refresh must ensure only one thread actually re-auths;
+    the others observe the refreshed token and proceed.
+    """
+    import threading
+
+    n_threads = 5
+    # Barrier inside the inner call: all N threads must arrive at the 401 raise
+    # before any of them can proceed to the refresh path. This proves every
+    # thread captured token_at_start = OLD token (none could observe a refresh
+    # mid-flight).
+    inner_barrier = threading.Barrier(n_threads)
+    thread_local = threading.local()
+    auth_call_count = 0
+    auth_count_lock = threading.Lock()
+
+    def fake_authenticate() -> bool:
+        nonlocal auth_call_count
+        with auth_count_lock:
+            auth_call_count += 1
+        authed_client.token = f"fresh_token_{auth_call_count}"
+        return True
+
+    def fake_inner() -> list[dict]:
+        attempt = getattr(thread_local, "attempt", 0)
+        thread_local.attempt = attempt + 1
+        if attempt == 0:
+            # Synchronize: every thread must be inside the inner call with the
+            # OLD token before ANY thread proceeds to refresh.
+            inner_barrier.wait()
+            raise ACInfinityAuthError("Token rejected by API (code 401): expired")
+        return [{"devCode": "C58ZA"}]
+
+    results: list = []
+    errors: list = []
+    start_gate = threading.Barrier(n_threads)
+
+    def call() -> None:
+        try:
+            start_gate.wait()  # release all threads simultaneously
+            result = authed_client.get_devices()
+            results.append(result)
+        except Exception as e:  # pragma: no cover — only fires on test failure
+            errors.append(e)
+
+    with patch.object(authed_client, "authenticate", side_effect=fake_authenticate):
+        with patch.object(authed_client, "_get_devices_inner", side_effect=fake_inner):
+            threads = [threading.Thread(target=call) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+    assert errors == []
+    assert len(results) == n_threads
+    # Critical: only ONE authenticate() call despite N threads hitting 401
+    assert auth_call_count == 1, f"Expected 1 auth call, got {auth_call_count}"
+    # All threads converged on the same refreshed token
+    assert authed_client.token == "fresh_token_1"
+
+
+@responses_lib.activate
+def test_get_mode_settings_refreshes_token_on_401(authed_client):
+    """get_mode_settings must also refresh on 401."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL,
+        json={"code": 200, "data": MOCK_MODE_SETTINGS_LEGACY_PORT1}, status=200,
+    )
+
+    result = authed_client.get_mode_settings(12345, 1)
+    assert "modeType" in result
+
+
+# ============ Historical data — non-401 API error coverage ============
+
+@responses_lib.activate
+def test_get_historical_data_500_raises_api_error(authed_client):
+    """Non-401 API error must raise ACInfinityAPIError (not trigger refresh)."""
+    responses_lib.add(
+        responses_lib.POST, HISTORY_URL,
+        json={"code": 500, "msg": "server error"}, status=200,
+    )
+    with pytest.raises(ACInfinityAPIError):
+        authed_client.get_historical_data("12345", 1714000000, 1714086400)
+
+
+# ============ Historical data — pagination edge ============
+
+@responses_lib.activate
+def test_get_historical_data_pagination_stops_when_cursor_no_advance(authed_client):
+    """If returned records don't advance the time cursor, stop paginating (line 264)."""
+    # Page 1: returns page_size records, but the last record's createTime equals current_start
+    page1 = {
+        "code": 200,
+        "data": {
+            "rows": [
+                {"createTime": 1714000000, "temperature": 2400}
+                for _ in range(3)
+            ],
+        },
+    }
+    responses_lib.add(responses_lib.POST, HISTORY_URL, json=page1, status=200)
+
+    result = authed_client.get_historical_data(
+        "12345", 1714000000, 1714086400, page_size=3,
+    )
+    # Should stop after first page because cursor can't advance past start
+    assert len(result) == 3
 
 
 # ============ get_devices ============

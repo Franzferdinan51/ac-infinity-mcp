@@ -21,7 +21,6 @@ from ac_infinity_mcp.schema import (
     ACInfinityAuthError,
     ACInfinityDeviceError,
     ACIReading,
-    VPDTargets,
 )
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -338,14 +337,17 @@ async def check_vpd_drift(device_id: str, stage: str = "veg") -> str:
         On failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
+        if stage not in STAGE_TARGETS:
+            valid = ", ".join(STAGE_TARGETS)
+            return json.dumps({"error": f"Unknown stage: {stage}. Valid: {valid}"})
+
         reading_json = await get_device_reading(device_id)
         reading = json.loads(reading_json)
 
         if "error" in reading:
             return json.dumps(reading)
 
-        targets = VPDTargets()
-        target_range = getattr(targets, stage, targets.veg)
+        target_range = STAGE_TARGETS[stage]["vpd"]
         current_vpd = reading["vpd"]
 
         status = "OK"
@@ -504,7 +506,7 @@ async def detect_environment_trends(device_id: str, days: int = 7) -> str:
         if not 1 <= days <= 30:
             return json.dumps({"error": "days must be between 1 and 30"})
 
-        today = datetime.utcnow()
+        today = datetime.now(UTC).replace(tzinfo=None)
         start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
         end_date = today.strftime("%Y-%m-%d")
 
@@ -554,7 +556,7 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         if not 1 <= days <= 30:
             return json.dumps({"error": "days must be between 1 and 30"})
 
-        today = datetime.utcnow()
+        today = datetime.now(UTC).replace(tzinfo=None)
         start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
         end_date = today.strftime("%Y-%m-%d")
 
@@ -898,7 +900,9 @@ def apply_sampling(readings: list, interval: str) -> list:
     result = []
     for bucket_key in sorted(sampled.keys()):
         avg = average_readings(sampled[bucket_key])
-        avg["timestamp"] = datetime.utcfromtimestamp(bucket_key).isoformat() + "Z"
+        avg["timestamp"] = (
+            datetime.fromtimestamp(bucket_key, UTC).replace(tzinfo=None).isoformat() + "Z"
+        )
         result.append(avg)
     return result
 
@@ -948,7 +952,7 @@ def average_readings(readings: list) -> dict:
     }
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     email = os.getenv("AC_INFINITY_EMAIL")
     password = os.getenv("AC_INFINITY_PASSWORD")
 
@@ -971,5 +975,5 @@ def main() -> None:
     asyncio.run(_run())
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

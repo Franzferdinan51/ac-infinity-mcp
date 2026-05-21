@@ -13,4 +13,7 @@ COPY --from=builder /install /usr/local
 
 ENV PYTHONUNBUFFERED=1
 
+RUN useradd --no-create-home --shell /bin/false appuser
+USER appuser
+
 CMD ["ac-infinity-mcp"]

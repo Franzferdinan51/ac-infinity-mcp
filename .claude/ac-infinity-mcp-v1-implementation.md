@@ -289,6 +289,19 @@ Maintain ≥85% coverage.
 **Status:** 🔲 Pending
 
 ### Scope
+
+**Stream A — MCP wire protocol tests (new)**
+The existing server tests call tool functions directly as Python async functions. They do not
+exercise the MCP JSON-RPC layer at all. Phase 10 must add tests that verify:
+- All 11 tools are registered on `mcp_server` with correct names
+- Each tool's parameter schema (names, types, required/optional) matches the function signature
+- A JSON-RPC `tools/call` message sent through a real `mcp` client against a running server
+  process returns the expected response shape (happy path + missing-creds guard)
+- `main()` startup path: missing env vars → `sys.exit(1)`; bad credentials → `sys.exit(1)`
+
+These tests run in CI without real AC Infinity credentials (mock client or subprocess with no env).
+
+**Stream B — Live API integration tests**
 - Expand `tests/integration/test_live.py` with live API tests (skipped in CI without credentials)
 - Full smoke test plan documented and executed against live hardware
 

@@ -42,3 +42,23 @@ jobs:
 
       - name: Security audit — pip-audit
         run: pip-audit --ignore-vuln PYSEC-2025-183
+
+  docker:
+    name: "Docker build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image
+        run: docker build -t ac-infinity-mcp-test .
+
+      - name: Missing creds → clean exit
+        run: |
+          output=$(docker run --rm ac-infinity-mcp-test 2>&1) || true
+          echo "$output"
+          echo "$output" | grep -q "Missing AC_INFINITY_EMAIL" || (echo "FAIL: expected missing-creds error" && exit 1)
+
+      - name: No .env baked into image
+        run: |
+          count=$(docker run --rm ac-infinity-mcp-test find / -name ".env" 2>/dev/null | wc -l)
+          [ "$count" -eq 0 ] || (echo "FAIL: .env found in image" && exit 1)

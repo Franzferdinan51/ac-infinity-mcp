@@ -33,6 +33,10 @@ EXPECTED_TOOLS = {
     "set_port_speed",
     "set_port_on",
     "set_port_off",
+    "set_vpd_automation",
+    "set_temperature_automation",
+    "set_humidity_automation",
+    "set_port_mode",
 }
 
 SCHEMA_CASES: list[tuple[str, list[str], list[str]]] = [
@@ -53,6 +57,17 @@ SCHEMA_CASES: list[tuple[str, list[str], list[str]]] = [
     ("set_port_speed", ["device_id", "port", "speed"], ["dry_run"]),
     ("set_port_on", ["device_id", "port"], ["dry_run"]),
     ("set_port_off", ["device_id", "port"], ["dry_run"]),
+    ("set_vpd_automation", ["device_id", "port", "target_vpd"], ["dry_run"]),
+    ("set_temperature_automation", ["device_id", "port", "min_c", "max_c"], ["dry_run"]),
+    ("set_humidity_automation", ["device_id", "port", "min_rh", "max_rh"], ["dry_run"]),
+    (
+        "set_port_mode",
+        ["device_id", "port", "mode"],
+        [
+            "dry_run", "cycle_on_seconds", "cycle_off_seconds",
+            "schedule_start", "schedule_end", "timer_duration_seconds",
+        ],
+    ),
 ]
 
 # Env without AC Infinity credentials — built at import time so subprocess
@@ -88,13 +103,13 @@ def _get_tool_schema(name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_all_13_tools_registered() -> None:
+def test_all_17_tools_registered() -> None:
     registered = {t.name for t in mcp_server._tool_manager.list_tools()}  # type: ignore[attr-defined]
     assert registered == EXPECTED_TOOLS
 
 
-def test_tool_count_is_exactly_13() -> None:
-    assert len(mcp_server._tool_manager.list_tools()) == 13  # type: ignore[attr-defined]
+def test_tool_count_is_exactly_17() -> None:
+    assert len(mcp_server._tool_manager.list_tools()) == 17  # type: ignore[attr-defined]
 
 
 def test_mcp_server_name_is_ac_infinity() -> None:
@@ -150,12 +165,12 @@ def test_get_historical_readings_defaults() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_protocol_list_tools_returns_all_13(mock_client: MagicMock) -> None:
+async def test_protocol_list_tools_returns_all_17(mock_client: MagicMock) -> None:
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         async with create_connected_server_and_client_session(srv.mcp_server) as session:
             result = await session.list_tools()
             names = {t.name for t in result.tools}
-            assert len(result.tools) == 13
+            assert len(result.tools) == 17
             assert names == EXPECTED_TOOLS
 
 

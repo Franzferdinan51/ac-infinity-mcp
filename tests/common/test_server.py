@@ -12,6 +12,7 @@ from ac_infinity_mcp.server import (
     _filter_readings_by_time,
     _format_schedule_time,
     _parse_duration_seconds,
+    _parse_schedule_time,
     apply_sampling,
     average_readings,
     check_vpd_drift,
@@ -25,9 +26,13 @@ from ac_infinity_mcp.server import (
     get_port_settings,
     get_port_status,
     mcp_server,
+    set_humidity_automation,
+    set_port_mode,
     set_port_off,
     set_port_on,
     set_port_speed,
+    set_temperature_automation,
+    set_vpd_automation,
 )
 from tests.conftest import MOCK_DEVICE_LEGACY
 
@@ -1679,3 +1684,599 @@ async def test_get_port_settings_generic_exception(mock_client):
         result = await get_port_settings("C58ZA", 1)
     data = json.loads(result)
     assert "error" in data
+
+
+# ============ _parse_schedule_time ============
+
+def test_parse_schedule_time_valid():
+    assert _parse_schedule_time("08:00") == 480
+    assert _parse_schedule_time("00:00") == 0
+    assert _parse_schedule_time("23:59") == 1439
+    assert _parse_schedule_time("06:30") == 390
+
+
+def test_parse_schedule_time_none_returns_disabled():
+    assert _parse_schedule_time(None) == 65535
+
+
+def test_parse_schedule_time_invalid_raises():
+    with pytest.raises(ValueError, match="Invalid schedule time"):
+        _parse_schedule_time("25:00")
+    with pytest.raises(ValueError, match="Invalid schedule time"):
+        _parse_schedule_time("not-a-time")
+
+
+# ============ set_vpd_automation ============
+
+MOCK_VPD_DRY = {
+    "payload": {"atType": 8, "targetVpd": 14, "vpdSettingMode": 1, "targetVpdSwitch": 1},
+    "dry_run": True,
+    "controller_type": "legacy",
+    "sent": False,
+}
+MOCK_VPD_LIVE = {
+    "payload": {},
+    "dry_run": False,
+    "controller_type": "legacy",
+    "sent": True,
+}
+
+
+async def test_set_vpd_automation_dry_run(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_VPD_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 1.4, dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    assert data["sent"] is False
+    assert data["target_vpd_kpa"] == 1.4
+    assert "payload" in data
+    assert data["controller_type"] == "legacy"
+
+
+async def test_set_vpd_automation_live(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_VPD_LIVE
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 1.4, dry_run=False)
+    data = json.loads(result)
+    assert data["sent"] is True
+    assert "payload" not in data
+
+
+async def test_set_vpd_automation_payload_encoding(mock_client):
+    """targetVpd must be stored as kPa × 10 (not × 100)."""
+    mock_client.set_port_mode.return_value = MOCK_VPD_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        await set_vpd_automation("C58ZA", 1, 1.4)
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 8
+    assert call_updates["targetVpd"] == 14   # 1.4 × 10
+    assert call_updates["vpdSettingMode"] == 1
+    assert call_updates["targetVpdSwitch"] == 1
+
+
+async def test_set_vpd_automation_target_too_low(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 0.0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "0.1" in data["error"]
+
+
+async def test_set_vpd_automation_target_too_high(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 3.1)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_vpd_automation_boundary_min_valid(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_VPD_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 0.1)
+    data = json.loads(result)
+    assert "error" not in data
+
+
+async def test_set_vpd_automation_boundary_max_valid(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_VPD_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 3.0)
+    data = json.loads(result)
+    assert "error" not in data
+
+
+async def test_set_vpd_automation_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("INVALID", 1, 1.4)
+    data = json.loads(result)
+    assert "error" in data
+    assert "INVALID" in data["error"]
+
+
+async def test_set_vpd_automation_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 0, 1.4)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_set_vpd_automation_ai_plus_returns_not_implemented(mock_client):
+    mock_client.set_port_mode.return_value = {
+        "payload": {}, "dry_run": False,
+        "controller_type": "new_framework", "sent": False,
+        "ai_plus_write_unsupported": True,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 1.4, dry_run=False)
+    data = json.loads(result)
+    assert "error" in data
+    assert "AI+" in data["error"]
+    assert data["controller_type"] == "new_framework"
+
+
+async def test_set_vpd_automation_api_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAPIError("server error")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 1.4)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_vpd_automation_auth_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAuthError("token expired")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 1.4)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_vpd_automation_generic_exception(mock_client):
+    mock_client.set_port_mode.side_effect = RuntimeError("crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_vpd_automation("C58ZA", 1, 1.4)
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ set_temperature_automation ============
+
+MOCK_TEMP_DRY = {
+    "payload": {"atType": 3, "devLt": 20, "devHt": 28, "activeLt": 1, "activeHt": 1},
+    "dry_run": True,
+    "controller_type": "legacy",
+    "sent": False,
+}
+
+
+async def test_set_temperature_automation_dry_run(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_TEMP_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, 20.0, 28.0, dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    assert data["min_c"] == 20.0
+    assert data["max_c"] == 28.0
+    assert "payload" in data
+
+
+async def test_set_temperature_automation_payload_encoding(mock_client):
+    """devLt/devHt are raw Celsius integers — no × 100 scaling."""
+    mock_client.set_port_mode.return_value = MOCK_TEMP_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        await set_temperature_automation("C58ZA", 1, 20.0, 28.0)
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 3
+    assert call_updates["devLt"] == 20    # raw °C, not 2000
+    assert call_updates["devHt"] == 28
+    assert call_updates["activeLt"] == 1
+    assert call_updates["activeHt"] == 1
+
+
+async def test_set_temperature_automation_min_ge_max(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, 28.0, 20.0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "min_c" in data["error"]
+
+
+async def test_set_temperature_automation_equal_min_max(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, 25.0, 25.0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_temperature_automation_out_of_range(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, -1.0, 30.0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_temperature_automation_max_out_of_range(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, 20.0, 51.0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_temperature_automation_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("INVALID", 1, 20.0, 28.0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_temperature_automation_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 0, 20.0, 28.0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_set_temperature_automation_ai_plus_returns_not_implemented(mock_client):
+    mock_client.set_port_mode.return_value = {
+        "payload": {}, "dry_run": False,
+        "controller_type": "new_framework", "sent": False,
+        "ai_plus_write_unsupported": True,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, 20.0, 28.0, dry_run=False)
+    data = json.loads(result)
+    assert "error" in data
+    assert "AI+" in data["error"]
+
+
+async def test_set_temperature_automation_api_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAPIError("err")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, 20.0, 28.0)
+    assert "error" in json.loads(result)
+
+
+async def test_set_temperature_automation_generic_exception(mock_client):
+    mock_client.set_port_mode.side_effect = RuntimeError("crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_temperature_automation("C58ZA", 1, 20.0, 28.0)
+    assert "error" in json.loads(result)
+
+
+# ============ set_humidity_automation ============
+
+MOCK_HUMI_DRY = {
+    "payload": {"atType": 3, "devLh": 50, "devHh": 70, "activeLh": 1, "activeHh": 1},
+    "dry_run": True,
+    "controller_type": "legacy",
+    "sent": False,
+}
+
+
+async def test_set_humidity_automation_dry_run(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_HUMI_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 1, 50.0, 70.0, dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    assert data["min_rh"] == 50.0
+    assert data["max_rh"] == 70.0
+    assert "payload" in data
+
+
+async def test_set_humidity_automation_payload_encoding(mock_client):
+    """devLh/devHh are raw % integers — no × 100 scaling."""
+    mock_client.set_port_mode.return_value = MOCK_HUMI_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        await set_humidity_automation("C58ZA", 1, 50.0, 70.0)
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 3
+    assert call_updates["devLh"] == 50    # raw %, not 5000
+    assert call_updates["devHh"] == 70
+    assert call_updates["activeLh"] == 1
+    assert call_updates["activeHh"] == 1
+
+
+async def test_set_humidity_automation_min_ge_max(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 1, 70.0, 50.0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "min_rh" in data["error"]
+
+
+async def test_set_humidity_automation_out_of_range(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 1, -1.0, 70.0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_humidity_automation_max_out_of_range(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 1, 50.0, 101.0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_humidity_automation_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("INVALID", 1, 50.0, 70.0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_humidity_automation_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 0, 50.0, 70.0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_set_humidity_automation_ai_plus_returns_not_implemented(mock_client):
+    mock_client.set_port_mode.return_value = {
+        "payload": {}, "dry_run": False,
+        "controller_type": "new_framework", "sent": False,
+        "ai_plus_write_unsupported": True,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 1, 50.0, 70.0, dry_run=False)
+    data = json.loads(result)
+    assert "error" in data
+    assert "AI+" in data["error"]
+
+
+async def test_set_humidity_automation_api_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAPIError("err")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 1, 50.0, 70.0)
+    assert "error" in json.loads(result)
+
+
+async def test_set_humidity_automation_generic_exception(mock_client):
+    mock_client.set_port_mode.side_effect = RuntimeError("crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_humidity_automation("C58ZA", 1, 50.0, 70.0)
+    assert "error" in json.loads(result)
+
+
+# ============ set_port_mode ============
+
+MOCK_MODE_DRY = {
+    "payload": {"atType": 1},
+    "dry_run": True,
+    "controller_type": "legacy",
+    "sent": False,
+}
+MOCK_MODE_LIVE = {
+    "payload": {},
+    "dry_run": False,
+    "controller_type": "legacy",
+    "sent": True,
+}
+
+
+async def test_set_port_mode_off_dry_run(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "OFF")
+    data = json.loads(result)
+    assert data["mode"] == "OFF"
+    assert data["dry_run"] is True
+    assert "payload" in data
+
+
+async def test_set_port_mode_on(mock_client):
+    mock_client.set_port_mode.return_value = {**MOCK_MODE_DRY, "payload": {"atType": 2}}
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "ON")
+    data = json.loads(result)
+    assert data["mode"] == "ON"
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 2
+
+
+async def test_set_port_mode_auto(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "AUTO")
+    data = json.loads(result)
+    assert data["mode"] == "AUTO"
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 3
+
+
+async def test_set_port_mode_vpd(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "VPD")
+    data = json.loads(result)
+    assert data["mode"] == "VPD"
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 8
+
+
+async def test_set_port_mode_case_insensitive(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "off")
+    data = json.loads(result)
+    assert data["mode"] == "OFF"
+
+
+async def test_set_port_mode_live(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_LIVE
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "OFF", dry_run=False)
+    data = json.loads(result)
+    assert data["sent"] is True
+    assert "payload" not in data
+
+
+async def test_set_port_mode_invalid_mode(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "INVALID")
+    data = json.loads(result)
+    assert "error" in data
+    assert "INVALID" in data["error"]
+
+
+async def test_set_port_mode_cycle_with_params(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode(
+            "C58ZA", 1, "CYCLE", cycle_on_seconds=300, cycle_off_seconds=60
+        )
+    data = json.loads(result)
+    assert data["mode"] == "CYCLE"
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 6
+    assert call_updates["activeCycleOn"] == 300
+    assert call_updates["activeCycleOff"] == 60
+
+
+async def test_set_port_mode_cycle_missing_on_param(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "CYCLE", cycle_off_seconds=60)
+    data = json.loads(result)
+    assert "error" in data
+    assert "cycle_on_seconds" in data["error"]
+
+
+async def test_set_port_mode_cycle_missing_both_params(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "CYCLE")
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_mode_cycle_zero_seconds(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "CYCLE", cycle_on_seconds=0, cycle_off_seconds=60)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_mode_schedule_with_params(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode(
+            "C58ZA", 1, "SCHEDULE", schedule_start="08:00", schedule_end="20:00"
+        )
+    data = json.loads(result)
+    assert data["mode"] == "SCHEDULE"
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 7
+    assert call_updates["schedStartTime"] == 480   # 8*60
+    assert call_updates["schedEndtTime"] == 1200   # 20*60
+
+
+async def test_set_port_mode_schedule_missing_params(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "SCHEDULE", schedule_start="08:00")
+    data = json.loads(result)
+    assert "error" in data
+    assert "schedule_end" in data["error"]
+
+
+async def test_set_port_mode_schedule_invalid_time_format(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode(
+            "C58ZA", 1, "SCHEDULE", schedule_start="bad", schedule_end="20:00"
+        )
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_mode_timer_to_off_with_duration(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode(
+            "C58ZA", 1, "TIMER_TO_OFF", timer_duration_seconds=3600
+        )
+    data = json.loads(result)
+    assert data["mode"] == "TIMER_TO_OFF"
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 5
+    assert call_updates["acitveTimerOff"] == 3600
+
+
+async def test_set_port_mode_timer_to_on_with_duration(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode(
+            "C58ZA", 1, "TIMER_TO_ON", timer_duration_seconds=1800
+        )
+    data = json.loads(result)
+    assert data["mode"] == "TIMER_TO_ON"
+    call_updates = mock_client.set_port_mode.call_args[0][2]
+    assert call_updates["atType"] == 4
+    assert call_updates["acitveTimerOn"] == 1800
+
+
+async def test_set_port_mode_timer_missing_duration(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "TIMER_TO_OFF")
+    data = json.loads(result)
+    assert "error" in data
+    assert "timer_duration_seconds" in data["error"]
+
+
+async def test_set_port_mode_timer_zero_duration(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "TIMER_TO_OFF", timer_duration_seconds=0)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_mode_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("INVALID", 1, "OFF")
+    data = json.loads(result)
+    assert "error" in data
+    assert "INVALID" in data["error"]
+
+
+async def test_set_port_mode_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 0, "OFF")
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_set_port_mode_ai_plus_returns_not_implemented(mock_client):
+    mock_client.set_port_mode.return_value = {
+        "payload": {}, "dry_run": False,
+        "controller_type": "new_framework", "sent": False,
+        "ai_plus_write_unsupported": True,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "OFF", dry_run=False)
+    data = json.loads(result)
+    assert "error" in data
+    assert "AI+" in data["error"]
+
+
+async def test_set_port_mode_device_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityDeviceError("smart mode")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "OFF")
+    assert "error" in json.loads(result)
+
+
+async def test_set_port_mode_auth_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAuthError("expired")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "OFF")
+    assert "error" in json.loads(result)
+
+
+async def test_set_port_mode_generic_exception(mock_client):
+    mock_client.set_port_mode.side_effect = RuntimeError("crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_mode("C58ZA", 1, "OFF")
+    assert "error" in json.loads(result)

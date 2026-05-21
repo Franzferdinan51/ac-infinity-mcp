@@ -605,12 +605,33 @@ def _decode_mode(mode_int: int | None) -> str:
     return _MODE_LABELS.get(mode_int, f"UNKNOWN({mode_int})")
 
 
+_MODE_AT_TYPES: dict[str, int] = {v: k for k, v in _MODE_LABELS.items()}
+
+
 def _format_schedule_time(minutes: int | None) -> str | None:
     """Convert minutes-since-midnight to HH:MM string. Returns None if disabled (65535)."""
     if minutes is None or minutes == 65535:
         return None
     h, m = divmod(minutes, 60)
     return f"{h:02d}:{m % 60:02d}"
+
+
+def _parse_schedule_time(time_str: str | None) -> int:
+    """Convert HH:MM string to minutes-since-midnight. Returns 65535 if None (disabled)."""
+    if time_str is None:
+        return 65535
+    try:
+        parts = time_str.split(":")
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        return h * 60 + m
+    except (ValueError, AttributeError):
+        raise ValueError(
+            f"Invalid schedule time {time_str!r}: expected 'HH:MM' (00:00–23:59)"
+        ) from None
 
 
 @mcp_server.tool()
@@ -1011,6 +1032,384 @@ async def set_port_off(
         return json.dumps({"error": str(e)})
     except Exception as e:
         logger.error("Unexpected error in set_port_off: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+# ============ Automation Write Tools ============
+
+
+def _ai_plus_unsupported_error(device_id: str, port: int, controller_type: str) -> str:
+    # dry_run is always False here: the AI+ guard in client._set_port_mode_inner fires
+    # only on the live-write path (dry_run returns early before the guard is reached).
+    return json.dumps({
+        "error": (
+            "AI+ controllers (devType=22) live write path is not yet implemented. "
+            "dry_run=True is fully supported and returns the payload that would be sent. "
+            "See docs/API.md for details."
+        ),
+        "device_id": device_id,
+        "port": port,
+        "dry_run": False,
+        "controller_type": controller_type,
+    })
+
+
+@mcp_server.tool()
+async def set_vpd_automation(
+    device_id: str,
+    port: int,
+    target_vpd: float,
+    dry_run: bool = True,
+) -> str:
+    """Enable VPD automation on a port using the built-in temperature and humidity sensors.
+
+    Switches the port to VPD mode (atType=8) and sets the VPD target.
+    Uses read-before-write. Defaults to dry_run=True — set dry_run=False to
+    write to the device.
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        target_vpd: Target VPD in kPa, range 0.1–3.0.
+            Typical ranges by stage: seedling/clones 0.8–1.2, veg 1.0–1.5,
+            early_flower 1.0–1.8, mid_flower 1.2–2.0, late_flower 1.2–1.8.
+        dry_run: If True (default), returns the payload that would be sent
+            without writing.
+
+    Returns:
+        JSON with action, device_id, port, target_vpd_kpa, dry_run,
+        controller_type, sent, and payload (when dry_run=True).
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+        if not 0.1 <= target_vpd <= 3.0:
+            return json.dumps({"error": "target_vpd must be between 0.1 and 3.0 kPa"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        updates = {
+            "atType": 8,  # VPD mode
+            "vpdSettingMode": 1,
+            "targetVpd": round(target_vpd * 10),  # API stores as ×10 (e.g. 1.4 kPa → 14)
+            "targetVpdSwitch": 1,
+        }
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, updates, dry_run
+        )
+
+        if write_result.get("ai_plus_write_unsupported"):
+            return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
+
+        response: dict = {
+            "action": f"set port {port} VPD automation to {target_vpd} kPa",
+            "device_id": device_id,
+            "port": port,
+            "target_vpd_kpa": target_vpd,
+            "dry_run": write_result["dry_run"],
+            "controller_type": write_result["controller_type"],
+            "sent": write_result["sent"],
+        }
+        if write_result["dry_run"]:
+            response["payload"] = write_result["payload"]
+        return json.dumps(response, indent=2)
+
+    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.warning("Error in set_vpd_automation (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in set_vpd_automation: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def set_temperature_automation(
+    device_id: str,
+    port: int,
+    min_c: float,
+    max_c: float,
+    dry_run: bool = True,
+) -> str:
+    """Enable temperature automation on a port using the built-in temperature sensor.
+
+    Switches the port to AUTO mode (atType=3) and sets the temperature thresholds.
+    The controller speeds up when temperature exceeds max_c and slows down below
+    min_c. Uses read-before-write. Defaults to dry_run=True.
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        min_c: Minimum temperature threshold in °C, range 0–50. Sub-degree values
+            are rounded to the nearest integer (e.g. 20.5 → 21).
+        max_c: Maximum temperature threshold in °C, range 0–50. Must exceed min_c.
+            Sub-degree values are rounded to the nearest integer.
+        dry_run: If True (default), returns the payload that would be sent
+            without writing.
+
+    Returns:
+        JSON with action, device_id, port, min_c, max_c, dry_run,
+        controller_type, sent, and payload (when dry_run=True).
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+        if not (0 <= min_c <= 50 and 0 <= max_c <= 50):
+            return json.dumps({"error": "min_c and max_c must be between 0 and 50°C"})
+        if min_c >= max_c:
+            return json.dumps({"error": "min_c must be less than max_c"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        updates = {
+            "atType": 3,  # AUTO mode
+            "devLt": round(min_c),  # raw °C integer — no ×100 scaling
+            "devHt": round(max_c),
+            "activeLt": 1,
+            "activeHt": 1,
+        }
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, updates, dry_run
+        )
+
+        if write_result.get("ai_plus_write_unsupported"):
+            return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
+
+        response: dict = {
+            "action": f"set port {port} temperature automation {min_c}–{max_c}°C",
+            "device_id": device_id,
+            "port": port,
+            "min_c": min_c,
+            "max_c": max_c,
+            "dry_run": write_result["dry_run"],
+            "controller_type": write_result["controller_type"],
+            "sent": write_result["sent"],
+        }
+        if write_result["dry_run"]:
+            response["payload"] = write_result["payload"]
+        return json.dumps(response, indent=2)
+
+    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.warning(
+            "Error in set_temperature_automation (device=%s port=%s): %s", device_id, port, e
+        )
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in set_temperature_automation: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def set_humidity_automation(
+    device_id: str,
+    port: int,
+    min_rh: float,
+    max_rh: float,
+    dry_run: bool = True,
+) -> str:
+    """Enable humidity automation on a port using the built-in humidity sensor.
+
+    Switches the port to AUTO mode (atType=3) and sets the humidity thresholds.
+    The controller speeds up when humidity exceeds max_rh and slows down below
+    min_rh. Uses read-before-write. Defaults to dry_run=True.
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        min_rh: Minimum relative humidity threshold (%), range 0–100. Sub-percent values
+            are rounded to the nearest integer (e.g. 50.5 → 51).
+        max_rh: Maximum relative humidity threshold (%), range 0–100. Must exceed min_rh.
+            Sub-percent values are rounded to the nearest integer.
+        dry_run: If True (default), returns the payload that would be sent
+            without writing.
+
+    Returns:
+        JSON with action, device_id, port, min_rh, max_rh, dry_run,
+        controller_type, sent, and payload (when dry_run=True).
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+        if not (0 <= min_rh <= 100 and 0 <= max_rh <= 100):
+            return json.dumps({"error": "min_rh and max_rh must be between 0 and 100"})
+        if min_rh >= max_rh:
+            return json.dumps({"error": "min_rh must be less than max_rh"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        updates = {
+            "atType": 3,  # AUTO mode
+            "devLh": round(min_rh),  # raw % RH integer — no ×100 scaling
+            "devHh": round(max_rh),
+            "activeLh": 1,
+            "activeHh": 1,
+        }
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, updates, dry_run
+        )
+
+        if write_result.get("ai_plus_write_unsupported"):
+            return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
+
+        response: dict = {
+            "action": f"set port {port} humidity automation {min_rh}–{max_rh}%",
+            "device_id": device_id,
+            "port": port,
+            "min_rh": min_rh,
+            "max_rh": max_rh,
+            "dry_run": write_result["dry_run"],
+            "controller_type": write_result["controller_type"],
+            "sent": write_result["sent"],
+        }
+        if write_result["dry_run"]:
+            response["payload"] = write_result["payload"]
+        return json.dumps(response, indent=2)
+
+    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.warning(
+            "Error in set_humidity_automation (device=%s port=%s): %s", device_id, port, e
+        )
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in set_humidity_automation: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+_VALID_MODES = frozenset(_MODE_AT_TYPES)
+_CYCLE_MODES = frozenset({"CYCLE"})
+_SCHEDULE_MODES = frozenset({"SCHEDULE"})
+_TIMER_MODES = frozenset({"TIMER_TO_ON", "TIMER_TO_OFF"})
+
+
+@mcp_server.tool()
+async def set_port_mode(
+    device_id: str,
+    port: int,
+    mode: str,
+    dry_run: bool = True,
+    cycle_on_seconds: int | None = None,
+    cycle_off_seconds: int | None = None,
+    schedule_start: str | None = None,
+    schedule_end: str | None = None,
+    timer_duration_seconds: int | None = None,
+) -> str:
+    """Switch a port to a specific automation mode.
+
+    All 8 AC Infinity automation modes are supported. Mode-specific parameters
+    are required for CYCLE, SCHEDULE, TIMER_TO_ON, and TIMER_TO_OFF modes.
+    Uses read-before-write. Defaults to dry_run=True.
+
+    For setting automation targets alongside the mode, prefer the dedicated tools:
+    ``set_vpd_automation`` (VPD mode), ``set_temperature_automation`` and
+    ``set_humidity_automation`` (AUTO mode).
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        mode: One of OFF, ON, AUTO, VPD, CYCLE, SCHEDULE, TIMER_TO_ON, TIMER_TO_OFF.
+        dry_run: If True (default), returns the payload without writing.
+        cycle_on_seconds: CYCLE mode — seconds the port runs per cycle. Required for CYCLE.
+        cycle_off_seconds: CYCLE mode — seconds the port is off per cycle. Required for CYCLE.
+        schedule_start: SCHEDULE mode — start time as "HH:MM" in device local time.
+            Required for SCHEDULE.
+        schedule_end: SCHEDULE mode — end time as "HH:MM" in device local time.
+            Required for SCHEDULE.
+        timer_duration_seconds: TIMER_TO_ON / TIMER_TO_OFF — countdown duration in seconds.
+            Required for TIMER_TO_ON and TIMER_TO_OFF.
+
+    Returns:
+        JSON with action, device_id, port, mode, dry_run, controller_type, sent,
+        and payload (when dry_run=True). On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+
+        mode_upper = mode.upper()
+        if mode_upper not in _VALID_MODES:
+            valid = ", ".join(sorted(_VALID_MODES))
+            return json.dumps({"error": f"Invalid mode {mode!r}. Valid modes: {valid}"})
+
+        if mode_upper in _CYCLE_MODES:
+            if cycle_on_seconds is None or cycle_off_seconds is None:
+                return json.dumps({
+                    "error": "CYCLE mode requires cycle_on_seconds and cycle_off_seconds"
+                })
+            if cycle_on_seconds < 1 or cycle_off_seconds < 1:
+                return json.dumps({"error": "cycle_on_seconds and cycle_off_seconds must be >= 1"})
+
+        if mode_upper in _SCHEDULE_MODES:
+            if schedule_start is None or schedule_end is None:
+                return json.dumps({
+                    "error": "SCHEDULE mode requires schedule_start and schedule_end ('HH:MM')"
+                })
+
+        if mode_upper in _TIMER_MODES:
+            if timer_duration_seconds is None:
+                return json.dumps({
+                    "error": f"{mode_upper} mode requires timer_duration_seconds"
+                })
+            if timer_duration_seconds < 1:
+                return json.dumps({"error": "timer_duration_seconds must be >= 1"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        at_type = _MODE_AT_TYPES[mode_upper]
+        updates: dict = {"atType": at_type}
+
+        if mode_upper == "CYCLE":
+            updates["activeCycleOn"] = cycle_on_seconds
+            updates["activeCycleOff"] = cycle_off_seconds
+        elif mode_upper == "SCHEDULE":
+            try:
+                updates["schedStartTime"] = _parse_schedule_time(schedule_start)
+                updates["schedEndtTime"] = _parse_schedule_time(schedule_end)  # API typo
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
+        elif mode_upper == "TIMER_TO_ON":
+            updates["acitveTimerOn"] = timer_duration_seconds  # API typo: acitve
+        elif mode_upper == "TIMER_TO_OFF":
+            updates["acitveTimerOff"] = timer_duration_seconds  # API typo: acitve
+
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, updates, dry_run
+        )
+
+        if write_result.get("ai_plus_write_unsupported"):
+            return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
+
+        response: dict = {
+            "action": f"set port {port} mode to {mode_upper}",
+            "device_id": device_id,
+            "port": port,
+            "mode": mode_upper,
+            "dry_run": write_result["dry_run"],
+            "controller_type": write_result["controller_type"],
+            "sent": write_result["sent"],
+        }
+        if write_result["dry_run"]:
+            response["payload"] = write_result["payload"]
+        return json.dumps(response, indent=2)
+
+    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.warning("Error in set_port_mode (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in set_port_mode: %s", e)
         return json.dumps({"error": str(e)})
 
 

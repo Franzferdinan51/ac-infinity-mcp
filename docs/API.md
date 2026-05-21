@@ -437,18 +437,20 @@ devId=REDACTED_DEV_ID&port=1&appId=REDACTED_TOKEN
 | `onSpead` | int | On speed (0–10) |
 | `onSelfSpead` | int | Self-start speed |
 | `modeType` | int | Mode type — must be 2 when `onSpead > 0` (Quirk 12) |
-| `activeHt` / `activeHh` / `activeLt` / `activeLh` | int | High/low temp/humidity trigger enables |
-| `devHt` / `devHtf` / `devLt` / `devLtf` | int | High/low temp thresholds (°C and °F) |
-| `devHh` / `devLh` | int | High/low humidity thresholds |
-| `acitveTimerOn` / `acitveTimerOff` | int | Timer enable flags (note typo in field name) |
+| `activeHt` / `activeHh` / `activeLt` / `activeLh` | int | High/low temp/humidity trigger enables (0=off, 1=on) |
+| `devHt` / `devHtf` / `devLt` / `devLtf` | int | High/low temp thresholds in raw °C and °F (no ×100 scaling — `devHt=28` means 28°C) |
+| `devHh` / `devLh` | int | High/low humidity thresholds in raw % RH (no ×100 scaling — `devHh=70` means 70%) |
+| `acitveTimerOn` / `acitveTimerOff` | int | Timer countdown durations in **seconds** for TIMER_TO_ON / TIMER_TO_OFF modes respectively (note typo in field name: `acitve`) |
 | `activeCycleOn` / `activeCycleOff` | int | Cycle mode on/off durations (seconds) |
-| `schedStartTime` / `schedEndtTime` | int | Schedule start/end (65535 = disabled; note typo in `schedEndtTime`) |
+| `schedStartTime` / `schedEndtTime` | int | Schedule start/end as **minutes since midnight** in device local time (65535 = disabled; note typo in `schedEndtTime`). Convert: `06:30` → 390 |
+| `targetVpd` | int | VPD automation target — divide by 10 for kPa (`targetVpd=14` → 1.4 kPa). Distinct from live sensor `vpdnums` which is ÷100. |
+| `vpdSettingMode` / `targetVpdSwitch` | int | VPD automation mode and enable flags (both set to 1 to enable VPD mode) |
 | `surplus` | int or null | Legacy: 0; AI+: null |
 | `activeHtVpd` / `activeLtVpd` | int | VPD high/low trigger enables |
 | `activeHtVpdNums` / `activeLtVpdNums` | int | VPD thresholds |
-| `targetTSwitch` / `targetHumiSwitch` / `targetVpdSwitch` | int | Target mode enables |
-| `settingMode` / `vpdSettingMode` | int | Setting mode flags |
-| `targetVpd` / `targetTemp` / `targetTempF` / `targetHumi` | int | Target values |
+| `targetTSwitch` / `targetHumiSwitch` | int | Target mode enables |
+| `settingMode` | int | Setting mode flag |
+| `targetTemp` / `targetTempF` / `targetHumi` | int | Temperature and humidity target values |
 | `isUpdateVpdNums` | bool | VPD update flag |
 | `co2*` / `co2Fan*` | int | CO2 and CO2 fan automation settings (8 fields each) |
 | `moisture*` | int | Moisture sensor automation settings (8 fields) |

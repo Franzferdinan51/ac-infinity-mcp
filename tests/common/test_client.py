@@ -1,11 +1,13 @@
 """Unit tests for ACInfinityClient — data parsing and HTTP methods."""
 
+from unittest.mock import patch
+
 import pytest
 import requests
 import responses as responses_lib
 
 from ac_infinity_mcp.client import ACInfinityClient
-from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError
+from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError, ACInfinityDeviceError
 from tests.fixtures.mock_api_responses import (
     AUTH_FAILURE,
     AUTH_SUCCESS,
@@ -15,10 +17,14 @@ from tests.fixtures.mock_api_responses import (
     HISTORY_EMPTY,
     HISTORY_PAGE_1,
 )
+from tests.fixtures.mock_mode_settings_ai_plus import MOCK_MODE_SETTINGS_AI_PLUS_PORT1
+from tests.fixtures.mock_mode_settings_legacy import MOCK_MODE_SETTINGS_LEGACY_PORT1
 
 LOGIN_URL = "http://www.acinfinityserver.com/api/user/appUserLogin"
 DEVICES_URL = "http://www.acinfinityserver.com/api/user/devInfoListAll"
 HISTORY_URL = "http://www.acinfinityserver.com/api/log/dataPage"
+MODE_SETTINGS_URL = "http://www.acinfinityserver.com/api/dev/getdevModeSettingList"
+ADD_DEV_MODE_URL = "http://www.acinfinityserver.com/api/dev/addDevMode"
 
 
 @pytest.fixture
@@ -434,3 +440,174 @@ def test_get_historical_data_filters_out_of_range(authed_client):
     assert result is not None
     assert len(result) == 1
     assert result[0]["createTime"] == base_ts + 1
+
+
+# ============ get_mode_settings ============
+
+MODE_SETTINGS_SUCCESS = {"code": 200, "msg": "success.", "data": MOCK_MODE_SETTINGS_LEGACY_PORT1}
+MODE_SETTINGS_401 = {"code": 401, "msg": "Unauthorized"}
+MODE_SETTINGS_999999 = {"code": 999999, "msg": "Operation failed, please try again"}
+
+
+@responses_lib.activate
+def test_get_mode_settings_happy_path(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    result = authed_client.get_mode_settings("12345", port=1)
+    assert result["externalPort"] == 1
+    assert result["onSpead"] == 5
+    assert "modeSetid" in result
+
+
+@responses_lib.activate
+def test_get_mode_settings_returns_dict_not_list(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    result = authed_client.get_mode_settings("12345", port=1)
+    assert isinstance(result, dict)
+
+
+def test_get_mode_settings_no_token_raises_auth_error(client):
+    with pytest.raises(ACInfinityAuthError):
+        client.get_mode_settings("12345", port=1)
+
+
+@responses_lib.activate
+def test_get_mode_settings_401_raises_auth_error(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_401, status=200)
+    with pytest.raises(ACInfinityAuthError):
+        authed_client.get_mode_settings("12345", port=1)
+
+
+@responses_lib.activate
+def test_get_mode_settings_999999_raises_api_error(authed_client):
+    """Quirk 16: 999999 is returned when port parameter is missing or invalid."""
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_999999, status=200)
+    with pytest.raises(ACInfinityAPIError):
+        authed_client.get_mode_settings("12345", port=99)
+
+
+@responses_lib.activate
+def test_get_mode_settings_timeout_propagates(authed_client):
+    responses_lib.add(
+        responses_lib.POST,
+        MODE_SETTINGS_URL,
+        body=requests.exceptions.Timeout(),
+    )
+    with pytest.raises(requests.exceptions.Timeout):
+        authed_client.get_mode_settings("12345", port=1)
+
+
+# ============ set_port_mode — dry_run=True ============
+
+LEGACY_DEVICE_DATA = {
+    "devId": "1424979258063367506",
+    "devType": 11,
+    "newFrameworkDevice": False,
+}
+
+AI_PLUS_DEVICE_DATA = {
+    "devId": "1424979258063547818",
+    "devType": 22,
+    "newFrameworkDevice": True,
+}
+
+
+@responses_lib.activate
+def test_set_port_mode_dry_run_legacy_returns_payload(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    result = authed_client.set_port_mode(
+        LEGACY_DEVICE_DATA, port=1, updates={"onSpead": 5}, dry_run=True
+    )
+    assert result["dry_run"] is True
+    assert result["sent"] is False
+    assert result["controller_type"] == "legacy"
+    assert "payload" in result
+
+
+@responses_lib.activate
+def test_set_port_mode_dry_run_does_not_call_write_endpoint(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={"onSpead": 5}, dry_run=True)
+    # Only one request (mode settings read), no write endpoint called
+    assert len(responses_lib.calls) == 1
+    assert "getdevModeSettingList" in responses_lib.calls[0].request.url
+
+
+@responses_lib.activate
+def test_set_port_mode_dry_run_rate_limit_not_called(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    with patch.object(authed_client, "_enforce_write_rate_limit") as mock_limit:
+        authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=True)
+        mock_limit.assert_not_called()
+
+
+@responses_lib.activate
+def test_set_port_mode_dry_run_quirk_11_modeSetid_absent(authed_client):
+    """Quirk 11: modeSetid must not appear in the write payload."""
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    result = authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=True)
+    assert "modeSetid" not in result["payload"]
+
+
+@responses_lib.activate
+def test_set_port_mode_dry_run_quirk_12_modeType_when_speed_nonzero(authed_client):
+    """Quirk 12: modeType=2 must be set when onSpead > 0."""
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    result = authed_client.set_port_mode(
+        LEGACY_DEVICE_DATA, port=1, updates={"onSpead": 5}, dry_run=True
+    )
+    assert result["payload"]["modeType"] == 2
+
+
+@responses_lib.activate
+def test_set_port_mode_dry_run_ai_plus(authed_client):
+    ai_plus_response = {"code": 200, "msg": "success.", "data": MOCK_MODE_SETTINGS_AI_PLUS_PORT1}
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=ai_plus_response, status=200)
+    result = authed_client.set_port_mode(
+        AI_PLUS_DEVICE_DATA, port=1, updates={"onSpead": 3}, dry_run=True
+    )
+    assert result["controller_type"] == "new_framework"
+    assert result["sent"] is False
+    assert result["payload"]["onSpead"] == 3
+
+
+def test_set_port_mode_no_token_raises_auth_error(client):
+    with pytest.raises(ACInfinityAuthError):
+        client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=True)
+
+
+def test_set_port_mode_missing_dev_id_raises_device_error(authed_client):
+    with pytest.raises(ACInfinityDeviceError):
+        authed_client.set_port_mode({}, port=1, updates={}, dry_run=True)
+
+
+# ============ set_port_mode — dry_run=False (live write) ============
+
+ADD_MODE_SUCCESS = {"code": 200, "msg": "success", "data": None}
+ADD_MODE_403 = {"code": 403, "msg": "Data saving failed. Please try again later."}
+
+
+@responses_lib.activate
+def test_set_port_mode_live_write_calls_rate_limit(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    responses_lib.add(responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_SUCCESS, status=200)
+    with patch.object(authed_client, "_enforce_write_rate_limit") as mock_limit:
+        authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False)
+        mock_limit.assert_called_once()
+
+
+@responses_lib.activate
+def test_set_port_mode_live_write_sent_true(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    responses_lib.add(responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_SUCCESS, status=200)
+    with patch.object(authed_client, "_enforce_write_rate_limit"):
+        result = authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False)
+    assert result["sent"] is True
+
+
+@responses_lib.activate
+def test_set_port_mode_live_write_non_200_raises_api_error(authed_client):
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
+    responses_lib.add(responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_403, status=200)
+    with patch.object(authed_client, "_enforce_write_rate_limit"):
+        with pytest.raises(ACInfinityAPIError):
+            authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False)

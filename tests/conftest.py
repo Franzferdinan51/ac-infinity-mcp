@@ -15,8 +15,10 @@ MOCK_DEVICE_LEGACY: dict = {
         "humidity": 6000,
         "vpdnums": 124,
         "ports": [
-            {"port": 1, "portName": "Intake Fan", "speak": 5, "portsLoad": 1},
-            {"port": 2, "portName": "Exhaust Fan", "speak": 7, "portsLoad": 1},
+            {"port": 1, "portName": "Intake Fan", "speak": 5, "portsLoad": 1,
+             "loadState": 1, "curMode": 3, "remainTime": 0},
+            {"port": 2, "portName": "Exhaust Fan", "speak": 7, "portsLoad": 1,
+             "loadState": 1, "curMode": 2, "remainTime": 0},
         ],
     },
 }
@@ -33,7 +35,8 @@ MOCK_DEVICE_AI_PLUS: dict = {
         "temperatureF": 7520,
         "humidity": 5500,
         "vpdnums": 150,
-        "ports": [{"port": 1, "portName": "Port 1", "speak": 0, "portsLoad": 0}],
+        "ports": [{"port": 1, "portName": "Port 1", "speak": 0, "portsLoad": 0,
+                   "loadState": 0, "curMode": 1, "remainTime": None}],
     },
 }
 

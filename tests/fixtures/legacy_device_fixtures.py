@@ -13,10 +13,14 @@ LEGACY_11_DEVICE = {
         "humidity": 6000,
         "vpdnums": 130,
         "ports": [
-            {"port": 1, "portName": "Intake Fan", "speak": 5, "portsLoad": 1},
-            {"port": 2, "portName": "Exhaust Fan", "speak": 7, "portsLoad": 1},
-            {"port": 3, "portName": "Humidifier", "speak": 0, "portsLoad": 0},
-            {"port": 4, "portName": "Heater", "speak": 0, "portsLoad": 0},
+            {"port": 1, "portName": "Intake Fan", "speak": 5, "portsLoad": 1,
+             "loadState": 1, "curMode": 3, "remainTime": 0},
+            {"port": 2, "portName": "Exhaust Fan", "speak": 7, "portsLoad": 1,
+             "loadState": 1, "curMode": 2, "remainTime": 0},
+            {"port": 3, "portName": "Humidifier", "speak": 0, "portsLoad": 0,
+             "loadState": 0, "curMode": 1, "remainTime": None},
+            {"port": 4, "portName": "Heater", "speak": 0, "portsLoad": 0,
+             "loadState": 0, "curMode": 1, "remainTime": None},
         ],
     },
 }

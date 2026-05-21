@@ -589,6 +589,203 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         return json.dumps({"error": str(e)})
 
 
+# ============ New Read Tools ============
+
+# curMode (devInfoListAll) and atType (getdevModeSettingList) use the same integer encoding
+_MODE_LABELS: dict[int, str] = {
+    1: "OFF", 2: "ON", 3: "AUTO",
+    4: "TIMER_TO_ON", 5: "TIMER_TO_OFF",
+    6: "CYCLE", 7: "SCHEDULE", 8: "VPD",
+}
+
+
+def _decode_mode(mode_int: int | None) -> str:
+    if mode_int is None:
+        return "UNKNOWN"
+    return _MODE_LABELS.get(mode_int, f"UNKNOWN({mode_int})")
+
+
+def _format_schedule_time(minutes: int | None) -> str | None:
+    """Convert minutes-since-midnight to HH:MM string. Returns None if disabled (65535)."""
+    if minutes is None or minutes == 65535:
+        return None
+    h, m = divmod(minutes, 60)
+    return f"{h:02d}:{m % 60:02d}"
+
+
+@mcp_server.tool()
+async def get_port_status(device_id: str, port: int) -> str:
+    """
+    Get the live operational status of a single port.
+
+    Reads real-time fields from the device info response: actual current power
+    level, load detection, active automation mode, and remaining timer seconds.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+        port: 1-based port number
+
+    Returns:
+        JSON example::
+
+            {
+              "device_id": "C58ZA",
+              "port": 1,
+              "port_name": "Intake Fan",
+              "power_level": 5,
+              "load_detected": true,
+              "mode": "AUTO",
+              "remain_time_seconds": 0
+            }
+
+        ``mode`` is one of: OFF, ON, AUTO, TIMER_TO_ON, TIMER_TO_OFF, CYCLE, SCHEDULE, VPD.
+        ``load_detected`` is true when a device is physically plugged into the port.
+        On failure returns ``{"error": "...", "detail": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        ports = device.get("deviceInfo", {}).get("ports", [])
+        port_data = next((p for p in ports if p.get("port") == port), None)
+        if port_data is None:
+            return json.dumps({"error": f"Port {port} not found on device {device_id}"})
+
+        return json.dumps({
+            "device_id": device_id,
+            "port": port,
+            "port_name": port_data.get("portName", f"Port {port}"),
+            "power_level": port_data.get("speak", 0),
+            "load_detected": bool(port_data.get("loadState", 0)),
+            "mode": _decode_mode(port_data.get("curMode")),
+            "remain_time_seconds": port_data.get("remainTime") or 0,
+        }, indent=2)
+
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in get_port_status: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in get_port_status: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in get_port_status: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def get_port_settings(device_id: str, port: int) -> str:
+    """
+    Get the full automation configuration for a port.
+
+    Calls the getdevModeSettingList endpoint and returns the active mode,
+    speed target, and all configured automation targets (VPD, temperature,
+    humidity, schedule, timer, cycle).
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices)
+        port: 1-based port number
+
+    Returns:
+        JSON example::
+
+            {
+              "device_id": "C58ZA",
+              "port": 1,
+              "mode": "AUTO",
+              "speed_target": 5,
+              "vpd_target_kpa": null,
+              "temp_range_c": null,
+              "humidity_range_pct": null,
+              "schedule_window": null,
+              "cycle_on_seconds": 300,
+              "cycle_off_seconds": 60,
+              "timer_on_seconds": 0,
+              "timer_off_seconds": 0
+            }
+
+        ``vpd_target_kpa`` is non-null only when VPD automation is active.
+        ``temp_range_c`` / ``humidity_range_pct`` are non-null only when those
+        thresholds are enabled. ``schedule_window`` times are in device local time
+        (not UTC). On failure returns ``{"error": "...", "detail": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        settings = await asyncio.to_thread(_client().get_mode_settings, dev_id, port)
+
+        vpd_target = None
+        if settings.get("targetVpdSwitch"):
+            vpd_target = round(settings.get("targetVpd", 0) / 10, 2)
+
+        temp_range = None
+        if settings.get("activeLt") or settings.get("activeHt"):
+            temp_range = {
+                "min_c": settings.get("devLt", 0),
+                "max_c": settings.get("devHt", 0),
+            }
+
+        humi_range = None
+        if settings.get("activeLh") or settings.get("activeHh"):
+            humi_range = {
+                "min_pct": settings.get("devLh", 0),
+                "max_pct": settings.get("devHh", 0),
+            }
+
+        sched_start = _format_schedule_time(settings.get("schedStartTime"))
+        sched_end = _format_schedule_time(settings.get("schedEndtTime"))  # API typo: EndtTime
+        schedule_window = (
+            {"start": sched_start, "end": sched_end}
+            if sched_start is not None
+            else None
+        )
+
+        return json.dumps({
+            "device_id": device_id,
+            "port": port,
+            "mode": _decode_mode(settings.get("atType")),
+            "speed_target": settings.get("onSpead", 0),
+            "vpd_target_kpa": vpd_target,
+            "temp_range_c": temp_range,
+            "humidity_range_pct": humi_range,
+            "schedule_window": schedule_window,
+            "cycle_on_seconds": settings.get("activeCycleOn", 0),
+            "cycle_off_seconds": settings.get("activeCycleOff", 0),
+            "timer_on_seconds": settings.get("acitveTimerOn", 0),
+            "timer_off_seconds": settings.get("acitveTimerOff", 0),
+        }, indent=2)
+
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in get_port_settings: %s", e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": str(e),
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in get_port_settings: %s", e)
+        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in get_port_settings: %s", e)
+        return json.dumps({"error": str(e)})
+
+
 # ============ Write Tools ============
 
 @mcp_server.tool()

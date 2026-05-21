@@ -28,6 +28,8 @@ EXPECTED_TOOLS = {
     "get_environment_health",
     "detect_environment_trends",
     "get_port_activity_report",
+    "get_port_status",
+    "get_port_settings",
     "set_port_speed",
     "set_port_on",
     "set_port_off",
@@ -46,6 +48,8 @@ SCHEMA_CASES: list[tuple[str, list[str], list[str]]] = [
     ("get_environment_health", ["device_id"], ["stage"]),
     ("detect_environment_trends", ["device_id"], ["days"]),
     ("get_port_activity_report", ["device_id"], ["days"]),
+    ("get_port_status", ["device_id", "port"], []),
+    ("get_port_settings", ["device_id", "port"], []),
     ("set_port_speed", ["device_id", "port", "speed"], ["dry_run"]),
     ("set_port_on", ["device_id", "port"], ["dry_run"]),
     ("set_port_off", ["device_id", "port"], ["dry_run"]),
@@ -84,13 +88,13 @@ def _get_tool_schema(name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_all_11_tools_registered() -> None:
+def test_all_13_tools_registered() -> None:
     registered = {t.name for t in mcp_server._tool_manager.list_tools()}  # type: ignore[attr-defined]
     assert registered == EXPECTED_TOOLS
 
 
-def test_tool_count_is_exactly_11() -> None:
-    assert len(mcp_server._tool_manager.list_tools()) == 11  # type: ignore[attr-defined]
+def test_tool_count_is_exactly_13() -> None:
+    assert len(mcp_server._tool_manager.list_tools()) == 13  # type: ignore[attr-defined]
 
 
 def test_mcp_server_name_is_ac_infinity() -> None:
@@ -146,12 +150,12 @@ def test_get_historical_readings_defaults() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_protocol_list_tools_returns_all_11(mock_client: MagicMock) -> None:
+async def test_protocol_list_tools_returns_all_13(mock_client: MagicMock) -> None:
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         async with create_connected_server_and_client_session(srv.mcp_server) as session:
             result = await session.list_tools()
             names = {t.name for t in result.tools}
-            assert len(result.tools) == 11
+            assert len(result.tools) == 13
             assert names == EXPECTED_TOOLS
 
 

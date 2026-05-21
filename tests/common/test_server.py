@@ -8,7 +8,9 @@ import pytest
 
 from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError, ACInfinityDeviceError
 from ac_infinity_mcp.server import (
+    _decode_mode,
     _filter_readings_by_time,
+    _format_schedule_time,
     _parse_duration_seconds,
     apply_sampling,
     average_readings,
@@ -20,6 +22,8 @@ from ac_infinity_mcp.server import (
     get_environment_health,
     get_historical_readings,
     get_port_activity_report,
+    get_port_settings,
+    get_port_status,
     mcp_server,
     set_port_off,
     set_port_on,
@@ -1381,3 +1385,297 @@ def test_apply_sampling_bad_timestamp_skipped():
     ]
     result = apply_sampling(readings, "1h")
     assert len(result) == 1
+
+
+# ============ _decode_mode / _format_schedule_time helpers ============
+
+@pytest.mark.parametrize("mode_int,expected", [
+    (1, "OFF"), (2, "ON"), (3, "AUTO"),
+    (4, "TIMER_TO_ON"), (5, "TIMER_TO_OFF"),
+    (6, "CYCLE"), (7, "SCHEDULE"), (8, "VPD"),
+])
+def test_decode_mode_known_values(mode_int, expected):
+    assert _decode_mode(mode_int) == expected
+
+
+def test_decode_mode_none_returns_unknown():
+    assert _decode_mode(None) == "UNKNOWN"
+
+
+def test_decode_mode_unrecognised_int():
+    assert _decode_mode(99) == "UNKNOWN(99)"
+
+
+@pytest.mark.parametrize("minutes,expected", [
+    (0, "00:00"),
+    (60, "01:00"),
+    (480, "08:00"),
+    (1200, "20:00"),
+    (1439, "23:59"),
+])
+def test_format_schedule_time_valid(minutes, expected):
+    assert _format_schedule_time(minutes) == expected
+
+
+def test_format_schedule_time_disabled():
+    assert _format_schedule_time(65535) is None
+
+
+def test_format_schedule_time_none():
+    assert _format_schedule_time(None) is None
+
+
+# ============ get_port_status ============
+
+async def test_get_port_status_success(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 1)
+    data = json.loads(result)
+    assert data["device_id"] == "C58ZA"
+    assert data["port"] == 1
+    assert data["port_name"] == "Intake Fan"
+    assert data["power_level"] == 5
+    assert data["load_detected"] is True
+    assert data["mode"] == "AUTO"        # curMode=3
+    assert data["remain_time_seconds"] == 0
+
+
+async def test_get_port_status_mode_on(mock_client):
+    """Port 2 in conftest has curMode=2 → ON."""
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 2)
+    data = json.loads(result)
+    assert data["mode"] == "ON"
+
+
+async def test_get_port_status_remain_time_none_defaults_to_zero(mock_client):
+    """remainTime=None in fixture → remain_time_seconds=0 in output."""
+    mock_client.get_devices.return_value = [{
+        **MOCK_DEVICE_LEGACY,
+        "deviceInfo": {
+            **MOCK_DEVICE_LEGACY["deviceInfo"],
+            "ports": [
+                {"port": 1, "portName": "Fan", "speak": 3,
+                 "portsLoad": 1, "loadState": 1, "curMode": 3, "remainTime": None},
+            ],
+        },
+    }]
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 1)
+    data = json.loads(result)
+    assert data["remain_time_seconds"] == 0
+
+
+async def test_get_port_status_load_not_detected(mock_client):
+    """loadState=0 → load_detected=False."""
+    mock_client.get_devices.return_value = [{
+        **MOCK_DEVICE_LEGACY,
+        "deviceInfo": {
+            **MOCK_DEVICE_LEGACY["deviceInfo"],
+            "ports": [
+                {"port": 1, "portName": "Empty Port", "speak": 0,
+                 "portsLoad": 0, "loadState": 0, "curMode": 1, "remainTime": 0},
+            ],
+        },
+    }]
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 1)
+    data = json.loads(result)
+    assert data["load_detected"] is False
+    assert data["mode"] == "OFF"
+
+
+async def test_get_port_status_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("NOTEXIST", 1)
+    data = json.loads(result)
+    assert "error" in data
+    assert "NOTEXIST" in data["error"]
+
+
+async def test_get_port_status_port_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 99)
+    data = json.loads(result)
+    assert "error" in data
+    assert "99" in data["error"]
+
+
+async def test_get_port_status_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_get_port_status_auth_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAuthError("token expired")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 1)
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+    assert "detail" in data
+
+
+async def test_get_port_status_api_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAPIError("API error 503")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 1)
+    data = json.loads(result)
+    assert data["error"] == "AC Infinity API error"
+    assert "detail" in data
+
+
+async def test_get_port_status_generic_exception(mock_client):
+    mock_client.get_devices.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_status("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ get_port_settings ============
+
+MOCK_MODE_SETTINGS_BASIC: dict = {
+    "atType": 1,
+    "onSpead": 5,
+    "targetVpdSwitch": 0,
+    "targetVpd": 0,
+    "activeLt": 0,
+    "activeHt": 0,
+    "devLt": 0,
+    "devHt": 90,
+    "activeLh": 0,
+    "activeHh": 0,
+    "devLh": 0,
+    "devHh": 100,
+    "schedStartTime": 65535,
+    "schedEndtTime": 65535,
+    "activeCycleOn": 300,
+    "activeCycleOff": 60,
+    "acitveTimerOn": 0,
+    "acitveTimerOff": 0,
+}
+
+
+async def test_get_port_settings_success_basic(mock_client):
+    mock_client.get_mode_settings.return_value = MOCK_MODE_SETTINGS_BASIC
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["device_id"] == "C58ZA"
+    assert data["port"] == 1
+    assert data["mode"] == "OFF"       # atType=1
+    assert data["speed_target"] == 5
+    assert data["vpd_target_kpa"] is None
+    assert data["temp_range_c"] is None
+    assert data["humidity_range_pct"] is None
+    assert data["schedule_window"] is None
+    assert data["cycle_on_seconds"] == 300
+    assert data["cycle_off_seconds"] == 60
+    assert data["timer_on_seconds"] == 0
+    assert data["timer_off_seconds"] == 0
+
+
+async def test_get_port_settings_vpd_target_active(mock_client):
+    """targetVpdSwitch=1 → vpd_target_kpa populated (targetVpd / 10)."""
+    settings = {**MOCK_MODE_SETTINGS_BASIC, "targetVpdSwitch": 1, "targetVpd": 14}
+    mock_client.get_mode_settings.return_value = settings
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["vpd_target_kpa"] == 1.4
+
+
+async def test_get_port_settings_temp_range_active(mock_client):
+    """activeLt=1 and activeHt=1 → temp_range_c populated (raw Celsius, no scaling)."""
+    settings = {**MOCK_MODE_SETTINGS_BASIC, "activeLt": 1, "activeHt": 1,
+                "devLt": 20, "devHt": 28}
+    mock_client.get_mode_settings.return_value = settings
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["temp_range_c"] == {"min_c": 20, "max_c": 28}
+
+
+async def test_get_port_settings_humidity_range_active(mock_client):
+    """activeLh=1 → humidity_range_pct populated."""
+    settings = {**MOCK_MODE_SETTINGS_BASIC, "activeLh": 1, "devLh": 40, "devHh": 70}
+    mock_client.get_mode_settings.return_value = settings
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["humidity_range_pct"] == {"min_pct": 40, "max_pct": 70}
+
+
+async def test_get_port_settings_schedule_window_active(mock_client):
+    """schedStartTime != 65535 → schedule_window populated with HH:MM strings."""
+    settings = {**MOCK_MODE_SETTINGS_BASIC, "schedStartTime": 480, "schedEndtTime": 1200}
+    mock_client.get_mode_settings.return_value = settings
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["schedule_window"] == {"start": "08:00", "end": "20:00"}
+
+
+async def test_get_port_settings_mode_auto(mock_client):
+    settings = {**MOCK_MODE_SETTINGS_BASIC, "atType": 3}
+    mock_client.get_mode_settings.return_value = settings
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["mode"] == "AUTO"
+
+
+async def test_get_port_settings_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("NOTEXIST", 1)
+    data = json.loads(result)
+    assert "error" in data
+    assert "NOTEXIST" in data["error"]
+
+
+async def test_get_port_settings_missing_dev_id(mock_client):
+    """Device missing devId returns a clear error."""
+    device_no_id = {k: v for k, v in MOCK_DEVICE_LEGACY.items() if k != "devId"}
+    mock_client.get_devices.return_value = [device_no_id]
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data
+    assert "devId" in data["error"]
+
+
+async def test_get_port_settings_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_get_port_settings_auth_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAuthError("token expired")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+    assert "detail" in data
+
+
+async def test_get_port_settings_api_error(mock_client):
+    mock_client.get_mode_settings.side_effect = ACInfinityAPIError("API error 503")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["error"] == "AC Infinity API error"
+    assert "detail" in data
+
+
+async def test_get_port_settings_generic_exception(mock_client):
+    mock_client.get_mode_settings.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data

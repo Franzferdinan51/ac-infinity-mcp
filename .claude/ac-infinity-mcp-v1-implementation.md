@@ -575,6 +575,17 @@ Delivered `get_environment_health`, `detect_environment_trends`, `get_port_activ
 
 **`get_port_settings(device_id, port)`**: Call `/api/dev/getdevModeSettingList`, return full automation config — active mode, speed targets, VPD target, temp range, humidity range, schedule window, timer/cycle settings. Both legacy and AI+ controller types.
 
+**Field encoding (confirmed via research):**
+- `curMode` in `devInfoListAll` ports — integer: 1=OFF, 2=ON, 3=AUTO, 4=TIMER_TO_ON, 5=TIMER_TO_OFF, 6=CYCLE, 7=SCHEDULE, 8=VPD
+- `atType` in `getdevModeSettingList` — same AtType encoding as `curMode`
+- `targetVpd` — divide by 10 to get kPa (e.g., stored 12 → 1.2 kPa); distinct from sensor `vpdnums` which is ÷100
+- `devLt`/`devHt` — raw Celsius integers, no scaling; `devLh`/`devHh` — raw % RH integers, no scaling
+- `schedStartTime`/`schedEndtTime` — minutes since midnight in **device local time** (65535 = disabled); return as "HH:MM" string, document as device local time in docstring (not UTC)
+- `activeCycleOn`/`activeCycleOff`, `acitveTimerOn`/`acitveTimerOff` — seconds
+- `remainTime` in `devInfoListAll` ports — seconds; may be `None` when no active timer → default to 0
+
+**Timezone note:** Schedule times are device local time — no UTC suffix. A timezone audit during Phase 12 planning also identified that `peak_hour` in `get_port_activity_report` is UTC but unlabeled; this is tracked as [issue #17](https://github.com/ober37/ac-infinity-mcp/issues/17) and will be fixed in Phase 15 (out of scope here as it is a breaking rename).
+
 **Gate loop:** All 5 gates per CLAUDE.md
 
 ---
@@ -631,8 +642,8 @@ Calls `set_vpd_automation`, `set_temperature_automation`, `set_humidity_automati
 
 ### Phase 15 — Quality Cycle (Second Pass)
 **Status:** Pending
-**Deliverable:** All 16 tools + 3 prompts quality-gated; README + docs/API.md fully updated; 100% coverage
-**Effort:** ~4h | **Sequential after Phase 14 — runs after all planned functionality is complete**
+**Deliverable:** All 16 tools + 3 prompts quality-gated; README + docs/API.md fully updated; 100% coverage; all open GitHub issues resolved
+**Effort:** ~5h | **Sequential after Phase 14 — runs after all planned functionality is complete**
 
 Same structure as Phase 11: two-model review (Sonnet first pass, Opus independent second pass), no inherited findings between passes, iterate until fully clean.
 
@@ -641,7 +652,14 @@ Same structure as Phase 11: two-model review (Sonnet first pass, Opus independen
 - Update hardware compatibility table if any AI+ behavior changed
 - Update docs/API.md with new tools' parameter/return schemas and any new API quirks discovered
 
-**Part 2 — Deep Quality Cycle**
+**Part 2 — Address GitHub Issues**
+- Pull the full open issue list from `ober37/ac-infinity-mcp`
+- Triage each open issue: in-scope for v1.0, defer to v2.0, or close as won't-fix
+- Implement all in-scope issues before proceeding to Part 3
+- Known issues at plan time:
+  - [#17](https://github.com/ober37/ac-infinity-mcp/issues/17) `peak_hour` field is UTC but not labeled — rename to `peak_hour_utc` in `ActivityReport`, tool output, tests, and docs/API.md
+
+**Part 3 — Deep Quality Cycle**
 - Pass 1: Test coverage gap analysis + remediation (target ≥ 90% across all modules)
 - Pass 2: Expert holistic code review (Senior Python Engineer, no prior findings)
 - Pass 3: Expert holistic security review (Security Engineer, no prior findings)

@@ -680,17 +680,28 @@ from `getdevModeSettingList` and benefit from the same read-before-write pattern
 
 ---
 
-### Quirk 14 — AI+ controllers: static full payload
+### Quirk 14 — AI+ controllers: live write path is unknown
 
-AI+ controllers (`newFrameworkDevice=true`) use a different write API path and accept a
-static full payload without a read-before-write step. Detection:
+AI+ controllers (`newFrameworkDevice=true`, `devType=22`) use the same read-before-write
+pattern and return the same 142-field structure from `getdevModeSettingList` as legacy
+controllers. However, the write endpoint differs:
 
+- `POST /dev/addDevMode` returns `{"code": 100001, "msg": "Something went wrong with your request."}` for AI+ devices — this endpoint is for legacy only.
+- Phase 8 exhaustively probed 11 endpoint variants; all returned HTTP 404 except `addDevMode`.
+
+**Current status:** AI+ `dry_run=True` is fully supported and returns the payload that
+would be sent. AI+ `dry_run=False` is not yet implemented and returns a documented error.
+
+**To discover the AI+ write endpoint:** Use mitmproxy to intercept mobile app traffic
+while making a setting change on an AI+ controller. Update this quirk and implement the
+branch in `client.py::set_port_mode` once discovered.
+
+Detection:
 ```python
-is_ai_plus = device.get("newFrameworkDevice") is True
+from ac_infinity_mcp.controller import ControllerType, detect_controller_type
+ct = detect_controller_type(device_data)
+is_ai_plus = ct == ControllerType.NEW_FRAMEWORK  # devType >= 20 or newFrameworkDevice=True
 ```
-
-The payload format and endpoint differ from legacy controllers. See Phase 8
-implementation notes in `src/ac_infinity_mcp/controller.py`.
 
 ---
 

@@ -158,6 +158,24 @@ def test_live_set_port_off_dry_run(
     assert data.get("sent") is False
 
 
+def test_live_apply_grow_stage_template_dry_run(
+    authed_client: ACInfinityClient, live_device_id: str
+) -> None:
+    result = asyncio.run(
+        srv.apply_grow_stage_template(live_device_id, port=1, stage="veg", dry_run=True)
+    )
+    data = json.loads(result)
+    assert data.get("dry_run") is True
+    assert data["vpd"]["sent"] is False
+    assert data["temperature"]["sent"] is False
+    assert data["humidity"]["sent"] is False
+    assert "payload" in data["vpd"]
+    assert "payload" in data["temperature"]
+    assert "payload" in data["humidity"]
+    assert data["vpd"]["target_kpa"] == 1.25
+    assert "error" not in data
+
+
 def test_live_get_historical_readings_time_filter(
     authed_client: ACInfinityClient, live_device_id: str
 ) -> None:

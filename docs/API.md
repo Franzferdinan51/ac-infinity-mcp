@@ -746,3 +746,65 @@ for port in range(1, port_count + 1):
 
 The `externalPort` field in the response matches the `port` parameter sent.
 Both legacy and AI+ controllers return the same 142-field structure.
+
+---
+
+## MCP Intelligence Tool
+
+### `apply_grow_stage_template(device_id, port, stage, dry_run=True)`
+
+One-click grow stage configuration. Calls `set_vpd_automation`, `set_temperature_automation`,
+and `set_humidity_automation` in sequence using the VPD midpoint and full ranges from
+`STAGE_TARGETS` in `analytics.py`.
+
+**Parameters:**
+| Parameter | Type | Description |
+|---|---|---|
+| `device_id` | `str` | Device code from `discover_devices` |
+| `port` | `int` | 1-based port number |
+| `stage` | `str` | One of: `clones`, `seedling`, `veg`, `early_flower`, `mid_flower`, `late_flower` |
+| `dry_run` | `bool` | Default `True` — returns payloads without writing |
+
+**Stage targets (VPD is the midpoint of the stage range):**
+| Stage | VPD (kPa) | Temp (°C) | Humidity (%) |
+|---|---|---|---|
+| `clones` | 1.00 | 22–26 | 70–80 |
+| `seedling` | 1.00 | 22–26 | 65–75 |
+| `veg` | 1.25 | 20–28 | 50–70 |
+| `early_flower` | 1.40 | 20–26 | 40–60 |
+| `mid_flower` | 1.60 | 18–25 | 35–55 |
+| `late_flower` | 1.50 | 18–24 | 30–50 |
+
+**Response:** JSON with `vpd`, `temperature`, `humidity` sub-objects, each containing
+`sent`, `controller_type`, and `payload` (when `dry_run=True`). On partial failure,
+`partial_write=True` and `recovery_note` lists what was applied so the caller can revert.
+
+**Encoding:**
+- VPD: `int(target_vpd * 10)` — e.g. 1.25 kPa → stored as 13 (Quirk 4 analogue for writes)
+- Temp/humidity: raw integer — e.g. 20°C → `devLt=20` (no × 100 scaling)
+- Rate limit: 3 sequential writes = minimum 4.5s wall-clock on live writes (Quirk 15)
+
+**AI+ note:** `dry_run=True` is fully supported. `dry_run=False` returns the AI+
+unsupported error before any writes (same as individual automation tools).
+
+---
+
+## MCP Prompts
+
+Static text responses — zero API calls. Registered with `@mcp_server.prompt()`.
+
+### `vpd_troubleshooting`
+
+Step-by-step VPD diagnosis guide. Covers HIGH VPD (air too dry) and LOW VPD (air too
+humid) with specific tool calls for each fix path. Includes stage VPD target table.
+
+### `new_grower_setup`
+
+Onboarding guide: `discover_devices` → `get_device_reading` → `apply_grow_stage_template`
+(dry_run first) → `get_environment_health`. Explains each step and available stage names.
+
+### `environment_alert_interpretation`
+
+Explains `check_vpd_drift` status values (OK / HIGH / LOW) and `get_environment_health`
+score grades (A–F, 90–100 → 0–39). Covers score weighting (VPD 40%, temp 30%, humidity
+30%), `top_recommendation` field, and quick action reference table.

@@ -24,6 +24,8 @@
 > *"Is my environment in the right range for late flower?"*
 > *"Turn off port 3 on my 69 Pro controller — dry run first."*
 > *"Show me which ports have been running the most this week."*
+> *"Apply the veg stage template to port 1 — dry run first so I can see the settings."*
+> *"My VPD is too high — what should I adjust?"*
 
 ## Compatible hardware
 
@@ -54,6 +56,7 @@
 | ⚙️ **Automation** | `set_temperature_automation` | Enable AUTO mode with min/max °C thresholds (`dry_run=True` by default) |
 | ⚙️ **Automation** | `set_humidity_automation` | Enable AUTO mode with min/max % RH thresholds (`dry_run=True` by default) |
 | ⚙️ **Automation** | `set_port_mode` | Switch to any mode: OFF, ON, AUTO, VPD, CYCLE, SCHEDULE, TIMER_TO_ON, TIMER_TO_OFF (`dry_run=True` by default) |
+| 🌱 **Intelligence** | `apply_grow_stage_template` | One-click VPD + temp + humidity automation for a named grow stage (`dry_run=True` by default) |
 
 > ✦ Write and Automation tools default to `dry_run=True` — they return the exact payload they *would* send without making any changes to your equipment. Pass `dry_run=False` only when you're ready to execute.
 

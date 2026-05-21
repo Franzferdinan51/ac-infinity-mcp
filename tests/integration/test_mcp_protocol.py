@@ -37,6 +37,7 @@ EXPECTED_TOOLS = {
     "set_temperature_automation",
     "set_humidity_automation",
     "set_port_mode",
+    "apply_grow_stage_template",
 }
 
 SCHEMA_CASES: list[tuple[str, list[str], list[str]]] = [
@@ -68,6 +69,7 @@ SCHEMA_CASES: list[tuple[str, list[str], list[str]]] = [
             "schedule_start", "schedule_end", "timer_duration_seconds",
         ],
     ),
+    ("apply_grow_stage_template", ["device_id", "port", "stage"], ["dry_run"]),
 ]
 
 # Env without AC Infinity credentials — built at import time so subprocess
@@ -103,13 +105,13 @@ def _get_tool_schema(name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_all_17_tools_registered() -> None:
+def test_all_18_tools_registered() -> None:
     registered = {t.name for t in mcp_server._tool_manager.list_tools()}  # type: ignore[attr-defined]
     assert registered == EXPECTED_TOOLS
 
 
-def test_tool_count_is_exactly_17() -> None:
-    assert len(mcp_server._tool_manager.list_tools()) == 17  # type: ignore[attr-defined]
+def test_tool_count_is_exactly_18() -> None:
+    assert len(mcp_server._tool_manager.list_tools()) == 18  # type: ignore[attr-defined]
 
 
 def test_mcp_server_name_is_ac_infinity() -> None:
@@ -165,12 +167,12 @@ def test_get_historical_readings_defaults() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_protocol_list_tools_returns_all_17(mock_client: MagicMock) -> None:
+async def test_protocol_list_tools_returns_all_18(mock_client: MagicMock) -> None:
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         async with create_connected_server_and_client_session(srv.mcp_server) as session:
             result = await session.list_tools()
             names = {t.name for t in result.tools}
-            assert len(result.tools) == 17
+            assert len(result.tools) == 18
             assert names == EXPECTED_TOOLS
 
 

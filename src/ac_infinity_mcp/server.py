@@ -1038,6 +1038,14 @@ async def set_port_off(
 # ============ Automation Write Tools ============
 
 
+def _recovery_note(sent_writes: list[str]) -> str:
+    applied = ", ".join(sent_writes)
+    return (
+        f"{applied.capitalize()} automation was applied (sent=true). "
+        "To revert: call set_port_mode with mode=AUTO or set_port_speed to restore prior state."
+    )
+
+
 def _ai_plus_unsupported_error(device_id: str, port: int, controller_type: str) -> str:
     # dry_run is always False here: the AI+ guard in client._set_port_mode_inner fires
     # only on the live-write path (dry_run returns early before the guard is reached).
@@ -1411,6 +1419,353 @@ async def set_port_mode(
     except Exception as e:
         logger.error("Unexpected error in set_port_mode: %s", e)
         return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def apply_grow_stage_template(
+    device_id: str,
+    port: int,
+    stage: str,
+    dry_run: bool = True,
+) -> str:
+    """Apply a grow-stage automation template (VPD + temperature + humidity) in one call.
+
+    Sets VPD automation, temperature automation, and humidity automation in sequence
+    using the built-in sensors. Defaults to dry_run=True — set dry_run=False to write.
+
+    Stage targets (VPD midpoint used as single target):
+
+    | Stage        | VPD (kPa) | Temp (°C) | Humidity (%) |
+    |---|---|---|---|
+    | clones       | 1.00      | 22–26     | 70–80        |
+    | seedling     | 1.00      | 22–26     | 65–75        |
+    | veg          | 1.25      | 20–28     | 50–70        |
+    | early_flower | 1.40      | 20–26     | 40–60        |
+    | mid_flower   | 1.60      | 18–25     | 35–55        |
+    | late_flower  | 1.50      | 18–24     | 30–50        |
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        stage: Growth stage name. One of: clones, seedling, veg, early_flower,
+            mid_flower, late_flower.
+        dry_run: If True (default), returns payloads without writing.
+
+    Returns:
+        JSON with per-write status for vpd, temperature, and humidity. Each entry
+        includes sent, controller_type, and payload (when dry_run=True). On partial
+        failure, partial_write=True and recovery_note lists what was applied so the
+        caller can revert if needed. On failure returns ``{"error": "..."}``.
+    """
+    if port < 1:
+        return json.dumps({"error": "port must be a positive integer"})
+    if stage not in STAGE_TARGETS:
+        valid = ", ".join(sorted(STAGE_TARGETS.keys()))
+        return json.dumps({"error": f"Unknown stage {stage!r} — valid stages: {valid}"})
+
+    targets = STAGE_TARGETS[stage]
+    vpd_min, vpd_max = targets["vpd"]
+    temp_min, temp_max = targets["temp_c"]
+    humi_min, humi_max = targets["humidity"]
+    target_vpd = round((vpd_min + vpd_max) / 2, 2)
+
+    try:
+        devices = await asyncio.to_thread(_client().get_devices)
+    except Exception as e:
+        logger.warning(
+            "Error fetching devices in apply_grow_stage_template (device=%s): %s", device_id, e
+        )
+        return json.dumps({"error": str(e)})
+
+    device = next((d for d in devices if d.get("devCode") == device_id), None)
+    if not device:
+        return json.dumps({"error": f"Device {device_id} not found"})
+
+    response: dict = {
+        "action": "apply grow stage template",
+        "device_id": device_id,
+        "port": port,
+        "stage": stage,
+        "dry_run": dry_run,
+    }
+    sent_writes: list[str] = []
+
+    # VPD write
+    vpd_updates = {
+        "atType": 8,
+        "vpdSettingMode": 1,
+        "targetVpd": round(target_vpd * 10),  # API stores as ×10 (e.g. 1.25 kPa → 13)
+        "targetVpdSwitch": 1,
+    }
+    try:
+        vpd_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, vpd_updates, dry_run
+        )
+        if vpd_result.get("ai_plus_write_unsupported"):
+            return _ai_plus_unsupported_error(device_id, port, vpd_result["controller_type"])
+        vpd_entry: dict = {
+            "target_kpa": target_vpd,
+            "sent": vpd_result["sent"],
+            "controller_type": vpd_result["controller_type"],
+        }
+        if vpd_result["dry_run"]:
+            vpd_entry["payload"] = vpd_result["payload"]
+        if vpd_result["sent"]:
+            sent_writes.append("vpd")
+        response["vpd"] = vpd_entry
+    except Exception as e:
+        logger.warning(
+            "VPD write failed in apply_grow_stage_template (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        response["vpd"] = {"target_kpa": target_vpd, "sent": False, "error": str(e)}
+        response["temperature"] = {
+            "min_c": temp_min, "max_c": temp_max, "sent": False,
+            "error": "not attempted — vpd write failed",
+        }
+        response["humidity"] = {
+            "min_rh": humi_min, "max_rh": humi_max, "sent": False,
+            "error": "not attempted — vpd write failed",
+        }
+        return json.dumps(response, indent=2)
+
+    # Temperature write
+    temp_updates = {
+        "atType": 3,
+        "devLt": round(temp_min),
+        "devHt": round(temp_max),
+        "activeLt": 1,
+        "activeHt": 1,
+    }
+    try:
+        temp_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, temp_updates, dry_run
+        )
+        temp_entry: dict = {
+            "min_c": temp_min,
+            "max_c": temp_max,
+            "sent": temp_result["sent"],
+            "controller_type": temp_result["controller_type"],
+        }
+        if temp_result["dry_run"]:
+            temp_entry["payload"] = temp_result["payload"]
+        if temp_result["sent"]:
+            sent_writes.append("temperature")
+        response["temperature"] = temp_entry
+    except Exception as e:
+        logger.warning(
+            "Temperature write failed in apply_grow_stage_template (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        response["temperature"] = {
+            "min_c": temp_min, "max_c": temp_max, "sent": False, "error": str(e),
+        }
+        response["humidity"] = {
+            "min_rh": humi_min, "max_rh": humi_max, "sent": False,
+            "error": "not attempted — temperature write failed",
+        }
+        response["partial_write"] = True
+        response["recovery_note"] = _recovery_note(sent_writes)
+        return json.dumps(response, indent=2)
+
+    # Humidity write
+    humi_updates = {
+        "atType": 3,
+        "devLh": round(humi_min),
+        "devHh": round(humi_max),
+        "activeLh": 1,
+        "activeHh": 1,
+    }
+    try:
+        humi_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, humi_updates, dry_run
+        )
+        humi_entry: dict = {
+            "min_rh": humi_min,
+            "max_rh": humi_max,
+            "sent": humi_result["sent"],
+            "controller_type": humi_result["controller_type"],
+        }
+        if humi_result["dry_run"]:
+            humi_entry["payload"] = humi_result["payload"]
+        response["humidity"] = humi_entry
+    except Exception as e:
+        logger.warning(
+            "Humidity write failed in apply_grow_stage_template (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        response["humidity"] = {
+            "min_rh": humi_min, "max_rh": humi_max, "sent": False, "error": str(e),
+        }
+        response["partial_write"] = True
+        response["recovery_note"] = _recovery_note(sent_writes)
+        return json.dumps(response, indent=2)
+
+    return json.dumps(response, indent=2)
+
+
+# ============ MCP Prompts ============
+
+
+@mcp_server.prompt()
+def vpd_troubleshooting() -> str:
+    """Step-by-step guide for diagnosing and fixing VPD issues."""
+    return """\
+## VPD Troubleshooting Guide
+
+**What is VPD?**
+Vapour Pressure Deficit (VPD) is the difference between the moisture in the air and
+how much moisture the air can hold at saturation. It drives transpiration — too high
+stresses the plant, too low causes wet conditions and disease risk.
+
+**Step 1 — Check your current VPD**
+Call `get_device_reading(device_id)` and look at the `vpd` field (kPa).
+Or call `check_vpd_drift(device_id, stage)` to compare against a growth stage target.
+
+**Step 2 — Diagnose HIGH VPD (above target range)**
+High VPD means the air is too dry. The plant is losing water faster than it can absorb it.
+Signs: wilting, leaf curl, slow growth.
+
+Fixes (choose one or both):
+- **Lower temperature** — call `set_temperature_automation(device_id, port, min_c, max_c)`
+  to drop the max threshold 1–2°C.
+- **Raise humidity** — call `set_humidity_automation(device_id, port, min_rh, max_rh)`
+  to increase the lower humidity bound.
+- **Use VPD mode** — call `set_vpd_automation(device_id, port, target_vpd)` to let the
+  controller manage VPD directly. Start with the midpoint of your stage range.
+
+**Step 3 — Diagnose LOW VPD (below target range)**
+Low VPD means the air is too humid. Stomata close, CO2 uptake drops, mould risk rises.
+Signs: soft growth, mould, bud rot risk in flower.
+
+Fixes (choose one or both):
+- **Raise temperature** — increase the min_c threshold in `set_temperature_automation`.
+- **Lower humidity** — decrease the max_rh in `set_humidity_automation`.
+- Increase airflow with `set_port_speed(device_id, port, speed)`.
+
+**Target ranges by stage**
+| Stage | VPD (kPa) | Temp (°F) |
+|---|---|---|
+| clones / seedling | 0.8–1.2 | 72–79 |
+| veg | 1.0–1.5 | 68–82 |
+| early flower | 1.0–1.8 | 68–79 |
+| mid flower | 1.2–2.0 | 64–77 |
+| late flower | 1.2–1.8 | 64–75 |
+
+**One-click solution:** `apply_grow_stage_template(device_id, port, stage)` sets VPD,
+temperature, and humidity automation in one call. Use `dry_run=True` first to preview.
+"""
+
+
+@mcp_server.prompt()
+def new_grower_setup() -> str:
+    """Onboarding guide: from first connection to automated grow environment."""
+    return """\
+## New Grower Setup Guide
+
+Welcome! Here is how to connect your AC Infinity controller and get your environment
+dialled in with automation in four steps.
+
+**Step 1 — Discover your devices**
+```
+discover_devices()
+```
+Returns all controllers on your account. Copy the `device_id` (e.g. `"C58ZA"`) — you
+need it for every other tool.
+
+**Step 2 — Check current readings**
+```
+get_device_reading(device_id)
+```
+Shows live temperature, humidity, VPD, and the current speed of each port. Verify the
+numbers match your physical environment before making any changes.
+
+**Step 3 — Apply a grow stage template (dry_run first)**
+```
+apply_grow_stage_template(device_id, port=1, stage="veg", dry_run=True)
+```
+Preview the automation settings — VPD target, temperature range, humidity range —
+without writing anything. When the numbers look right:
+```
+apply_grow_stage_template(device_id, port=1, stage="veg", dry_run=False)
+```
+Available stages: `clones`, `seedling`, `veg`, `early_flower`, `mid_flower`, `late_flower`.
+
+**Step 4 — Check your environment health score**
+```
+get_environment_health(device_id, stage="veg")
+```
+Returns a 0–100 score and letter grade (A–F) with a per-metric breakdown and the top
+recommendation. Run this after applying automation to confirm the environment is responding.
+
+**Tip:** Use `check_vpd_drift(device_id, stage)` any time you want a quick status check
+(OK / HIGH / LOW) without the full health report.
+
+**Tip:** If anything looks wrong, see the `vpd_troubleshooting` prompt for step-by-step
+diagnosis and fix instructions.
+"""
+
+
+@mcp_server.prompt()
+def environment_alert_interpretation() -> str:
+    """Guide to interpreting alerts from check_vpd_drift and get_environment_health."""
+    return """\
+## Environment Alert Interpretation Guide
+
+### check_vpd_drift — Status Field
+
+`check_vpd_drift(device_id, stage)` returns a `status` field:
+
+| Status | Meaning | Typical action |
+|---|---|---|
+| `OK` | VPD is within the target range for the stage | None needed |
+| `HIGH` | VPD above target — air too dry | Lower temp or raise humidity; see vpd_troubleshooting |
+| `LOW` | VPD below target — air too humid | Raise temp or lower humidity; increase airflow |
+
+The response also includes `current_vpd` (kPa), `target_range` [min, max], and `deviation`
+(how far outside the range). A deviation of 0 means exactly on target; a positive value
+means above the upper bound; negative means below the lower bound.
+
+---
+
+### get_environment_health — Score and Grade
+
+`get_environment_health(device_id, stage)` returns a composite score:
+
+| Grade | Score | Interpretation |
+|---|---|---|
+| A | 90–100 | Excellent — environment is dialled in |
+| B | 75–89 | Good — minor deviation, stable growth |
+| C | 60–74 | Fair — worth investigating; one metric is off |
+| D | 40–59 | Poor — environment stress likely; intervene soon |
+| F | 0–39 | Critical — significant stress; act immediately |
+
+**Score weighting:** VPD 40% + Temperature 30% + Humidity 30%.
+
+VPD has the highest weight because it integrates both temperature and humidity into a
+single stress indicator. A D or F on VPD alone can drag an otherwise healthy environment
+into the C/D range.
+
+**top_recommendation** — the single most impactful action to improve the score. Always
+start here. Common recommendations:
+- "Lower temperature 1–2°C to bring VPD into target range"
+- "Increase humidity by 5–10% RH to reduce VPD"
+- "Temperature is the primary driver of health score — adjust min/max thresholds"
+
+**Per-metric scores** (vpd_score, temp_score, humidity_score) are each 0–100. A score
+below 60 on any metric is the most likely root cause of a low overall score.
+
+---
+
+### Quick Action Reference
+
+| Situation | Tool to call |
+|---|---|
+| VPD HIGH or LOW | `set_vpd_automation`, `set_temperature_automation`, `set_humidity_automation` |
+| Health score C or below | Follow `top_recommendation`; use `apply_grow_stage_template` |
+| Unsure where to start | `vpd_troubleshooting` prompt |
+| First time setup | `new_grower_setup` prompt |
+"""
 
 
 # ============ Helpers ============

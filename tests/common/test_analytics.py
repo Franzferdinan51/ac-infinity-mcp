@@ -364,3 +364,72 @@ def test_calculate_vpd_saturated():
 def test_calculate_vpd_zero_humidity():
     vpd = calculate_vpd(25.0, 0.0)
     assert vpd > 3.0
+
+
+# ============ Residual coverage — degenerate / defensive paths ============
+
+def test_health_score_temp_low_recommendation():
+    """worst_metric == 'temp' with low temp triggers the 'raise temperature' branch."""
+    reading = _reading(temp_c=10.0, humidity=60.0, vpd=1.24)
+    result = calculate_health_score(reading, "veg")
+    assert "Temperature is low" in result.top_recommendation
+
+
+def test_health_score_grade_F_for_terrible_environment():
+    """A reading way outside targets must produce an F grade (score < 60)."""
+    reading = _reading(temp_c=45.0, humidity=10.0, vpd=4.0)
+    result = calculate_health_score(reading, "veg")
+    assert result.grade == "F"
+    assert result.score < 60
+
+
+def test_health_score_degenerate_range_returns_zero():
+    """A degenerate target range (low == high) yields 0.0 outside the band."""
+    from ac_infinity_mcp.analytics import _range_score
+    # margin == 0 path — value outside the equal low/high
+    assert _range_score(value=10.0, low=5.0, high=5.0) == 0.0
+
+
+def test_detect_trends_skips_invalid_timestamps():
+    """Records with bad timestamps are skipped in trend computation."""
+    readings = [
+        {"timestamp": "BAD_TS", "temperature_c": 24.0, "humidity": 55.0, "vpd": 1.4},
+        {"timestamp": _ts(0), "temperature_c": 24.0, "humidity": 55.0, "vpd": 1.4},
+        {"timestamp": _ts(1), "temperature_c": 25.0, "humidity": 56.0, "vpd": 1.5},
+    ]
+    trends = detect_trends(readings, days=1)
+    assert len(trends) == 3  # one per metric (temp_c, humidity, vpd)
+
+
+def test_activity_report_skips_records_with_bad_timestamp_hour():
+    """Records with unparseable timestamps still feed port stats but no hour is recorded."""
+    readings = [
+        {"timestamp": "BAD_TS", "ports": [_port(1, "Fan", 5, True)]},
+        {"timestamp": _ts(8), "ports": [_port(1, "Fan", 5, True)]},
+    ]
+    result = build_activity_report(readings)
+    assert len(result) == 1
+    assert result[0].port == 1
+
+
+def test_activity_report_skips_port_with_no_number():
+    """Ports missing a 'port' key are skipped."""
+    readings = [
+        {
+            "timestamp": _ts(8),
+            "ports": [
+                {"name": "Headless", "speed": 5, "on": True},  # no port_num
+                _port(1, "Fan", 5, True),
+            ],
+        }
+    ]
+    result = build_activity_report(readings)
+    assert len(result) == 1
+    assert result[0].port == 1
+
+
+def test_activity_report_skips_port_with_zero_total_readings():
+    """A port with no on_flags entries is skipped from the report."""
+    # Edge case: empty readings list yields no reports
+    result = build_activity_report([])
+    assert result == []

@@ -21,7 +21,6 @@ from ac_infinity_mcp.schema import (
     ACInfinityAuthError,
     ACInfinityDeviceError,
     ACIReading,
-    VPDTargets,
 )
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -338,14 +337,17 @@ async def check_vpd_drift(device_id: str, stage: str = "veg") -> str:
         On failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
+        if stage not in STAGE_TARGETS:
+            valid = ", ".join(STAGE_TARGETS)
+            return json.dumps({"error": f"Unknown stage: {stage}. Valid: {valid}"})
+
         reading_json = await get_device_reading(device_id)
         reading = json.loads(reading_json)
 
         if "error" in reading:
             return json.dumps(reading)
 
-        targets = VPDTargets()
-        target_range = getattr(targets, stage, targets.veg)
+        target_range = STAGE_TARGETS[stage]["vpd"]
         current_vpd = reading["vpd"]
 
         status = "OK"
@@ -973,5 +975,5 @@ def main() -> None:  # pragma: no cover
     asyncio.run(_run())
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

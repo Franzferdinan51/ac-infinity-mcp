@@ -354,15 +354,14 @@ async def test_check_vpd_drift_high(mock_client):
     assert "exceeds target" in data["alert"]
 
 
-async def test_check_vpd_drift_unknown_stage_defaults_to_veg(mock_client):
-    mock_client.parse_device_data.return_value = {
-        **mock_client.parse_device_data.return_value,
-        "vpd": 1.24,
-    }
+async def test_check_vpd_drift_unknown_stage_returns_error(mock_client):
+    """Unknown stage must return an error, not silently fall back to veg."""
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
-        result = await check_vpd_drift("C58ZA", "nonexistent_stage")
+        result = await check_vpd_drift("C58ZA", "bloom")
     data = json.loads(result)
-    assert "status" in data
+    assert "error" in data
+    assert "bloom" in data["error"]
+    assert "Unknown stage" in data["error"]
 
 
 async def test_check_vpd_drift_device_not_found(mock_client):

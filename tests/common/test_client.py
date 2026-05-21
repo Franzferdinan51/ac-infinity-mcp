@@ -281,6 +281,159 @@ def test_authenticate_password_truncated_to_25_chars():
     assert c.password == "a" * 25
 
 
+@responses_lib.activate
+def test_authenticate_generic_exception_returns_false(client):
+    """Bare except path in authenticate() must return False for unexpected errors."""
+    with patch.object(client.session, "post", side_effect=RuntimeError("unexpected boom")):
+        result = client.authenticate()
+    assert result is False
+
+
+# ============ Token refresh on 401 ============
+
+@responses_lib.activate
+def test_get_devices_refreshes_token_on_401(authed_client):
+    """A 401 from get_devices must trigger one re-auth and a retry that succeeds."""
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token_xyz"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL, json=DEVICES_SUCCESS, status=200,
+    )
+
+    devices = authed_client.get_devices()
+    assert len(devices) >= 1
+    assert authed_client.token == "fresh_token_xyz"
+
+
+@responses_lib.activate
+def test_get_devices_second_401_after_refresh_raises(authed_client):
+    """If the retry after refresh also returns 401, raise without further attempts."""
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "still expired"}, status=200,
+    )
+
+    with pytest.raises(ACInfinityAuthError):
+        authed_client.get_devices()
+
+
+@responses_lib.activate
+def test_get_devices_no_refresh_when_unauthenticated(client):
+    """If client was never authenticated, AuthError raises without attempting refresh."""
+    # client fixture has no token set
+    with pytest.raises(ACInfinityAuthError):
+        client.get_devices()
+    # No login call should have been made
+    login_calls = [c for c in responses_lib.calls if LOGIN_URL in c.request.url]
+    assert len(login_calls) == 0
+
+
+@responses_lib.activate
+def test_get_devices_no_refresh_if_authenticate_fails(authed_client):
+    """If re-authentication fails, the original AuthError propagates."""
+    responses_lib.add(
+        responses_lib.POST, DEVICES_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json=AUTH_FAILURE, status=200,
+    )
+
+    with pytest.raises(ACInfinityAuthError):
+        authed_client.get_devices()
+
+
+@responses_lib.activate
+def test_get_historical_data_refreshes_token_on_401(authed_client):
+    """get_historical_data must also refresh on 401."""
+    responses_lib.add(
+        responses_lib.POST, HISTORY_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, HISTORY_URL, json=HISTORY_EMPTY, status=200,
+    )
+
+    result = authed_client.get_historical_data("12345", 1714000000, 1714086400)
+    assert result == []
+
+
+@responses_lib.activate
+def test_get_mode_settings_refreshes_token_on_401(authed_client):
+    """get_mode_settings must also refresh on 401."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL,
+        json={"code": 401, "msg": "token expired"}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        json={"code": 200, "data": {"appId": "fresh_token"}}, status=200,
+    )
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL,
+        json={"code": 200, "data": MOCK_MODE_SETTINGS_LEGACY_PORT1}, status=200,
+    )
+
+    result = authed_client.get_mode_settings(12345, 1)
+    assert "modeType" in result
+
+
+# ============ Historical data — non-401 API error coverage ============
+
+@responses_lib.activate
+def test_get_historical_data_500_raises_api_error(authed_client):
+    """Non-401 API error must raise ACInfinityAPIError (not trigger refresh)."""
+    responses_lib.add(
+        responses_lib.POST, HISTORY_URL,
+        json={"code": 500, "msg": "server error"}, status=200,
+    )
+    with pytest.raises(ACInfinityAPIError):
+        authed_client.get_historical_data("12345", 1714000000, 1714086400)
+
+
+# ============ Historical data — pagination edge ============
+
+@responses_lib.activate
+def test_get_historical_data_pagination_stops_when_cursor_no_advance(authed_client):
+    """If returned records don't advance the time cursor, stop paginating (line 264)."""
+    # Page 1: returns page_size records, but the last record's createTime equals current_start
+    page1 = {
+        "code": 200,
+        "data": {
+            "rows": [
+                {"createTime": 1714000000, "temperature": 2400}
+                for _ in range(3)
+            ],
+        },
+    }
+    responses_lib.add(responses_lib.POST, HISTORY_URL, json=page1, status=200)
+
+    result = authed_client.get_historical_data(
+        "12345", 1714000000, 1714086400, page_size=3,
+    )
+    # Should stop after first page because cursor can't advance past start
+    assert len(result) == 3
+
+
 # ============ get_devices ============
 
 @responses_lib.activate

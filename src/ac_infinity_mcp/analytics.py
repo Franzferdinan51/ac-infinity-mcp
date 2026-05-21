@@ -257,7 +257,7 @@ def build_activity_report(readings: list[dict[str, Any]]) -> list[ActivityReport
     for port_num in sorted(port_data.keys()):
         pd = port_data[port_num]
         total = len(pd["on_flags"])
-        if total == 0:
+        if total == 0:  # pragma: no cover — defensive; port_data is only populated when on_flags appended
             continue
 
         on_count = sum(1 for f in pd["on_flags"] if f)

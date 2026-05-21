@@ -149,13 +149,22 @@ Maintain ≥85% coverage.
 
 ## Phase 4 — Full API Documentation + Read Tool Polish
 
-**Status:** 🔲 Pending
+**Status:** ✅ Complete (PR #4 — feat/phase-4-error-handling-docs)
 
 ### Scope
 - Expand `docs/API.md` from skeleton to full reference (request/response examples for all 15 quirks)
 - Polish server.py docstrings (add `Returns:` sections with example JSON)
 - Improve error messages in client.py (distinguish auth failure vs network vs API error codes)
 - No new MCP tools
+
+**Phase 4 Lessons Learned**
+- **What went well:** Live API sniff script worked on the first run and produced real response shapes immediately — the `docs/API.md` is now built from actual API output, not guesswork. The three-work-stream approach (A→B→C) was clean: error handling first meant docstrings could accurately describe the new error response shapes. All 5 gates cleared on the first pass (one test assertion fix for `"password" not in response` — too broad; corrected to check for actual credential values). The gate loop caught that real token/device-ID values from the sniff ended up in `docs/API.md` and they were scrubbed before commit.
+- **Changed from plan:** Added code 401 → `ACInfinityAuthError` distinction that wasn't in the original design table (plan only listed `token is None` → AuthError). This made the test plan more precise and the error messages more actionable. `scripts/sniff_api.py` was gitignored rather than just not committed — cleaner.
+- **Watch out for next phase (Phase 5 — CI/CD):** The `get_historical_data` while-loop now raises on any chunk failure, which changes retry semantics: tenacity will restart from chunk 1 if a network error happens mid-pagination (pre-existing issue, not new). Phase 5 should confirm that `pip audit` runs cleanly in CI — there's a system-level `pyjwt` CVE on the dev machine that is NOT a project dependency but will appear if the audit scans the system Python instead of the project venv. CI should install into a clean venv.
+- **Actual effort vs estimate:** ~2.5 hours actual vs ~3 hours estimated (live sniff worked first try; single defect in gate loop was minor).
+- **Investment time:** ~2:30 — wall-clock from session start to branch pushed.
+- **Defects found:**
+  - [D001] Test assertion `"password" not in json.dumps(data).lower()` was too broad — the error message intentionally contains "AC_INFINITY_PASSWORD" (the env var name). | Discovered: Gate 4 | Severity: low | Resolved: Y
 
 ---
 

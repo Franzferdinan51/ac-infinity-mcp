@@ -565,7 +565,8 @@ Delivered `get_environment_health`, `detect_environment_trends`, `get_port_activ
 ---
 
 ### Phase 12 — New Read Tools
-**Status:** Pending
+**Status:** ✅ Complete
+**PR:** [feat(server): Phase 12 — get_port_status, get_port_settings](https://github.com/ober37/ac-infinity-mcp/pull/18)
 **Deliverable:** `get_port_status` + `get_port_settings` — 2 new MCP tools, all gates pass
 **Effort:** ~2h | **Sequential after Phase 11**
 
@@ -633,7 +634,8 @@ All 4 tools: `dry_run=True` default, full read-before-write where required, 1.5s
 ---
 
 ### Phase 14 — Intelligence Tools + MCP Prompts
-**Status:** Pending
+**Status:** ✅ Complete
+**PR:** [feat(server): Phase 14 — apply_grow_stage_template + 3 MCP prompts](https://github.com/ober37/ac-infinity-mcp/pull/20)
 **Deliverable:** `apply_grow_stage_template` + 3 MCP prompts — all gates pass
 **Effort:** ~2h | **Sequential after Phase 13**
 
@@ -658,6 +660,21 @@ Calls `set_vpd_automation`, `set_temperature_automation`, `set_humidity_automati
 - `environment_alert_interpretation` — How to read alerts from `check_vpd_drift` and `get_environment_health`
 
 **Gate loop:** All 5 gates per CLAUDE.md
+
+**Phase 14 Lessons Learned**
+- **What went well:** Planning session surfaced the two key design decisions (VPD midpoint strategy, partial failure handling) before any code was written — both were confirmed by the user before implementation. The per-write exception handling pattern with `sent_writes` tracking is clean and correctly handles all three failure scenarios (fail at VPD, fail at temp, fail at humidity). 100% coverage maintained. All 14 live smoke tests passed first run.
+- **Changed from plan:** (1) Default changed from `dry_run=False` (in original spec) to `dry_run=True` (consistent with all other write tools). (2) Implementation calls `_client().set_port_mode()` directly three times rather than calling the server tool functions — avoids JSON parse/unparse overhead and keeps the response structure clean. (3) Dead code (`if sent_writes:` in VPD exception handler) removed after coverage revealed it was unreachable — VPD is always first, so `sent_writes` is always empty at that point. (4) One test added (`test_apply_grow_stage_template_get_devices_exception`) to cover the `get_devices` exception path, reaching 100% coverage.
+- **Watch out for Phase 15:** (1) `apply_grow_stage_template` with 3 sequential live writes is the most likely target for the rate-limit smoke test — ensure the Phase 15 quality review confirms the 1.5s gap is correctly handled. (2) The plan says "16 tools + 3 prompts" but the actual count is 18 tools (set_port_on and set_port_off were added as separate tools, not part of set_port_mode count). Update the plan's Section 2 coverage summary table accordingly. (3) Phase 12 plan status still shows "Pending" — needs to be updated to ✅ Complete (PR #18 was merged).
+- **Actual effort vs estimate:** ~1h actual vs ~2h planned — under budget.
+- **Investment time:** 2026-05-21 session — ~1h wall-clock from /clear to PR #20 raised.
+- **Defects found:** None
+
+**Phase 14 Time Investment**
+- **Date:** 2026-05-21
+- **Actual Claude session time:** ~1:00
+- **Projected manual time:** 8h–14h (midpoint ~11h)
+- **Manual estimate basis:** Decent Python, familiar with write infrastructure. Primary cost drivers: designing partial-failure response format, implementing 3 sequential writes with per-write error handling, writing ~22 tests covering all edge cases (6 stages, partial failures, AI+), writing 3 prompt bodies with accurate content, updating wire protocol tests.
+- **Multiplier:** ~11x (11h projected midpoint ÷ ~1h actual)
 
 ---
 

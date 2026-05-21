@@ -134,6 +134,8 @@ The container runs over stdio. Connect via a stdio bridge such as [mcp-proxy](ht
 | `AC_INFINITY_EMAIL` | Yes | Your AC Infinity account email |
 | `AC_INFINITY_PASSWORD` | Yes | Your AC Infinity account password |
 
+> ⚠️ **HTTP-only upstream:** The AC Infinity cloud API does not support HTTPS. Credentials and sensor data traverse the network in plain text. This is an upstream limitation — see [docs/API.md](docs/API.md) Quirk 8. Avoid running this server on untrusted networks.
+
 ## Development
 
 ```bash

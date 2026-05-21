@@ -504,7 +504,7 @@ async def detect_environment_trends(device_id: str, days: int = 7) -> str:
         if not 1 <= days <= 30:
             return json.dumps({"error": "days must be between 1 and 30"})
 
-        today = datetime.utcnow()
+        today = datetime.now(UTC).replace(tzinfo=None)
         start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
         end_date = today.strftime("%Y-%m-%d")
 
@@ -554,7 +554,7 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         if not 1 <= days <= 30:
             return json.dumps({"error": "days must be between 1 and 30"})
 
-        today = datetime.utcnow()
+        today = datetime.now(UTC).replace(tzinfo=None)
         start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
         end_date = today.strftime("%Y-%m-%d")
 
@@ -898,7 +898,9 @@ def apply_sampling(readings: list, interval: str) -> list:
     result = []
     for bucket_key in sorted(sampled.keys()):
         avg = average_readings(sampled[bucket_key])
-        avg["timestamp"] = datetime.utcfromtimestamp(bucket_key).isoformat() + "Z"
+        avg["timestamp"] = (
+            datetime.fromtimestamp(bucket_key, UTC).replace(tzinfo=None).isoformat() + "Z"
+        )
         result.append(avg)
     return result
 

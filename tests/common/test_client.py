@@ -190,6 +190,41 @@ def test_enforce_write_rate_limit_is_callable(client):
     assert callable(client._enforce_write_rate_limit)
 
 
+def test_enforce_write_rate_limit_sleeps_when_elapsed_less_than_1_5s(client):
+    """Two back-to-back calls must enforce >=1.5s between them."""
+    import time
+    client._last_write_time = 0.0
+    client._enforce_write_rate_limit()  # primes _last_write_time
+    t0 = time.monotonic()
+    client._enforce_write_rate_limit()  # must sleep ~1.5s
+    elapsed = time.monotonic() - t0
+    assert elapsed >= 1.4  # allow small scheduling tolerance
+
+
+def test_enforce_write_rate_limit_lock_serializes_concurrent_writes(client):
+    """Concurrent rate-limit calls must serialize via the lock."""
+    import threading
+    import time
+
+    client._last_write_time = time.monotonic() - 10.0  # cold start
+    timestamps: list[float] = []
+
+    def call_and_record() -> None:
+        client._enforce_write_rate_limit()
+        timestamps.append(time.monotonic())
+
+    threads = [threading.Thread(target=call_and_record) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    timestamps.sort()
+    # First call passes immediately; subsequent calls must be >=1.5s apart
+    for i in range(1, len(timestamps)):
+        assert timestamps[i] - timestamps[i - 1] >= 1.4
+
+
 # ============ authenticate ============
 
 @responses_lib.activate

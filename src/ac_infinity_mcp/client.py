@@ -1,6 +1,7 @@
 import logging
+import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -28,13 +29,20 @@ class ACInfinityClient:
         self.token: str | None = None
         self.session = requests.Session()
         self._last_write_time: float = 0.0
+        self._write_lock = threading.Lock()
 
     def _enforce_write_rate_limit(self) -> None:
-        """Enforce 1.5s minimum between write API calls (returns 403 if exceeded)."""
-        elapsed = time.monotonic() - self._last_write_time
-        if elapsed < 1.5:
-            time.sleep(1.5 - elapsed)
-        self._last_write_time = time.monotonic()
+        """Enforce 1.5s minimum between write API calls (returns 403 if exceeded).
+
+        Held under a lock so concurrent writers serialize correctly — without it,
+        parallel tool calls can pass the elapsed-time check simultaneously and
+        slam the API back-to-back.
+        """
+        with self._write_lock:
+            elapsed = time.monotonic() - self._last_write_time
+            if elapsed < 1.5:
+                time.sleep(1.5 - elapsed)
+            self._last_write_time = time.monotonic()
 
     def authenticate(self) -> bool:
         """Login and get API token"""
@@ -447,7 +455,7 @@ class ACInfinityClient:
             ]
 
         return {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(UTC).replace(tzinfo=None).isoformat() + "Z",
             "device_id": device_data.get("devCode"),
             "device_name": device_data.get("devName", "Unknown"),
             "temperature_c": round(temp_c, 1),
@@ -481,7 +489,7 @@ class ACInfinityClient:
         """
         create_time = record.get("createTime", 0)
         timestamp = (
-            datetime.utcfromtimestamp(int(create_time)).isoformat() + "Z"
+            datetime.fromtimestamp(int(create_time), UTC).replace(tzinfo=None).isoformat() + "Z"
             if create_time
             else None
         )

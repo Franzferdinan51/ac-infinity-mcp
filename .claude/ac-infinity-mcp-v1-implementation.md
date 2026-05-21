@@ -614,8 +614,8 @@ All 4 tools: `dry_run=True` default, full read-before-write where required, 1.5s
 - **What went well:** Planning session caught three encoding errors in the original spec before any code was written (targetVpd ×10 not ×100, raw °C/% integers for temp/humidity, atType=8 not 3 for VPD). The existing write infrastructure (client.set_port_mode + build_write_payload) handled all the complexity — 4 tools were thin wrappers over it. 100% coverage maintained. All 8 smoke tests passed first run against live device.
 - **Changed from plan:** (1) `set_port_mode` expanded from 4 simple modes to all 8 modes with mode-specific optional params (CYCLE, SCHEDULE, TIMER_TO_ON, TIMER_TO_OFF) — user chose the full signature. (2) Default changed from `dry_run=False` (in plan spec) to `dry_run=True` (consistent with CLAUDE.md and existing tools). (3) Added `_ai_plus_unsupported_error` helper to DRY up the AI+ error response across 4 tools. (4) README updated to add Phase 12 tools that were also missing (6 tools total added to table).
 - **Watch out for Phase 14:** `apply_grow_stage_template` calls `set_vpd_automation`, `set_temperature_automation`, `set_humidity_automation` in sequence — 1.5s rate limit means 3 live writes = 4.5s minimum wall-clock time. The `dry_run=True` propagation must flow through all 3 sub-calls. The STAGE_TARGETS in analytics.py are the authoritative source for stage VPD/temp/humidity values — confirm they match before coding Phase 14.
-- **Actual effort vs estimate:** ~2.5h actual vs ~3h planned — slightly under budget.
-- **Investment time:** 2026-05-21 session — ~2.5h wall-clock from planning session to PR merge.
+- **Actual effort vs estimate:** ~1h actual vs ~3h planned — well under budget.
+- **Investment time:** 2026-05-21 session — ~1h wall-clock from /clear to PR merge.
 - **Defects found:**
   - [D001] `targetVpd` encoding in Phase 13 spec: `int(target_vpd*100)` but Phase 12 reads `/10` → should be `int(target_vpd*10)` | Discovered: Planning session cross-reference | Severity: high | Resolved: Y
   - [D002] `devLt`/`devHt`/`devLh`/`devHh` encoding in Phase 13 spec: `int(min_c*100)` but API fixture shows raw integers | Discovered: Planning session cross-reference | Severity: high | Resolved: Y
@@ -625,10 +625,10 @@ All 4 tools: `dry_run=True` default, full read-before-write where required, 1.5s
 
 **Phase 13 Time Investment**
 - **Date:** 2026-05-21
-- **Actual Claude session time:** ~2.5h
+- **Actual Claude session time:** ~1:00
 - **Projected manual time:** 12h–20h (midpoint ~16h)
 - **Manual estimate basis:** Decent Python, familiar with existing write infrastructure but new to this specific automation field encoding. Primary cost drivers: researching correct field encodings (API has no official docs), implementing 4 tools + helpers + 230 tests, running gate loop with two model reviews.
-- **Multiplier:** ~6.4x (16h projected midpoint ÷ ~2.5h actual)
+- **Multiplier:** ~16x (16h projected midpoint ÷ ~1h actual)
 
 ---
 

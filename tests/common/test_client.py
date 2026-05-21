@@ -377,6 +377,72 @@ def test_get_historical_data_refreshes_token_on_401(authed_client):
     assert result == []
 
 
+def test_call_with_token_refresh_serializes_concurrent_401s(authed_client):
+    """Concurrent 401s must coalesce into a SINGLE re-authentication.
+
+    Without coordination, N parallel tool calls hitting an expired token would
+    each call authenticate(), wasting roundtrips and potentially triggering
+    upstream rate limits. The _auth_lock + token_at_start snapshot in
+    _call_with_token_refresh must ensure only one thread actually re-auths;
+    the others observe the refreshed token and proceed.
+    """
+    import threading
+
+    n_threads = 5
+    # Barrier inside the inner call: all N threads must arrive at the 401 raise
+    # before any of them can proceed to the refresh path. This proves every
+    # thread captured token_at_start = OLD token (none could observe a refresh
+    # mid-flight).
+    inner_barrier = threading.Barrier(n_threads)
+    thread_local = threading.local()
+    auth_call_count = 0
+    auth_count_lock = threading.Lock()
+
+    def fake_authenticate() -> bool:
+        nonlocal auth_call_count
+        with auth_count_lock:
+            auth_call_count += 1
+        authed_client.token = f"fresh_token_{auth_call_count}"
+        return True
+
+    def fake_inner() -> list[dict]:
+        attempt = getattr(thread_local, "attempt", 0)
+        thread_local.attempt = attempt + 1
+        if attempt == 0:
+            # Synchronize: every thread must be inside the inner call with the
+            # OLD token before ANY thread proceeds to refresh.
+            inner_barrier.wait()
+            raise ACInfinityAuthError("Token rejected by API (code 401): expired")
+        return [{"devCode": "C58ZA"}]
+
+    results: list = []
+    errors: list = []
+    start_gate = threading.Barrier(n_threads)
+
+    def call() -> None:
+        try:
+            start_gate.wait()  # release all threads simultaneously
+            result = authed_client.get_devices()
+            results.append(result)
+        except Exception as e:  # pragma: no cover — only fires on test failure
+            errors.append(e)
+
+    with patch.object(authed_client, "authenticate", side_effect=fake_authenticate):
+        with patch.object(authed_client, "_get_devices_inner", side_effect=fake_inner):
+            threads = [threading.Thread(target=call) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+    assert errors == []
+    assert len(results) == n_threads
+    # Critical: only ONE authenticate() call despite N threads hitting 401
+    assert auth_call_count == 1, f"Expected 1 auth call, got {auth_call_count}"
+    # All threads converged on the same refreshed token
+    assert authed_client.token == "fresh_token_1"
+
+
 @responses_lib.activate
 def test_get_mode_settings_refreshes_token_on_401(authed_client):
     """get_mode_settings must also refresh on 401."""

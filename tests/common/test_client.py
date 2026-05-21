@@ -560,7 +560,9 @@ def test_set_port_mode_dry_run_quirk_12_modeType_when_speed_nonzero(authed_clien
 
 @responses_lib.activate
 def test_set_port_mode_dry_run_ai_plus(authed_client):
-    ai_plus_response = {"code": 200, "msg": "success.", "data": MOCK_MODE_SETTINGS_AI_PLUS_PORT1}
+    # AI+ fixture captured with modeType=15 (smart automation); override to manual for this test.
+    ai_plus_manual = {**MOCK_MODE_SETTINGS_AI_PLUS_PORT1, "modeType": 0}
+    ai_plus_response = {"code": 200, "msg": "success.", "data": ai_plus_manual}
     responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=ai_plus_response, status=200)
     result = authed_client.set_port_mode(
         AI_PLUS_DEVICE_DATA, port=1, updates={"onSpead": 3}, dry_run=True
@@ -583,7 +585,23 @@ def test_set_port_mode_missing_dev_id_raises_device_error(authed_client):
 # ============ set_port_mode — dry_run=False (live write) ============
 
 ADD_MODE_SUCCESS = {"code": 200, "msg": "success", "data": None}
-ADD_MODE_403 = {"code": 403, "msg": "Data saving failed. Please try again later."}
+ADD_MODE_403_RATE_LIMIT = {"code": 403, "msg": "Data saving failed. Please try again later."}
+ADD_MODE_403_FIELD_ERROR = {"code": 403, "msg": "modeSetid is not allowed in payload."}
+MODE_SETTINGS_SMART_AUTO = {
+    "code": 200,
+    "msg": "success.",
+    "data": {**MOCK_MODE_SETTINGS_LEGACY_PORT1, "modeType": 15},
+}
+MODE_SETTINGS_ON_OFF_PORT = {
+    "code": 200,
+    "msg": "success.",
+    "data": {**MOCK_MODE_SETTINGS_LEGACY_PORT1, "modeType": 0, "loadType": 4},
+}
+MODE_SETTINGS_DIMMER_PORT = {
+    "code": 200,
+    "msg": "success.",
+    "data": {**MOCK_MODE_SETTINGS_LEGACY_PORT1, "modeType": 0, "loadType": 128},
+}
 
 
 @responses_lib.activate
@@ -605,9 +623,135 @@ def test_set_port_mode_live_write_sent_true(authed_client):
 
 
 @responses_lib.activate
-def test_set_port_mode_live_write_non_200_raises_api_error(authed_client):
-    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200)
-    responses_lib.add(responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_403, status=200)
+def test_set_port_mode_live_write_non_rate_limit_403_raises_immediately(authed_client):
+    """Non-rate-limit 403 (e.g. field validation error) must fail without retrying."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200
+    )
+    responses_lib.add(
+        responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_403_FIELD_ERROR, status=200
+    )
     with patch.object(authed_client, "_enforce_write_rate_limit"):
         with pytest.raises(ACInfinityAPIError):
             authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False)
+    # Only one write attempt — no retry for non-rate-limit errors
+    write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
+    assert len(write_calls) == 1
+
+
+@responses_lib.activate
+def test_set_port_mode_retries_on_403_rate_limit_then_succeeds(authed_client):
+    """Rate-limit 403 ('Data saving failed') triggers retry; succeeds on second attempt."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200
+    )
+    responses_lib.add(
+        responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_403_RATE_LIMIT, status=200
+    )
+    responses_lib.add(responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_SUCCESS, status=200)
+    with patch.object(authed_client, "_enforce_write_rate_limit"):
+        with patch("ac_infinity_mcp.client.time.sleep"):
+            result = authed_client.set_port_mode(
+                LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False
+            )
+    assert result["sent"] is True
+    write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
+    assert len(write_calls) == 2
+
+
+@responses_lib.activate
+def test_set_port_mode_exhausts_retries_and_raises(authed_client):
+    """Exhausting all 3 retry attempts on rate-limit 403 raises ACInfinityAPIError."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200
+    )
+    for _ in range(3):
+        responses_lib.add(
+            responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_403_RATE_LIMIT, status=200
+        )
+    with patch.object(authed_client, "_enforce_write_rate_limit"):
+        with patch("ac_infinity_mcp.client.time.sleep"):
+            with pytest.raises(ACInfinityAPIError):
+                authed_client.set_port_mode(
+                    LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False
+                )
+    write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
+    assert len(write_calls) == 3
+
+
+@responses_lib.activate
+def test_set_port_mode_raises_on_modeType_15(authed_client):
+    """Port in smart automation (modeType=15) raises ACInfinityDeviceError before any write."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SMART_AUTO, status=200
+    )
+    with pytest.raises(ACInfinityDeviceError) as exc_info:
+        authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=True)
+    assert "smart automation" in str(exc_info.value).lower()
+    assert "1" in str(exc_info.value)  # port number appears in message
+
+
+@responses_lib.activate
+def test_set_port_mode_modeType_15_no_write_attempted(authed_client):
+    """Smart automation guard fires before any write endpoint is reached."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SMART_AUTO, status=200
+    )
+    with pytest.raises(ACInfinityDeviceError):
+        authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False)
+    write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
+    assert len(write_calls) == 0
+
+
+@responses_lib.activate
+def test_set_port_mode_raises_on_load_type_4_when_variable_speed_required(authed_client):
+    """require_variable_speed=True raises ACInfinityDeviceError for on/off hardware."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_ON_OFF_PORT, status=200
+    )
+    with pytest.raises(ACInfinityDeviceError) as exc_info:
+        authed_client.set_port_mode(
+            LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=True, require_variable_speed=True
+        )
+    assert "loadType=4" in str(exc_info.value)
+    assert "set_port_on" in str(exc_info.value) or "set_port_off" in str(exc_info.value)
+
+
+@responses_lib.activate
+def test_set_port_mode_raises_on_load_type_128_when_variable_speed_required(authed_client):
+    """require_variable_speed=True raises ACInfinityDeviceError for dimmer-type hardware."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_DIMMER_PORT, status=200
+    )
+    with pytest.raises(ACInfinityDeviceError) as exc_info:
+        authed_client.set_port_mode(
+            LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=True, require_variable_speed=True
+        )
+    assert "loadType=128" in str(exc_info.value)
+
+
+@responses_lib.activate
+def test_set_port_mode_does_not_raise_load_type_4_when_variable_speed_not_required(authed_client):
+    """Without require_variable_speed, on/off ports are allowed (set_port_on/off use case)."""
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_ON_OFF_PORT, status=200
+    )
+    # Should not raise — no require_variable_speed flag
+    result = authed_client.set_port_mode(
+        LEGACY_DEVICE_DATA, port=1, updates={"onSpead": 0}, dry_run=True
+    )
+    assert result["dry_run"] is True
+
+
+@responses_lib.activate
+def test_set_port_mode_ai_plus_dry_run_false_returns_unsupported(authed_client):
+    """AI+ live write returns ai_plus_write_unsupported=True without calling addDevMode."""
+    # AI+ fixture captured with modeType=15; override to manual so modeType guard doesn't fire.
+    ai_plus_manual = {**MOCK_MODE_SETTINGS_AI_PLUS_PORT1, "modeType": 0}
+    ai_plus_response = {"code": 200, "msg": "success.", "data": ai_plus_manual}
+    responses_lib.add(responses_lib.POST, MODE_SETTINGS_URL, json=ai_plus_response, status=200)
+    result = authed_client.set_port_mode(AI_PLUS_DEVICE_DATA, port=1, updates={}, dry_run=False)
+    assert result.get("ai_plus_write_unsupported") is True
+    assert result["sent"] is False
+    write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
+    assert len(write_calls) == 0

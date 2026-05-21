@@ -995,3 +995,145 @@ async def test_set_port_off_auth_error(mock_client):
         result = await set_port_off("C58ZA", 1)
     data = json.loads(result)
     assert "error" in data
+
+
+# ============ Guard rails — Phase 8 ============
+
+MOCK_AI_PLUS_UNSUPPORTED = {
+    "payload": {"onSpead": 5, "modeType": 2},
+    "dry_run": False,
+    "controller_type": "new_framework",
+    "sent": False,
+    "ai_plus_write_unsupported": True,
+}
+
+
+async def test_set_port_speed_rejects_load_type_4(mock_client):
+    """set_port_speed rejects on/off devices (loadType=4) — guard fires in client layer."""
+    mock_client.set_port_mode.side_effect = ACInfinityDeviceError(
+        "Port 1 is an on/off device (loadType=4) — use set_port_on or set_port_off."
+    )
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+    assert "loadType=4" in data["error"]
+
+
+async def test_set_port_speed_rejects_load_type_128(mock_client):
+    """set_port_speed rejects dimmer-type devices (loadType=128) — guard fires in client layer."""
+    mock_client.set_port_mode.side_effect = ACInfinityDeviceError(
+        "Port 1 is an on/off device (loadType=128) — use set_port_on or set_port_off."
+    )
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+    assert "loadType=128" in data["error"]
+
+
+async def test_set_port_speed_allows_variable_speed_port(mock_client):
+    """set_port_speed must succeed for variable-speed ports (loadType=0 or 1)."""
+    mock_client.set_port_mode.return_value = MOCK_SET_PORT_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" not in data
+
+
+async def test_set_port_on_not_affected_by_load_type_guard(mock_client):
+    """set_port_on must NOT trigger the loadType guard — correct tool for on/off devices."""
+    mock_client.set_port_mode.return_value = {
+        "payload": {"onSpead": 10}, "dry_run": True, "controller_type": "legacy", "sent": False
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 1, dry_run=True)
+    data = json.loads(result)
+    assert "error" not in data
+    assert data["dry_run"] is True
+
+
+async def test_set_port_off_not_affected_by_load_type_guard(mock_client):
+    """set_port_off must NOT trigger the loadType guard — correct tool for on/off devices."""
+    mock_client.set_port_mode.return_value = {
+        "payload": {"onSpead": 0}, "dry_run": True, "controller_type": "legacy", "sent": False
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 1, dry_run=True)
+    data = json.loads(result)
+    assert "error" not in data
+    assert data["dry_run"] is True
+
+
+async def test_set_port_speed_returns_error_for_modeType_15(mock_client):
+    """ACInfinityDeviceError from modeType=15 guard becomes a JSON error in server."""
+    mock_client.set_port_mode.side_effect = ACInfinityDeviceError(
+        "Port 1 on device 12345 is in smart automation mode (modeType=15)"
+    )
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+    assert "smart automation" in data["error"].lower() or "modeType=15" in data["error"]
+
+
+async def test_set_port_on_returns_error_for_modeType_15(mock_client):
+    """modeType=15 guard applies to set_port_on as well."""
+    mock_client.set_port_mode.side_effect = ACInfinityDeviceError(
+        "Port 2 on device 12345 is in smart automation mode (modeType=15)"
+    )
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 2)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_off_returns_error_for_modeType_15(mock_client):
+    """modeType=15 guard applies to set_port_off as well."""
+    mock_client.set_port_mode.side_effect = ACInfinityDeviceError(
+        "Port 3 on device 12345 is in smart automation mode (modeType=15)"
+    )
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 3)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_speed_ai_plus_live_write_returns_not_implemented(mock_client):
+    """AI+ dry_run=False returns a clear documented error, not a crash."""
+    mock_client.set_port_mode.return_value = MOCK_AI_PLUS_UNSUPPORTED
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5, dry_run=False)
+    data = json.loads(result)
+    assert "error" in data
+    assert "AI+" in data["error"] or "devType=22" in data["error"]
+    assert data["controller_type"] == "new_framework"
+
+
+async def test_set_port_on_ai_plus_live_write_returns_not_implemented(mock_client):
+    """AI+ set_port_on dry_run=False returns documented error."""
+    mock_client.set_port_mode.return_value = MOCK_AI_PLUS_UNSUPPORTED
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 1, dry_run=False)
+    data = json.loads(result)
+    assert "error" in data
+    assert data["controller_type"] == "new_framework"
+
+
+async def test_set_port_off_ai_plus_live_write_returns_not_implemented(mock_client):
+    """AI+ set_port_off dry_run=False returns documented error."""
+    mock_client.set_port_mode.return_value = MOCK_AI_PLUS_UNSUPPORTED
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 1, dry_run=False)
+    data = json.loads(result)
+    assert "error" in data
+    assert data["controller_type"] == "new_framework"
+
+
+async def test_set_port_speed_passes_require_variable_speed_to_client(mock_client):
+    """set_port_speed passes require_variable_speed=True; client layer enforces the guard."""
+    mock_client.set_port_mode.return_value = MOCK_SET_PORT_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        await set_port_speed("C58ZA", 1, 5)
+    call_kwargs = mock_client.set_port_mode.call_args
+    assert call_kwargs.kwargs.get("require_variable_speed") is True

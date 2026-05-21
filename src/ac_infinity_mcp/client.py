@@ -5,7 +5,7 @@ from datetime import datetime
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from ac_infinity_mcp.controller import build_write_payload, detect_controller_type
+from ac_infinity_mcp.controller import ControllerType, build_write_payload, detect_controller_type
 from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError, ACInfinityDeviceError
 
 logger = logging.getLogger(__name__)
@@ -290,6 +290,7 @@ class ACInfinityClient:
         port: int,
         updates: dict,
         dry_run: bool = True,
+        require_variable_speed: bool = False,
     ) -> dict:
         """Write port mode settings using read-before-write.
 
@@ -303,6 +304,9 @@ class ACInfinityClient:
             port: 1-based port number.
             updates: Fields to change, e.g. {"onSpead": 5}.
             dry_run: If True (default), build and return the payload without sending.
+            require_variable_speed: If True, raise ACInfinityDeviceError when the port's
+                loadType indicates on/off hardware (loadType=4 or 128). Pass True from
+                set_port_speed; leave False for set_port_on/set_port_off.
 
         Returns:
             Dict with keys:
@@ -310,11 +314,14 @@ class ACInfinityClient:
                 "dry_run": bool
                 "controller_type": "legacy" or "new_framework"
                 "sent": bool (True only when dry_run=False and HTTP succeeded)
+                "ai_plus_write_unsupported": bool (True when AI+ live write attempted)
 
         Raises:
             ACInfinityAuthError: If not authenticated.
             ACInfinityAPIError: If the API returns a non-200 code (only when dry_run=False).
-            ACInfinityDeviceError: If devId is missing from device_data.
+            ACInfinityDeviceError: If devId is missing from device_data, if the port is in
+                smart automation mode (modeType=15), or if require_variable_speed=True and
+                the port's loadType indicates on/off hardware.
         """
         if not self.token:
             raise ACInfinityAuthError("Not authenticated — call authenticate() first")
@@ -325,6 +332,24 @@ class ACInfinityClient:
 
         controller_type = detect_controller_type(device_data)
         current_settings = self.get_mode_settings(dev_id, port)
+
+        # Guard: smart automation mode cannot be overridden via the write API (returns 999999)
+        mode_type = current_settings.get("modeType")
+        if mode_type == 15:
+            raise ACInfinityDeviceError(
+                f"Port {port} on device {dev_id} is in smart automation mode (modeType=15) — "
+                "cannot override manually. Use the AC Infinity app to switch to manual mode first."
+            )
+
+        # Guard: on/off hardware (loadType=4 or 128) rejects speed writes with 999999.
+        # Only enforced when require_variable_speed=True (i.e. called from set_port_speed).
+        load_type = current_settings.get("loadType", 0)
+        if require_variable_speed and load_type in (4, 128):
+            raise ACInfinityDeviceError(
+                f"Port {port} is an on/off device (loadType={load_type}) — "
+                "use set_port_on or set_port_off instead of set_port_speed."
+            )
+
         payload = build_write_payload(current_settings, updates, controller_type)
 
         result: dict = {
@@ -341,7 +366,14 @@ class ACInfinityClient:
             )
             return result
 
-        self._enforce_write_rate_limit()
+        # AI+ live write path is not yet implemented — addDevMode returns 100001 for devType=22
+        # and no alternative endpoint has been identified. dry_run=True is fully supported.
+        if controller_type == ControllerType.NEW_FRAMEWORK:
+            logger.warning(
+                "AI+ live write attempted for devId=%s port=%s — not yet supported", dev_id, port
+            )
+            result["ai_plus_write_unsupported"] = True
+            return result
 
         headers = {
             "token": self.token,
@@ -349,15 +381,32 @@ class ACInfinityClient:
             "User-Agent": "okhttp/3.10.0",
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
         }
-        resp = self.session.post(
-            self.ADD_DEV_MODE_ENDPOINT, data=payload, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
 
-        write_result = resp.json()
-        if write_result.get("code") != 200:
+        # Retry loop: 403 "Data saving failed" = rate limit; back off and retry.
+        # Other error codes fail immediately (auth, field validation, etc.).
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            self._enforce_write_rate_limit()
+            resp = self.session.post(
+                self.ADD_DEV_MODE_ENDPOINT, data=payload, headers=headers, timeout=10
+            )
+            resp.raise_for_status()
+
+            write_result = resp.json()
+            if write_result.get("code") == 200:
+                break
+
             error_msg = write_result.get("msg", "Unknown error")
             code = write_result.get("code")
+
+            if code == 403 and "saving failed" in error_msg.lower() and attempt < max_attempts:
+                logger.warning(
+                    "Write rate-limit hit for devId=%s port=%s (attempt %d/%d), backing off 3s",
+                    dev_id, port, attempt, max_attempts,
+                )
+                time.sleep(3)
+                continue
+
             logger.error("Write failed for devId=%s port=%s: %s", dev_id, port, error_msg)
             raise ACInfinityAPIError(f"Write API error {code}: {error_msg}")
 

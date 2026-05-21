@@ -640,8 +640,22 @@ async def set_port_speed(
             return json.dumps({"error": f"Device {device_id} not found"})
 
         write_result = await asyncio.to_thread(
-            _client().set_port_mode, device, port, {"onSpead": speed}, dry_run
+            _client().set_port_mode, device, port, {"onSpead": speed}, dry_run,
+            require_variable_speed=True,
         )
+
+        if write_result.get("ai_plus_write_unsupported"):
+            return json.dumps({
+                "error": (
+                    "AI+ controllers (devType=22) live write path is not yet implemented. "
+                    "dry_run=True is fully supported and returns the payload that would be sent. "
+                    "See docs/API.md for details."
+                ),
+                "device_id": device_id,
+                "port": port,
+                "dry_run": False,
+                "controller_type": write_result["controller_type"],
+            })
 
         response: dict = {
             "action": f"set port {port} speed to {speed}",
@@ -699,6 +713,19 @@ async def set_port_on(
             _client().set_port_mode, device, port, {"onSpead": 10}, dry_run
         )
 
+        if write_result.get("ai_plus_write_unsupported"):
+            return json.dumps({
+                "error": (
+                    "AI+ controllers (devType=22) live write path is not yet implemented. "
+                    "dry_run=True is fully supported and returns the payload that would be sent. "
+                    "See docs/API.md for details."
+                ),
+                "device_id": device_id,
+                "port": port,
+                "dry_run": False,
+                "controller_type": write_result["controller_type"],
+            })
+
         response: dict = {
             "action": f"turn port {port} on",
             "device_id": device_id,
@@ -753,6 +780,19 @@ async def set_port_off(
         write_result = await asyncio.to_thread(
             _client().set_port_mode, device, port, {"onSpead": 0}, dry_run
         )
+
+        if write_result.get("ai_plus_write_unsupported"):
+            return json.dumps({
+                "error": (
+                    "AI+ controllers (devType=22) live write path is not yet implemented. "
+                    "dry_run=True is fully supported and returns the payload that would be sent. "
+                    "See docs/API.md for details."
+                ),
+                "device_id": device_id,
+                "port": port,
+                "dry_run": False,
+                "controller_type": write_result["controller_type"],
+            })
 
         response: dict = {
             "action": f"turn port {port} off",

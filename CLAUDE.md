@@ -93,26 +93,5 @@ Confirm the current model name at the start of each phase session and substitute
 
 ## Closing Requirements (per phase)
 
-Before ending a phase session, write a Lessons Learned block to the master plan file at
-`/Users/ober37/.claude/plans/ac-infinity-mcp-v1-implementation.md`:
-
-```
-**Phase N Lessons Learned**
-- **What went well:** [brief note]
-- **Changed from plan:** [deviations and why]
-- **Watch out for next phase:** [specific warnings for Phase N+1]
-- **Actual effort vs estimate:** [hours actual vs planned]
-- **Investment time:** [HH:MM — wall-clock time from session start to PR merged]
-- **Defects found:**
-  - [D001] [description] | Discovered: [gate N] | Severity: [critical/high/medium/low] | Resolved: [Y/N]
-  - (use "None" if zero defects)
-```
-
-Then update the phase `**Status:**` line to `✅ Complete`.
-
-**Investment time:** Note wall-clock start time at session open; record elapsed time at PR merge.
-This feeds Section 4 (Time Investment Summary) of the Phase 11 project report.
-
-**Defects:** Any bug, async safety issue, API quirk violation, security finding, or test failure
-discovered during the gate loop is a defect. These feed Section 3 (Code Review) of the project
-report.
+See the **Closing Requirements** section in `.claude/ac-infinity-mcp-v1-implementation.md`
+for the full closing checklist (lessons learned format, defect log, status update).

@@ -282,14 +282,14 @@ Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`, `ci`
 ## Session Orchestration Protocol
 
 ### Plan File as Shared State
-This file at `/Users/ober37/.claude/plans/ac-infinity-mcp-v1-implementation.md` is the **single source of truth across all sessions**. Every phase session reads it at start and writes back before closing. No session should rely on prior conversation context — all context lives here.
+This file at `.claude/ac-infinity-mcp-v1-implementation.md` in the repo root is the **single source of truth across all sessions**. Every phase session reads it at start and writes back before closing. No session should rely on prior conversation context — all context lives here.
 
 ### How to Run an Orchestration Turn
 
 In any new Claude Code session (peekaboopoint repo, ac-infinity-mcp repo, or standalone):
 
 ```
-Read the plan file at /Users/ober37/.claude/plans/ac-infinity-mcp-v1-implementation.md.
+Read the plan file at `.claude/ac-infinity-mcp-v1-implementation.md` in the repo root.
 Identify the next Pending phase.
 Read all Lessons Learned sections from completed phases.
 Produce copy-paste instructions for Phase N that incorporate those lessons.
@@ -315,7 +315,28 @@ When starting a phase session with copy-paste instructions:
 1. Read this plan file fresh (do not rely on the copy-paste alone — plans can drift)
 2. Begin with the Phase Planning Session (Step 0) — present scope, confirm usability expectations, get user approval before any code
 3. Implement following the gate loop
-4. **Before ending the session:** Write lessons learned to this plan file under "Phase N Lessons Learned", write the time investment block under "Phase N Time Investment", and mark status ✅ Complete
+
+### Closing Requirements (per phase)
+
+Before ending a phase session, write the following to this plan file under the phase heading:
+
+```
+**Phase N Lessons Learned**
+- **What went well:** [brief note]
+- **Changed from plan:** [deviations and why]
+- **Watch out for next phase:** [specific warnings for Phase N+1]
+- **Actual effort vs estimate:** [hours actual vs planned]
+- **Investment time:** [HH:MM — wall-clock time from session start to PR merged]
+- **Defects found:**
+  - [D001] [description] | Discovered: [gate N] | Severity: [critical/high/medium/low] | Resolved: [Y/N]
+  - (use "None" if zero defects)
+```
+
+Then update the phase `**Status:**` line to `✅ Complete`.
+
+**Investment time:** Note wall-clock start time at session open; record elapsed time at PR merge. This feeds Section 4 (Time Investment Summary) of the Phase 16 project report.
+
+**Defects:** Any bug, async safety issue, API quirk violation, security finding, or test failure discovered during the gate loop is a defect. These feed Section 3 (Code Review) of the project report.
 
 ### Lessons Learned Format (per phase)
 

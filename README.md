@@ -45,11 +45,17 @@
 | 📊 **Analytics** | `get_environment_health` | Composite health score (0–100, A–F) across temp, humidity, VPD |
 | 📊 **Analytics** | `detect_environment_trends` | Linear trend + 7-day projection per metric |
 | 📊 **Analytics** | `get_port_activity_report` | Per-port on/off hours, uptime %, and peak activity hour |
+| 🔎 **Port Status** | `get_port_status` | Live port power level, load detection, active mode, and timer countdown |
+| 🔎 **Port Status** | `get_port_settings` | Full automation config: mode, VPD target, temp/humidity thresholds, schedule, cycle |
 | 🔌 **Write** | `set_port_speed` | Set fan or pump speed 1–10 (`dry_run=True` by default) |
 | 🔌 **Write** | `set_port_on` | Turn a port fully on (`dry_run=True` by default) |
 | 🔌 **Write** | `set_port_off` | Turn a port fully off (`dry_run=True` by default) |
+| ⚙️ **Automation** | `set_vpd_automation` | Enable VPD mode with a kPa target using built-in sensors (`dry_run=True` by default) |
+| ⚙️ **Automation** | `set_temperature_automation` | Enable AUTO mode with min/max °C thresholds (`dry_run=True` by default) |
+| ⚙️ **Automation** | `set_humidity_automation` | Enable AUTO mode with min/max % RH thresholds (`dry_run=True` by default) |
+| ⚙️ **Automation** | `set_port_mode` | Switch to any mode: OFF, ON, AUTO, VPD, CYCLE, SCHEDULE, TIMER_TO_ON, TIMER_TO_OFF (`dry_run=True` by default) |
 
-> ✦ Write tools default to `dry_run=True` — they return the exact payload they *would* send without making any changes to your equipment. Pass `dry_run=False` only when you're ready to execute.
+> ✦ Write and Automation tools default to `dry_run=True` — they return the exact payload they *would* send without making any changes to your equipment. Pass `dry_run=False` only when you're ready to execute.
 
 ## Quick start
 

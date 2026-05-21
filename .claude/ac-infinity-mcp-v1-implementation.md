@@ -12,8 +12,8 @@
 | 1 | Project Scaffold | ✅ Complete | #1 |
 | 2 | Read Tool Suite + Test Foundation | ✅ Complete | #2 |
 | 3 | Analytics MCP Tools | ✅ Complete | #3 |
-| 4 | Full API Documentation + Read Tool Polish | 🔲 Pending | — |
-| 5 | CI/CD Pipeline | 🔲 Pending | — |
+| 4 | Full API Documentation + Read Tool Polish | ✅ Complete | #4 |
+| 5 | CI/CD Pipeline | ✅ Complete | #5 |
 | 6 | Write Tools Foundation | 🔲 Pending | — |
 | 7 | Write Tools MCP Layer | 🔲 Pending | — |
 | 8 | Write Tools Full Implementation | 🔲 Pending | — |
@@ -170,13 +170,26 @@ Maintain ≥85% coverage.
 
 ## Phase 5 — CI/CD Pipeline
 
-**Status:** 🔲 Pending
+**Status:** ✅ Complete
+**PR:** #5 (`feat/phase-5-cicd`)
+**Merged:** 2026-05-20
 
 ### Scope
 - `.github/workflows/ci.yml` — ruff, mypy, pytest, pip-audit on every PR
 - `.github/workflows/codeql.yml` — CodeQL security scan
 - Dependabot config
 - Branch protection rules (document in CONTRIBUTING.md)
+
+---
+
+**Phase 5 Lessons Learned**
+- **What went well:** CI went green on first push; all four checks (ruff, mypy, pytest, pip-audit) passed immediately without workflow iteration. Dependabot fired 3 action-version PRs within minutes of merge (checkout-6, setup-python-6, codeql-action-4) — working exactly as designed.
+- **Changed from plan:** Had to suppress `PYSEC-2025-183` (pyjwt, disputed, no fix available) in `ci.yml` with `--ignore-vuln`. `pyjwt` is a transitive dep of `mcp` that the project does not use directly; the finding is a false positive for this project's threat model. This matched the Phase 4 warning exactly.
+- **Watch out for next phase (Phase 6 — Write Tools Foundation):** The write endpoints (`/dev/addDevMode`, `/dev/getdevModeSettingList`) have no request/response examples in `docs/API.md` yet — only the read endpoints were sniffed in Phase 4. Quirk 14 defers AI+ endpoint specifics to Phase 8. Phase 6 must front-load a write-API sniffing step to capture the full 77-param legacy payload and AI+ static payload structure before any implementation starts.
+- **Actual effort vs estimate:** ~1 hour actual vs ~2 hours estimated (clean first pass; pyjwt suppression was the only friction).
+- **Investment time:** ~1:15 — wall-clock from session start to PR merged.
+- **Defects found:**
+  - None
 
 ---
 

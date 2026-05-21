@@ -948,7 +948,7 @@ def average_readings(readings: list) -> dict:
     }
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     email = os.getenv("AC_INFINITY_EMAIL")
     password = os.getenv("AC_INFINITY_PASSWORD")
 

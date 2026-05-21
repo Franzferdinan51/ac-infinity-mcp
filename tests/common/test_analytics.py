@@ -10,6 +10,7 @@ from ac_infinity_mcp.analytics import (
     calculate_health_score,
     detect_trends,
 )
+from ac_infinity_mcp.schema import calculate_vpd
 
 
 def _reading(temp_c=24.0, humidity=60.0, vpd=1.24):
@@ -347,3 +348,19 @@ def test_build_activity_report_uptime_pct_range():
     result = build_activity_report(readings)
     assert 0 <= result[0].uptime_pct <= 100
     assert result[0].uptime_pct == 50.0
+
+
+# ============ calculate_vpd ============
+
+def test_calculate_vpd_known_value():
+    vpd = calculate_vpd(25.0, 60.0)
+    assert 1.2 <= vpd <= 1.4
+
+
+def test_calculate_vpd_saturated():
+    assert calculate_vpd(25.0, 100.0) == 0.0
+
+
+def test_calculate_vpd_zero_humidity():
+    vpd = calculate_vpd(25.0, 0.0)
+    assert vpd > 3.0

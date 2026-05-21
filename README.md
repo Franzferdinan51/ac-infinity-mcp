@@ -1,30 +1,87 @@
-# ac-infinity-mcp
+<p align="center">
+  <h1 align="center">ac-infinity-mcp</h1>
+  <p align="center">
+    Control and monitor your AC Infinity grow environment through Claude and any MCP-compatible AI assistant.
+  </p>
+  <p align="center">
+    <a href="https://github.com/ober37/ac-infinity-mcp/actions/workflows/ci.yml"><img src="https://github.com/ober37/ac-infinity-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/ober37/ac-infinity-mcp/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ober37/ac-infinity-mcp" alt="License: MIT"></a>
+    <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"></a>
+  </p>
+</p>
 
-MCP server for [AC Infinity](https://acinfinity.com) grow environment control. Exposes device
-readings, analytics, and write tools (speed, on/off) to Claude via the
-[Model Context Protocol](https://modelcontextprotocol.io).
+---
 
-## Quick start — Claude Desktop
+## What is this?
 
-### 1. Install
+**ac-infinity-mcp** is an [MCP server](https://modelcontextprotocol.io) that connects Claude (and other AI assistants) directly to your AC Infinity controllers — so you can read live sensor data, run analytics, and adjust fan speeds or port states using natural language, without opening the AC Infinity app.
+
+> Built with [FastMCP](https://github.com/jlowin/fastmcp) and the AC Infinity cloud API.
+
+## Example prompts
+
+> *"What's the VPD trend in my tent over the last 7 days?"*
+> *"Is my environment in the right range for late flower?"*
+> *"Turn off port 3 on my 69 Pro controller — dry run first."*
+> *"Show me which ports have been running the most this week."*
+
+## Compatible hardware
+
+| Controller | Reads | Writes | Notes |
+|---|---|---|---|
+| UIS Controller 69 Pro | ✅ | ✅ | Legacy protocol |
+| UIS Controller 69 Pro+ | ✅ | ✅ | Legacy protocol |
+| UIS Controller 89 AI+ | ✅ | ⚠️ v1 read-only | New AI+ protocol — write support planned for v2 |
+
+## Tools
+
+| Category | Tool | What it does |
+|---|---|---|
+| 🔍 **Discovery** | `discover_devices` | List all your controllers and ports |
+| 🌡️ **Readings** | `get_device_reading` | Live temp, humidity, VPD, and port states for one device |
+| 🌡️ **Readings** | `get_all_device_readings` | Same, for all devices at once |
+| 🌡️ **Readings** | `get_historical_readings` | Time-series data with optional bucketing (raw, 15m, 1h, 1d, …) |
+| 📊 **Analytics** | `check_vpd_drift` | VPD target compliance check for your current grow stage |
+| 📊 **Analytics** | `get_environment_health` | Composite health score (0–100, A–F) across temp, humidity, VPD |
+| 📊 **Analytics** | `detect_environment_trends` | Linear trend + 7-day projection per metric |
+| 📊 **Analytics** | `get_port_activity_report` | Per-port on/off hours, uptime %, and peak activity hour |
+| 🔌 **Write** | `set_port_speed` | Set fan or pump speed 1–10 (`dry_run=True` by default) |
+| 🔌 **Write** | `set_port_on` | Turn a port fully on (`dry_run=True` by default) |
+| 🔌 **Write** | `set_port_off` | Turn a port fully off (`dry_run=True` by default) |
+
+> ✦ Write tools default to `dry_run=True` — they return the exact payload they *would* send without making any changes to your equipment. Pass `dry_run=False` only when you're ready to execute.
+
+## Quick start
+
+### Option 1: pip (simplest)
 
 ```bash
 pip install git+https://github.com/ober37/ac-infinity-mcp.git
 ```
 
-Requires Python 3.11+. Install into a virtual environment to keep dependencies isolated:
+Requires Python 3.11+.
+
+### Option 2: isolated venv (recommended)
 
 ```bash
 python3 -m venv ~/.venvs/ac-infinity-mcp
 source ~/.venvs/ac-infinity-mcp/bin/activate
 pip install git+https://github.com/ober37/ac-infinity-mcp.git
-which ac-infinity-mcp   # note this path — you'll need it below
+which ac-infinity-mcp   # copy this path — you'll need it below
 ```
 
-### 2. Configure Claude Desktop
+### Option 3: uvx (no install)
+
+```bash
+uvx --from git+https://github.com/ober37/ac-infinity-mcp.git ac-infinity-mcp
+```
+
+## MCP client configuration
+
+### Claude Desktop
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
-`%APPDATA%\Claude\claude_desktop_config.json` (Windows) and add:
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -40,57 +97,42 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 }
 ```
 
-Replace `/path/to/ac-infinity-mcp` with the full path printed by `which ac-infinity-mcp` above.
+Replace `/path/to/ac-infinity-mcp` with the path printed by `which ac-infinity-mcp`.
 
-Restart Claude Desktop. You should see the AC Infinity tools available in the tool picker.
+### Cursor / Windsurf
+
+Add to your MCP settings:
+
+```json
+{
+  "ac-infinity": {
+    "command": "/path/to/ac-infinity-mcp",
+    "env": {
+      "AC_INFINITY_EMAIL": "you@example.com",
+      "AC_INFINITY_PASSWORD": "yourpassword"
+    }
+  }
+}
+```
 
 ## Docker
 
-### 1. Create `.env`
-
 ```bash
 cp .env.example .env
-# edit .env and fill in AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD
-```
-
-### 2. Build and run
-
-```bash
+# fill in AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD
 docker compose up --build
 ```
 
-The container runs the MCP server over stdio. Connect a Claude Desktop instance (or any MCP
-client) to it via a stdio bridge such as
-[mcp-proxy](https://github.com/sparfenyuk/mcp-proxy).
+The container runs over stdio. Connect via a stdio bridge such as [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy).
 
-> **Note:** `.env` is never copied into the image. Credentials are injected at runtime only
-> via `env_file` in `docker-compose.yml`.
+> Credentials are injected at runtime via `env_file` — never baked into the image.
 
 ## Environment variables
 
 | Variable | Required | Description |
-|----------|----------|-------------|
-| `AC_INFINITY_EMAIL` | Yes | AC Infinity account email |
-| `AC_INFINITY_PASSWORD` | Yes | AC Infinity account password |
-
-## Available tools
-
-| Tool | Description |
-|------|-------------|
-| `discover_devices` | List all controllers and their ports |
-| `get_device_reading` | Current temp, humidity, VPD for a device |
-| `get_all_device_readings` | Readings for all devices at once |
-| `get_historical_readings` | Time-series data for a device |
-| `check_vpd_drift` | VPD target compliance check |
-| `get_environment_health` | Composite health score (0–100) + grade |
-| `detect_environment_trends` | Linear trend + 7-day projection per metric |
-| `get_port_activity_report` | Per-port on/off hours and uptime |
-| `set_port_speed` | Set fan/pump speed (1–10, dry_run safe) |
-| `set_port_on` | Turn a port on (dry_run safe) |
-| `set_port_off` | Turn a port off (dry_run safe) |
-
-Write tools default to `dry_run=True` — they return the payload they _would_ send without
-making any changes. Pass `dry_run=False` to execute.
+|---|---|---|
+| `AC_INFINITY_EMAIL` | Yes | Your AC Infinity account email |
+| `AC_INFINITY_PASSWORD` | Yes | Your AC Infinity account password |
 
 ## Development
 
@@ -100,7 +142,16 @@ cd ac-infinity-mcp
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env   # fill in credentials
+
+# Lint + type-check
+ruff check src/ tests/
+mypy src/ac_infinity_mcp/
+
+# Tests (unit + integration)
 pytest tests/ -v
+
+# Security audit
+pip audit
 ```
 
 ## License

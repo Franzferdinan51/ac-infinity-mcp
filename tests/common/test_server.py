@@ -1137,3 +1137,248 @@ async def test_set_port_speed_passes_require_variable_speed_to_client(mock_clien
         await set_port_speed("C58ZA", 1, 5)
     call_kwargs = mock_client.set_port_mode.call_args
     assert call_kwargs.kwargs.get("require_variable_speed") is True
+
+
+# ============ Generic except Exception coverage ============
+
+async def test_get_device_reading_generic_exception(mock_client):
+    mock_client.get_devices.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_device_reading("C58ZA")
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_get_all_device_readings_generic_exception(mock_client):
+    mock_client.get_devices.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_all_device_readings()
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_speed_generic_exception(mock_client):
+    mock_client.set_port_mode.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_on_generic_exception(mock_client):
+    mock_client.set_port_mode.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_off_generic_exception(mock_client):
+    mock_client.set_port_mode.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ get_historical_readings — error handlers + missing branches ============
+
+async def test_get_historical_readings_auth_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAuthError("token expired")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings("C58ZA", "2024-04-25", "2024-04-25")
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+
+
+async def test_get_historical_readings_api_error(mock_client):
+    mock_client.get_devices.side_effect = ACInfinityAPIError("API error 503")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings("C58ZA", "2024-04-25", "2024-04-25")
+    data = json.loads(result)
+    assert data["error"] == "AC Infinity API error"
+
+
+async def test_get_historical_readings_generic_exception(mock_client):
+    mock_client.get_devices.side_effect = RuntimeError("unexpected crash")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings("C58ZA", "2024-04-25", "2024-04-25")
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_get_historical_readings_empty_after_sampling(mock_client):
+    base_ts = 1714000000
+    raw_records = [{"createTime": base_ts}]
+    mock_client.get_historical_data.return_value = raw_records
+    # Return a record with a bad timestamp so apply_sampling skips it and sampled is empty
+    mock_client.parse_history_record.side_effect = lambda r, port_names=None: {
+        "timestamp": "NOT_A_VALID_TIMESTAMP",
+        "temperature_c": 24.0, "temperature_f": 75.2,
+        "humidity": 55.0, "vpd": 1.5, "ports": [],
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings("C58ZA", "2024-04-25", "2024-04-25", "1h")
+    data = json.loads(result)
+    assert "error" in data["statistics"]
+
+
+async def test_get_historical_readings_with_time_filter(mock_client):
+    base_ts = 1714000000
+    raw_records = [{"createTime": base_ts + i * 3600} for i in range(4)]
+    mock_client.get_historical_data.return_value = raw_records
+    mock_client.parse_history_record.side_effect = lambda r, port_names=None: {
+        "timestamp": f"2024-04-25T{(r['createTime'] - base_ts) // 3600 + 8:02d}:00:00Z",
+        "temperature_c": 24.0, "temperature_f": 75.2,
+        "humidity": 55.0, "vpd": 1.5, "ports": [],
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings(
+            "C58ZA", "2024-04-25", "2024-04-25", "raw",
+            time_start="10:00", time_end="12:00",
+        )
+    data = json.loads(result)
+    assert len(data["readings"]) <= 4
+
+
+async def test_get_historical_readings_port_stats_computed(mock_client):
+    base_ts = 1714000000
+    raw_records = [{"createTime": base_ts + i * 3600} for i in range(3)]
+    mock_client.get_historical_data.return_value = raw_records
+    mock_client.parse_history_record.side_effect = lambda r, port_names=None: {
+        "timestamp": f"2024-04-25T{(r['createTime'] - base_ts) // 3600:02d}:00:00Z",
+        "temperature_c": 24.0, "temperature_f": 75.2,
+        "humidity": 55.0, "vpd": 1.5,
+        "ports": [{"port": 1, "name": "Fan", "speed": 5, "on": True}],
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings("C58ZA", "2024-04-25", "2024-04-25", "raw")
+    data = json.loads(result)
+    stats = data["statistics"]
+    assert "port_statistics" in stats
+    assert "Fan" in stats["port_statistics"]
+
+
+# ============ check_vpd_drift — error handlers ============
+
+async def test_check_vpd_drift_auth_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_device_reading",
+               side_effect=ACInfinityAuthError("token expired")):
+        result = await check_vpd_drift("C58ZA", "veg")
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+
+
+async def test_check_vpd_drift_api_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_device_reading",
+               side_effect=ACInfinityAPIError("API error 500")):
+        result = await check_vpd_drift("C58ZA", "veg")
+    data = json.loads(result)
+    assert data["error"] == "AC Infinity API error"
+
+
+async def test_check_vpd_drift_generic_exception(mock_client):
+    with patch("ac_infinity_mcp.server.get_device_reading",
+               side_effect=RuntimeError("unexpected crash")):
+        result = await check_vpd_drift("C58ZA", "veg")
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ get_environment_health — error handlers ============
+
+async def test_get_environment_health_auth_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_device_reading",
+               side_effect=ACInfinityAuthError("token expired")):
+        result = await get_environment_health("C58ZA", "veg")
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+
+
+async def test_get_environment_health_api_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_device_reading",
+               side_effect=ACInfinityAPIError("API error 500")):
+        result = await get_environment_health("C58ZA", "veg")
+    data = json.loads(result)
+    assert data["error"] == "AC Infinity API error"
+
+
+async def test_get_environment_health_generic_exception(mock_client):
+    with patch("ac_infinity_mcp.server.get_device_reading",
+               side_effect=RuntimeError("unexpected crash")):
+        result = await get_environment_health("C58ZA", "veg")
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ detect_environment_trends — error handlers ============
+
+async def test_detect_environment_trends_auth_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_historical_readings",
+               side_effect=ACInfinityAuthError("token expired")):
+        result = await detect_environment_trends("C58ZA", 7)
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+
+
+async def test_detect_environment_trends_api_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_historical_readings",
+               side_effect=ACInfinityAPIError("API error 500")):
+        result = await detect_environment_trends("C58ZA", 7)
+    data = json.loads(result)
+    assert data["error"] == "AC Infinity API error"
+
+
+async def test_detect_environment_trends_generic_exception(mock_client):
+    with patch("ac_infinity_mcp.server.get_historical_readings",
+               side_effect=RuntimeError("unexpected crash")):
+        result = await detect_environment_trends("C58ZA", 7)
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ get_port_activity_report — error propagation + error handlers ============
+
+async def test_get_port_activity_report_error_propagated(mock_client):
+    error_payload = json.dumps({"error": "No readings found for device C58ZA"})
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("ac_infinity_mcp.server.get_historical_readings",
+                   return_value=error_payload):
+            result = await get_port_activity_report("C58ZA", 7)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_get_port_activity_report_auth_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_historical_readings",
+               side_effect=ACInfinityAuthError("token expired")):
+        result = await get_port_activity_report("C58ZA", 7)
+    data = json.loads(result)
+    assert "Authentication failed" in data["error"]
+
+
+async def test_get_port_activity_report_api_error(mock_client):
+    with patch("ac_infinity_mcp.server.get_historical_readings",
+               side_effect=ACInfinityAPIError("API error 500")):
+        result = await get_port_activity_report("C58ZA", 7)
+    data = json.loads(result)
+    assert data["error"] == "AC Infinity API error"
+
+
+async def test_get_port_activity_report_generic_exception(mock_client):
+    with patch("ac_infinity_mcp.server.get_historical_readings",
+               side_effect=RuntimeError("unexpected crash")):
+        result = await get_port_activity_report("C58ZA", 7)
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ apply_sampling — bad timestamp coverage ============
+
+def test_apply_sampling_bad_timestamp_skipped():
+    readings = [
+        _make_history_record("NOT_A_TIMESTAMP", temp_c=24.0),
+        _make_history_record("2024-04-25T10:00:00Z", temp_c=24.0),
+    ]
+    result = apply_sampling(readings, "1h")
+    assert len(result) == 1

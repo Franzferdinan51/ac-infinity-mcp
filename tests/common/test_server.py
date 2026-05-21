@@ -1,11 +1,12 @@
 """Unit tests for server.py async tools and helper functions."""
 
+import asyncio
 import json
 from unittest.mock import patch
 
 import pytest
 
-from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError
+from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError, ACInfinityDeviceError
 from ac_infinity_mcp.server import (
     _filter_readings_by_time,
     _parse_duration_seconds,
@@ -20,6 +21,9 @@ from ac_infinity_mcp.server import (
     get_historical_readings,
     get_port_activity_report,
     mcp_server,
+    set_port_off,
+    set_port_on,
+    set_port_speed,
 )
 from tests.conftest import MOCK_DEVICE_LEGACY
 
@@ -758,3 +762,236 @@ async def test_get_port_activity_report_port_always_on(mock_client):
     port = data["ports"][0]
     assert port["uptime_pct"] == 100.0
     assert port["avg_speed_when_running"] == 5.0
+
+
+# ============ set_port_speed ============
+
+MOCK_SET_PORT_MODE_DRY = {
+    "payload": {"onSpead": 5, "modeType": 2, "devId": 12345},
+    "dry_run": True,
+    "controller_type": "legacy",
+    "sent": False,
+}
+
+MOCK_SET_PORT_MODE_LIVE = {
+    "payload": {"onSpead": 5, "modeType": 2, "devId": 12345},
+    "dry_run": False,
+    "controller_type": "legacy",
+    "sent": True,
+}
+
+
+async def test_set_port_speed_dry_run(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_SET_PORT_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 2, 5, dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    assert data["sent"] is False
+    assert data["speed"] == 5
+    assert data["port"] == 2
+    assert data["device_id"] == "C58ZA"
+    assert "payload" in data
+    assert data["controller_type"] == "legacy"
+
+
+async def test_set_port_speed_live(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_SET_PORT_MODE_LIVE
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 2, 5, dry_run=False)
+    data = json.loads(result)
+    assert data["sent"] is True
+    assert data["dry_run"] is False
+    assert "payload" not in data
+
+
+async def test_set_port_speed_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("INVALID", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+    assert "INVALID" in data["error"]
+
+
+async def test_set_port_speed_speed_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "speed" in data["error"]
+
+
+async def test_set_port_speed_speed_eleven(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 11)
+    data = json.loads(result)
+    assert "error" in data
+    assert "speed" in data["error"]
+
+
+async def test_set_port_speed_speed_one_valid(mock_client):
+    mock_client.set_port_mode.return_value = {**MOCK_SET_PORT_MODE_DRY, "payload": {"onSpead": 1}}
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 1)
+    data = json.loads(result)
+    assert "error" not in data
+    assert data["speed"] == 1
+
+
+async def test_set_port_speed_speed_ten_valid(mock_client):
+    mock_client.set_port_mode.return_value = {**MOCK_SET_PORT_MODE_DRY, "payload": {"onSpead": 10}}
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 10)
+    data = json.loads(result)
+    assert "error" not in data
+    assert data["speed"] == 10
+
+
+async def test_set_port_speed_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 0, 5)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_set_port_speed_api_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAPIError("API error 500")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_speed_auth_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAuthError("Not authenticated")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_speed_device_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityDeviceError("device_data missing devId")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, 5)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_speed_uses_asyncio_to_thread(mock_client):
+    """Confirm set_port_mode is called via asyncio.to_thread, not directly."""
+    mock_client.set_port_mode.return_value = MOCK_SET_PORT_MODE_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        with patch("asyncio.to_thread", wraps=asyncio.to_thread) as mock_thread:
+            await set_port_speed("C58ZA", 1, 5)
+    # asyncio.to_thread should have been called at least twice:
+    # once for get_devices and once for set_port_mode
+    assert mock_thread.call_count >= 2
+
+
+# ============ set_port_on ============
+
+MOCK_SET_PORT_ON_DRY = {
+    "payload": {"onSpead": 10, "modeType": 2, "devId": 12345},
+    "dry_run": True,
+    "controller_type": "legacy",
+    "sent": False,
+}
+
+
+async def test_set_port_on_dry_run(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_SET_PORT_ON_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 1, dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    assert data["sent"] is False
+    assert data["payload"]["onSpead"] == 10
+    assert data["device_id"] == "C58ZA"
+    assert data["port"] == 1
+
+
+async def test_set_port_on_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("INVALID", 1)
+    data = json.loads(result)
+    assert "error" in data
+    assert "INVALID" in data["error"]
+
+
+async def test_set_port_on_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_set_port_on_api_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAPIError("API error 403")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_on_auth_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAuthError("Not authenticated")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data
+
+
+# ============ set_port_off ============
+
+MOCK_SET_PORT_OFF_DRY = {
+    "payload": {"onSpead": 0, "modeType": 0, "devId": 12345},
+    "dry_run": True,
+    "controller_type": "legacy",
+    "sent": False,
+}
+
+
+async def test_set_port_off_dry_run(mock_client):
+    mock_client.set_port_mode.return_value = MOCK_SET_PORT_OFF_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 1, dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    assert data["sent"] is False
+    assert data["payload"]["onSpead"] == 0
+    assert data["device_id"] == "C58ZA"
+
+
+async def test_set_port_off_device_not_found(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("INVALID", 1)
+    data = json.loads(result)
+    assert "error" in data
+    assert "INVALID" in data["error"]
+
+
+async def test_set_port_off_port_zero(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 0)
+    data = json.loads(result)
+    assert "error" in data
+    assert "port" in data["error"]
+
+
+async def test_set_port_off_api_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAPIError("API error 403")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_set_port_off_auth_error(mock_client):
+    mock_client.set_port_mode.side_effect = ACInfinityAuthError("Not authenticated")
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_off("C58ZA", 1)
+    data = json.loads(result)
+    assert "error" in data

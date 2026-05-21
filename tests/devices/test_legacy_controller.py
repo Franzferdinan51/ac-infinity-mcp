@@ -108,6 +108,16 @@ def test_build_write_payload_legacy_new_field_in_updates_is_added():
     assert result["customField"] == 99
 
 
+def test_build_write_payload_converts_booleans_to_int():
+    """Bool fields (isUpdateVpdNums, restore) must be 0/1 not True/False for form encoding."""
+    settings = {**MOCK_MODE_SETTINGS_LEGACY_PORT1, "isUpdateVpdNums": False, "restore": True}
+    result = build_write_payload(settings, {}, ControllerType.LEGACY)
+    assert result["isUpdateVpdNums"] == 0
+    assert result["restore"] == 1
+    assert not isinstance(result["isUpdateVpdNums"], bool)
+    assert not isinstance(result["restore"], bool)
+
+
 def test_build_write_payload_from_flat_fixture():
     """Using the pre-filtered flat fixture as input mirrors the actual client call path."""
     result = build_write_payload(

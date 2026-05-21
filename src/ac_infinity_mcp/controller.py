@@ -57,9 +57,13 @@ def build_write_payload(
     Returns:
         Complete flat payload dict ready to POST to /dev/addDevMode (~138 fields).
     """
-    # Keep only flat scalar values — form-encoding cannot represent dicts or lists
+    # Keep only flat scalar values — form-encoding cannot represent dicts or lists.
+    # Convert Python booleans to int (0/1) — the API form-encodes as integers, not
+    # "True"/"False" strings, which cause 999999 rejections.
     payload: dict[str, Any] = {
-        k: v for k, v in current_settings.items() if not isinstance(v, (dict, list))
+        k: int(v) if isinstance(v, bool) else v
+        for k, v in current_settings.items()
+        if not isinstance(v, (dict, list))
     }
 
     payload.update(updates)

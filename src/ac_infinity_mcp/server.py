@@ -19,6 +19,7 @@ from ac_infinity_mcp.client import ACInfinityClient
 from ac_infinity_mcp.schema import (
     ACInfinityAPIError,
     ACInfinityAuthError,
+    ACInfinityDeviceError,
     ACIReading,
     VPDTargets,
 )
@@ -583,6 +584,194 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
     except Exception as e:
         logger.error("Unexpected error in get_port_activity_report: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+# ============ Write Tools ============
+
+@mcp_server.tool()
+async def set_port_speed(
+    device_id: str,
+    port: int,
+    speed: int,
+    dry_run: bool = True,
+) -> str:
+    """Set fan or dimmer speed on a specific port.
+
+    Uses read-before-write: reads current mode settings then overlays the new
+    speed value. Defaults to dry_run=True — set dry_run=False to write to the
+    device.
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        speed: Target speed 1–10 (10 = full speed).
+        dry_run: If True (default), returns the payload that would be sent
+            without writing. Set to False to execute the change.
+
+    Returns:
+        JSON with action, device_id, port, speed, dry_run, controller_type,
+        sent, and payload (when dry_run=True).
+
+        Example (dry_run=True)::
+
+            {
+              "action": "set port 2 speed to 5",
+              "device_id": "C58ZA",
+              "port": 2,
+              "speed": 5,
+              "dry_run": true,
+              "controller_type": "legacy",
+              "sent": false,
+              "payload": { ... }
+            }
+
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+        if not 1 <= speed <= 10:
+            return json.dumps({"error": "speed must be 1–10"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, {"onSpead": speed}, dry_run
+        )
+
+        response: dict = {
+            "action": f"set port {port} speed to {speed}",
+            "device_id": device_id,
+            "port": port,
+            "speed": speed,
+            "dry_run": write_result["dry_run"],
+            "controller_type": write_result["controller_type"],
+            "sent": write_result["sent"],
+        }
+        if write_result["dry_run"]:
+            response["payload"] = write_result["payload"]
+
+        return json.dumps(response, indent=2)
+
+    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.warning("Error in set_port_speed (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in set_port_speed: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def set_port_on(
+    device_id: str,
+    port: int,
+    dry_run: bool = True,
+) -> str:
+    """Turn a port on at full speed (onSpead=10).
+
+    Works for fan-type and on/off toggle devices. Uses read-before-write.
+    Defaults to dry_run=True — set dry_run=False to write to the device.
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        dry_run: If True (default), returns the payload that would be sent
+            without writing.
+
+    Returns:
+        JSON with action, device_id, port, dry_run, controller_type, sent,
+        and payload (when dry_run=True). On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, {"onSpead": 10}, dry_run
+        )
+
+        response: dict = {
+            "action": f"turn port {port} on",
+            "device_id": device_id,
+            "port": port,
+            "dry_run": write_result["dry_run"],
+            "controller_type": write_result["controller_type"],
+            "sent": write_result["sent"],
+        }
+        if write_result["dry_run"]:
+            response["payload"] = write_result["payload"]
+
+        return json.dumps(response, indent=2)
+
+    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.warning("Error in set_port_on (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in set_port_on: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+async def set_port_off(
+    device_id: str,
+    port: int,
+    dry_run: bool = True,
+) -> str:
+    """Turn a port off (onSpead=0).
+
+    Uses read-before-write. Defaults to dry_run=True — set dry_run=False to
+    write to the device.
+
+    Args:
+        device_id: Device code from discover_devices (e.g. "C58ZA").
+        port: 1-based port number.
+        dry_run: If True (default), returns the payload that would be sent
+            without writing.
+
+    Returns:
+        JSON with action, device_id, port, dry_run, controller_type, sent,
+        and payload (when dry_run=True). On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, {"onSpead": 0}, dry_run
+        )
+
+        response: dict = {
+            "action": f"turn port {port} off",
+            "device_id": device_id,
+            "port": port,
+            "dry_run": write_result["dry_run"],
+            "controller_type": write_result["controller_type"],
+            "sent": write_result["sent"],
+        }
+        if write_result["dry_run"]:
+            response["payload"] = write_result["payload"]
+
+        return json.dumps(response, indent=2)
+
+    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.warning("Error in set_port_off (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in set_port_off: %s", e)
         return json.dumps({"error": str(e)})
 
 

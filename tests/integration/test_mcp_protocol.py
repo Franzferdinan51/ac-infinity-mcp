@@ -225,6 +225,21 @@ async def test_protocol_call_check_vpd_drift_happy_path(mock_client: MagicMock) 
     assert data["stage"] == "veg"
 
 
+async def test_protocol_call_check_vpd_drift_invalid_stage_returns_error(
+    mock_client: MagicMock,
+) -> None:
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        async with create_connected_server_and_client_session(srv.mcp_server) as session:
+            result = await session.call_tool(
+                "check_vpd_drift", {"device_id": "C58ZA", "stage": "bloom"}
+            )
+    assert result.isError is False  # tool-level error, not MCP-level
+    data = json.loads(result.content[0].text)
+    assert "error" in data
+    assert "bloom" in data["error"]  # unknown stage echoed back
+    assert "veg" in data["error"]    # valid stages listed in message
+
+
 async def test_protocol_call_set_port_speed_dry_run_happy_path(
     mock_client: MagicMock,
 ) -> None:

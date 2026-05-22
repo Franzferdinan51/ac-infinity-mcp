@@ -32,6 +32,25 @@ def client():
     return ACInfinityClient("test@example.com", "password123")
 
 
+def test_base_url_is_http_only():
+    """docs/API.md Quirk 8: upstream serves HTTP only. A well-meaning "fix" to
+    https would silently break compatibility because the upstream server does
+    not serve TLS. Guards the invariant so a regression fails CI (P2-F007).
+    """
+    assert ACInfinityClient.BASE_URL.startswith("http://")
+    assert not ACInfinityClient.BASE_URL.startswith("https://")
+    # Confirm derived endpoints inherit the scheme
+    for endpoint in (
+        ACInfinityClient.LOGIN_ENDPOINT,
+        ACInfinityClient.DEVICES_ENDPOINT,
+        ACInfinityClient.HISTORY_ENDPOINT,
+        ACInfinityClient.MODE_SETTINGS_ENDPOINT,
+        ACInfinityClient.ADD_DEV_MODE_ENDPOINT,
+        ACInfinityClient.MODE_AND_SETTING_ENDPOINT,
+    ):
+        assert endpoint.startswith("http://")
+
+
 @pytest.fixture
 def authed_client():
     c = ACInfinityClient("test@example.com", "password123")
@@ -179,6 +198,87 @@ def test_parse_history_record_port_names(client):
     assert result["ports"][1]["name"] == "Exhaust Fan"
 
 
+@pytest.mark.parametrize("bad_record", [
+    # P3-F011 (Cycle 1): TypeError path — portSpead is a string
+    {"createTime": 1714000000, "portSpead": "not-an-int", "portStatus": 0, "devPortCount": 2},
+    # P2-C2-F007: ValueError path — createTime is non-numeric string
+    {"createTime": "not-a-number", "temperature": 0, "fTemperature": 0,
+     "humidity": 0, "vpdNums": 0, "portSpead": 0, "portStatus": 0, "devPortCount": 1},
+])
+def test_parse_history_record_raises_typed_error_on_malformed_input(client, bad_record):
+    """Upstream structural errors → ACInfinityAPIError (P3-F011, P2-C2-F007)."""
+    with pytest.raises(ACInfinityAPIError, match="malformed history record"):
+        client.parse_history_record(bad_record)
+
+
+@pytest.mark.parametrize("bad_device", [
+    # P3-F011 (Cycle 1): TypeError path — temperature is a string
+    {"devCode": "C58ZA", "devName": "Test", "deviceInfo": {
+        "temperature": "not-an-int", "ports": [],
+    }},
+    # P2-C2-F007: AttributeError path — deviceInfo is not a dict
+    {"devCode": "C58ZA", "devName": "Test", "deviceInfo": "not-a-dict"},
+    # P2-C2-F007: AttributeError path — sensors is a string (not iterable of dicts)
+    {"devCode": "C58ZA", "devName": "Test", "deviceInfo": {
+        "temperature": 2300, "ports": [], "sensors": "garbage",
+    }},
+])
+def test_parse_device_data_raises_typed_error_on_malformed_input(client, bad_device):
+    """Upstream structural errors in device dict → ACInfinityAPIError (P3-F011, P2-C2-F007)."""
+    with pytest.raises(ACInfinityAPIError, match="malformed device data"):
+        client.parse_device_data(bad_device)
+
+
+def test_parse_history_record_automation_flag_does_not_force_on(client):
+    """Quirk 6: portStatus is automation-triggered, NOT on/off (P1-F008).
+
+    Speed nibble alone must determine `on`. Previously, a port with portStatus
+    bit set but nibble=0 was reported as on=True, overstating activity. The
+    automation flag is now exposed as a separate `automation_triggered` field.
+    """
+    record = {
+        "createTime": 1714000000,
+        "temperature": 0,
+        "fTemperature": 0,
+        "humidity": 0,
+        "vpdNums": 0,
+        "portSpead": 0,           # all ports idle
+        "portStatus": 0b00000001, # automation armed on port 1, idle on others
+        "devPortCount": 2,
+    }
+    result = client.parse_history_record(record)
+    assert result["ports"][0]["on"] is False
+    assert result["ports"][0]["automation_triggered"] is True
+    assert result["ports"][1]["on"] is False
+    assert result["ports"][1]["automation_triggered"] is False
+
+
+@pytest.mark.parametrize("missing_devPortCount", [
+    {},          # field absent entirely
+    {"devPortCount": None},  # field present but null — Quirk 5 documents this
+])
+def test_parse_history_record_devPortCount_null_falls_back_to_8(client, missing_devPortCount):
+    """docs/API.md Quirk 5: devPortCount is often null in history records; fall back to 8.
+
+    A regression to record.get("devPortCount", 8) (which returns None for an
+    explicit-null field rather than the default) would cause range(None) to
+    raise TypeError. P2-F004.
+    """
+    record = {
+        "createTime": 1714000000,
+        "temperature": 0,
+        "fTemperature": 0,
+        "humidity": 0,
+        "vpdNums": 0,
+        "portSpead": 0,
+        "portStatus": 0,
+        **missing_devPortCount,
+    }
+    result = client.parse_history_record(record)
+    assert len(result["ports"]) == 8
+    assert [p["port"] for p in result["ports"]] == list(range(1, 9))
+
+
 # ============ rate limit ============
 
 def test_rate_limit_field_exists(client):
@@ -190,28 +290,97 @@ def test_enforce_write_rate_limit_is_callable(client):
     assert callable(client._enforce_write_rate_limit)
 
 
-def test_enforce_write_rate_limit_sleeps_when_elapsed_less_than_1_5s(client):
-    """Two back-to-back calls must enforce >=1.5s between them."""
-    import time
+def test_enforce_write_rate_limit_sleeps_when_elapsed_less_than_1_5s(client, monkeypatch):
+    """Mock the clock so the gate's sleep duration is asserted without waiting real time.
+
+    Real-clock tests added ~1.5s per case and risked CI flake on loaded runners.
+    By patching time.monotonic and time.sleep in the client module, we assert the
+    behavioural contract (sleep when elapsed < 1.5s) without burning wall-clock (P2-F012).
+    """
+    fake_now = [100.0]
+    sleep_calls: list[float] = []
+
+    def fake_monotonic() -> float:
+        return fake_now[0]
+
+    def fake_sleep(duration: float) -> None:
+        sleep_calls.append(duration)
+        fake_now[0] += duration
+
+    monkeypatch.setattr("ac_infinity_mcp.client.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("ac_infinity_mcp.client.time.sleep", fake_sleep)
+
+    # First call from cold — no sleep
     client._last_write_time = 0.0
-    client._enforce_write_rate_limit()  # primes _last_write_time
-    t0 = time.monotonic()
-    client._enforce_write_rate_limit()  # must sleep ~1.5s
-    elapsed = time.monotonic() - t0
-    assert elapsed >= 1.4  # allow small scheduling tolerance
+    client._enforce_write_rate_limit()
+    assert sleep_calls == []  # nothing slept on the first call
+
+    # Second call only 0.4s after the first — must sleep the remaining 1.1s
+    fake_now[0] += 0.4
+    client._enforce_write_rate_limit()
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] == pytest.approx(1.1, abs=0.01)
+
+    # Third call 2s after the second — already past the rate-limit window
+    fake_now[0] += 2.0
+    client._enforce_write_rate_limit()
+    assert len(sleep_calls) == 1  # no additional sleep
 
 
-def test_enforce_write_rate_limit_lock_serializes_concurrent_writes(client):
-    """Concurrent rate-limit calls must serialize via the lock."""
+def test_mark_write_completed_anchors_next_gap_from_post_return(client, monkeypatch):
+    """_last_write_time is reset after the POST returns so the next gap is measured
+    from completion, not start (P1-F015).
+    """
+    fake_now = [100.0]
+
+    def fake_monotonic() -> float:
+        return fake_now[0]
+
+    monkeypatch.setattr("ac_infinity_mcp.client.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("ac_infinity_mcp.client.time.sleep", lambda _: None)
+
+    client._last_write_time = 0.0
+    client._enforce_write_rate_limit()
+    start_ts = client._last_write_time
+
+    # Simulate a 500ms POST
+    fake_now[0] += 0.5
+    client._mark_write_completed()
+    completion_ts = client._last_write_time
+
+    assert completion_ts == start_ts + 0.5
+    assert completion_ts == fake_now[0]
+
+
+def test_enforce_write_rate_limit_lock_serializes_concurrent_writes(client, monkeypatch):
+    """Concurrent rate-limit calls must serialize via the lock.
+
+    Uses a fake clock so the test does not burn ~3s of real wall-clock waiting
+    for the rate-limit gate. The serialization assertion comes from the lock
+    forcing sequential entry, not from real-clock observations (P2-F012).
+    """
     import threading
-    import time
 
-    client._last_write_time = time.monotonic() - 10.0  # cold start
-    timestamps: list[float] = []
+    fake_now = [100.0]
+    monotonic_lock = threading.Lock()
+
+    def fake_monotonic() -> float:
+        with monotonic_lock:
+            return fake_now[0]
+
+    def fake_sleep(duration: float) -> None:
+        with monotonic_lock:
+            fake_now[0] += duration
+
+    monkeypatch.setattr("ac_infinity_mcp.client.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("ac_infinity_mcp.client.time.sleep", fake_sleep)
+
+    client._last_write_time = fake_now[0] - 10.0  # cold start
+    entry_times: list[float] = []
 
     def call_and_record() -> None:
         client._enforce_write_rate_limit()
-        timestamps.append(time.monotonic())
+        entry_times.append(client._last_write_time)
 
     threads = [threading.Thread(target=call_and_record) for _ in range(3)]
     for t in threads:
@@ -219,10 +388,11 @@ def test_enforce_write_rate_limit_lock_serializes_concurrent_writes(client):
     for t in threads:
         t.join()
 
-    timestamps.sort()
-    # First call passes immediately; subsequent calls must be >=1.5s apart
-    for i in range(1, len(timestamps)):
-        assert timestamps[i] - timestamps[i - 1] >= 1.4
+    entry_times.sort()
+    # Each call updates _last_write_time after enforcing the gate, so successive
+    # entries must be at least 1.5s apart in simulated time.
+    for i in range(1, len(entry_times)):
+        assert entry_times[i] - entry_times[i - 1] >= 1.5
 
 
 # ============ authenticate ============
@@ -237,14 +407,24 @@ def test_authenticate_success(client):
 
 @responses_lib.activate
 def test_authenticate_wrong_credentials(client):
+    """Real API returns code=400 (not 401) for bad credentials — see docs/API.md.
+
+    AUTH_FAILURE fixture mirrors that shape exactly so any future branch on
+    code==400 has accurate test data (P2-F008).
+    """
     responses_lib.add(responses_lib.POST, LOGIN_URL, json=AUTH_FAILURE, status=200)
     result = client.authenticate()
     assert result is False
     assert client.token is None
+    # Pin the fixture's documented shape so a regression to a thin mock fails.
+    assert AUTH_FAILURE["code"] == 400
+    assert "wrong" in AUTH_FAILURE["msg"].lower()
 
 
 @responses_lib.activate
-def test_authenticate_connection_error(client):
+def test_authenticate_connection_error(client, monkeypatch):
+    """Persistent ConnectionError returns False only after tenacity exhausts retries."""
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)  # no real backoff
     responses_lib.add(
         responses_lib.POST,
         LOGIN_URL,
@@ -252,10 +432,14 @@ def test_authenticate_connection_error(client):
     )
     result = client.authenticate()
     assert result is False
+    # tenacity retries 3 times — proves the wrapper is in place (P1-F005)
+    assert len(responses_lib.calls) == 3
 
 
 @responses_lib.activate
-def test_authenticate_timeout(client):
+def test_authenticate_timeout(client, monkeypatch):
+    """Persistent Timeout returns False after retry exhaustion."""
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
     responses_lib.add(
         responses_lib.POST,
         LOGIN_URL,
@@ -263,6 +447,26 @@ def test_authenticate_timeout(client):
     )
     result = client.authenticate()
     assert result is False
+    assert len(responses_lib.calls) == 3
+
+
+@responses_lib.activate
+def test_authenticate_recovers_from_transient_connection_error(client, monkeypatch):
+    """Transient ConnectionError is retried; eventual success returns True (P1-F005)."""
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        body=requests.exceptions.ConnectionError("transient"),
+    )
+    responses_lib.add(
+        responses_lib.POST, LOGIN_URL,
+        body=requests.exceptions.ConnectionError("transient"),
+    )
+    responses_lib.add(responses_lib.POST, LOGIN_URL, json=AUTH_SUCCESS, status=200)
+    result = client.authenticate()
+    assert result is True
+    assert client.token == "tok_test_abc123"
+    assert len(responses_lib.calls) == 3
 
 
 @responses_lib.activate
@@ -432,8 +636,15 @@ def test_call_with_token_refresh_serializes_concurrent_401s(authed_client):
             threads = [threading.Thread(target=call) for _ in range(n_threads)]
             for t in threads:
                 t.start()
+            # Bound the join — a deadlock-introducing regression in the auth_lock
+                # path could hang the whole CI run otherwise. Real wall-clock here
+            # is ~50ms; 10s gives generous slack on a loaded shared runner (P2-F013).
             for t in threads:
-                t.join()
+                t.join(timeout=10.0)
+                assert not t.is_alive(), (
+                    "Token-refresh thread did not complete within 10s — possible "
+                    "deadlock in _call_with_token_refresh"
+                )
 
     assert errors == []
     assert len(results) == n_threads
@@ -582,6 +793,23 @@ def test_get_historical_data_single_page(authed_client):
     )
     assert result is not None
     assert len(result) == 10
+
+
+@responses_lib.activate
+def test_get_historical_data_always_sends_pageNum_1(authed_client):
+    """docs/API.md Quirk 3: pageNum is server-ignored; the client always sends 1.
+
+    No prior test inspected the request body to confirm this — a regression
+    to pageNum=2 would have failed in subtle ways at runtime but passed CI.
+    P2-F005.
+    """
+    responses_lib.add(responses_lib.POST, HISTORY_URL, json=HISTORY_PAGE_1, status=200)
+    authed_client.get_historical_data(
+        dev_id="12345", start_timestamp=1714000000, end_timestamp=1714086400,
+    )
+    body = responses_lib.calls[0].request.body
+    assert "pageNum=1" in body
+    assert "pageNum=2" not in body
 
 
 @responses_lib.activate
@@ -931,6 +1159,51 @@ def test_set_port_mode_exhausts_retries_and_raises(authed_client):
                 )
     write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
     assert len(write_calls) == 3
+
+
+@responses_lib.activate
+def test_set_port_mode_retries_on_connection_error_then_succeeds(authed_client, monkeypatch):
+    """Transient ConnectionError on write POST is retried via tenacity (P1-F004).
+
+    ConnectionError fires before the request reaches the server, so retry is
+    safe. Timeout is intentionally excluded from retry — see client decorator.
+    """
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+    # Two MODE_SETTINGS responses because the retry re-runs the full inner.
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200
+    )
+    responses_lib.add(
+        responses_lib.POST, ADD_DEV_MODE_URL,
+        body=requests.exceptions.ConnectionError("connection reset"),
+    )
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200
+    )
+    responses_lib.add(responses_lib.POST, ADD_DEV_MODE_URL, json=ADD_MODE_SUCCESS, status=200)
+    with patch.object(authed_client, "_enforce_write_rate_limit"):
+        result = authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False)
+    assert result["sent"] is True
+    write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
+    assert len(write_calls) == 2
+
+
+@responses_lib.activate
+def test_set_port_mode_does_not_retry_on_timeout(authed_client, monkeypatch):
+    """Timeout is NOT retried for writes — server may have already processed it (P1-F004)."""
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _: None)
+    responses_lib.add(
+        responses_lib.POST, MODE_SETTINGS_URL, json=MODE_SETTINGS_SUCCESS, status=200
+    )
+    responses_lib.add(
+        responses_lib.POST, ADD_DEV_MODE_URL,
+        body=requests.exceptions.Timeout("read timeout"),
+    )
+    with patch.object(authed_client, "_enforce_write_rate_limit"):
+        with pytest.raises(requests.exceptions.Timeout):
+            authed_client.set_port_mode(LEGACY_DEVICE_DATA, port=1, updates={}, dry_run=False)
+    write_calls = [c for c in responses_lib.calls if "addDevMode" in c.request.url]
+    assert len(write_calls) == 1
 
 
 @responses_lib.activate

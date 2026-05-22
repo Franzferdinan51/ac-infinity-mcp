@@ -76,6 +76,9 @@ async def test_discover_devices_empty(mock_client):
         result = await discover_devices()
     data = json.loads(result)
     assert data["devices"] == []
+    # The "No devices found" message is part of the documented contract;
+    # regression removing it would have been invisible before (P2-F024).
+    assert data["message"] == "No devices found"
 
 
 async def test_discover_devices_api_error(mock_client):
@@ -117,6 +120,300 @@ async def test_discover_devices_client_not_initialized():
         result = await discover_devices()
     data = json.loads(result)
     assert "error" in data
+
+
+# ============ appEmail PII filtering (P2-F003) ============
+#
+# docs/API.md warns that device list responses include the authenticated user's
+# email address in the appEmail field. The read tools must filter it out, and
+# logging must never emit it at any level. These tests pin both contracts.
+
+_PII_EMAIL = "leaked-pii@example.com"
+
+
+def _device_with_pii() -> dict:
+    """A legacy fixture device with appEmail populated, as the real API sends."""
+    from tests.conftest import MOCK_DEVICE_LEGACY
+    return {**MOCK_DEVICE_LEGACY, "appEmail": _PII_EMAIL}
+
+
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("discover_devices", ()),
+        ("get_device_reading", ("C58ZA",)),
+        ("get_all_device_readings", ()),
+        ("get_port_status", ("C58ZA", 1)),
+        ("get_port_settings", ("C58ZA", 1)),
+    ],
+)
+async def test_read_tools_do_not_echo_appEmail(mock_client, caplog, tool_name, args):
+    """Read tools must not include the user's appEmail in their JSON output or logs."""
+    import logging
+
+    import ac_infinity_mcp.server as server_module
+    tool = getattr(server_module, tool_name)
+    mock_client.get_devices.return_value = [_device_with_pii()]
+    mock_client.get_mode_settings.return_value = {
+        "atType": 1, "modeType": 0, "onSpead": 0, "offSpead": 0,
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="ac_infinity_mcp"):
+        with patch("ac_infinity_mcp.server.aci_client", mock_client):
+            result = await tool(*args)
+
+    assert _PII_EMAIL not in result, f"{tool_name} leaked appEmail in its response"
+    for record in caplog.records:
+        assert _PII_EMAIL not in record.getMessage(), (
+            f"{tool_name} leaked appEmail in a log record at level {record.levelname}"
+        )
+
+
+# ============ Credential-redacting log filter (P3-F006, P3-F019) ============
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("token=abc123def456", "token=<redacted>"),
+    ("appPasswordl=hunter2", "appPasswordl=<redacted>"),
+    ("appEmail=user@example.com", "appEmail=<redacted>"),
+    ("{'appPassword': 'shouldnotleak'}", "{'appPassword': '<redacted>'}"),
+    ('{"token": "abc-123_XYZ.456"}', '{"token": "<redacted>"}'),
+    ("AC_INFINITY_PASSWORD=verysecret", "AC_INFINITY_PASSWORD=<redacted>"),
+    # P1-C2-F001: userId in URL query string (HTTPError __str__ leak vector)
+    (
+        "500 Server Error for url: http://server/api?userId=SECRETTOKEN123",
+        "500 Server Error for url: http://server/api?userId=<redacted>",
+    ),
+    # P3-C2-F004: password with embedded space — value pattern stops at structural
+    # terminators (comma, newline, brace), NOT at whitespace
+    ("appPasswordl=hunter pwd2,trailing", "appPasswordl=<redacted>,trailing"),
+    # P1-C3-F002: URL query with trailing params — `&` is a terminator so the
+    # trailing params survive redaction
+    (
+        "GET http://api/v1?userId=TOK&page=1&size=20",
+        "GET http://api/v1?userId=<redacted>&page=1&size=20",
+    ),
+])
+def test_credential_redaction_redacts_known_fields(raw, expected):
+    """The redactor must scrub credential field values across multiple shapes."""
+    from ac_infinity_mcp.server import _redact_credentials
+    assert _redact_credentials(raw) == expected
+
+
+def test_credential_redaction_leaves_clean_messages_alone():
+    from ac_infinity_mcp.server import _redact_credentials
+    clean = "Fetched 3 devices for user"
+    assert _redact_credentials(clean) == clean
+
+
+def test_credential_redaction_scrubs_exception_traceback():
+    """P1-C2-F002 / P3-C2-F001: exc_info=True logs go through formatException;
+    the formatter must scrub credentials from the traceback text too."""
+    import io
+    import logging
+
+    from ac_infinity_mcp.server import _CredentialRedactingFormatter
+
+    fmt = _CredentialRedactingFormatter()
+    try:
+        raise ValueError("login failed for appPasswordl=topsecret123")
+    except ValueError:
+        import sys
+        record = logging.LogRecord(
+            name="x", level=logging.ERROR, pathname=__file__, lineno=1,
+            msg="oops: %s", args=(sys.exc_info()[1],),
+            exc_info=sys.exc_info(),
+        )
+        formatted = fmt.format(record)
+
+    assert "topsecret123" not in formatted, (
+        f"credential leaked through exc_info traceback:\n{formatted}"
+    )
+    assert "<redacted>" in formatted
+
+    # also verify the bare _redact_credentials path covers the traceback text
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(fmt)
+    handler.emit(record)
+    assert "topsecret123" not in buf.getvalue()
+
+
+@pytest.mark.parametrize("exc_class,exc_msg,tool_call", [
+    # P3-C2-F003: typed exception text constructed from upstream API msg used to
+    # land verbatim in the LLM-facing "detail" field. Detail now routes to logs.
+    (ACInfinityAPIError, "Reflected appEmail=victim@example.com from upstream", "discover_devices"),
+    (ACInfinityAuthError, "Token rejected: appPasswordl=hunter2", "discover_devices"),
+])
+async def test_typed_exception_text_does_not_leak_to_mcp_response(
+    mock_client, exc_class, exc_msg, tool_call
+):
+    """Upstream-constructed exception messages must not appear in the MCP JSON response."""
+    import ac_infinity_mcp.server as server_module
+    tool = getattr(server_module, tool_call)
+    mock_client.get_devices.side_effect = exc_class(exc_msg)
+
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await tool()
+
+    # The exception message should NOT appear in the JSON response
+    assert "victim@example.com" not in result
+    assert "hunter2" not in result
+    assert "appEmail=" not in result
+    assert "appPasswordl=" not in result
+    # And the response should route the caller to logs
+    data = json.loads(result)
+    assert data["detail"] == "see server logs"
+
+
+@pytest.mark.parametrize("tool_name,args,fail_target", [
+    ("set_port_speed", ("C58ZA", 1, 5), "set_port_mode"),
+    ("set_port_on", ("C58ZA", 1), "set_port_mode"),
+    ("set_port_off", ("C58ZA", 1), "set_port_mode"),
+    ("set_vpd_automation", ("C58ZA", 1, 1.2), "set_port_mode"),
+    ("set_temperature_automation", ("C58ZA", 1, 20.0, 28.0), "set_port_mode"),
+    ("set_humidity_automation", ("C58ZA", 1, 50.0, 70.0), "set_port_mode"),
+    ("set_port_mode", ("C58ZA", 1, "ON"), "set_port_mode"),
+])
+@pytest.mark.parametrize("exc_class,exc_msg", [
+    # P3-C3-F001: write tools used to return {"error": str(e)} for the typed
+    # exception triplet — leaking upstream API messages (which embed the
+    # uncontrolled API response `msg` field) into the LLM-facing JSON.
+    (ACInfinityAPIError, "API error 500: Reflected appEmail=leak@example.com"),
+    (ACInfinityAuthError, "Token rejected by API (code 401): appPasswordl=hunter2"),
+])
+async def test_write_tools_do_not_leak_auth_or_api_exception_text(
+    mock_client, tool_name, args, fail_target, exc_class, exc_msg,
+):
+    """Write tools must scrub ACInfinityAuthError/APIError text from the response (P3-C3-F001).
+
+    ACInfinityDeviceError is intentionally NOT in this parametrize set — its
+    messages (loadType=4/128, modeType=15) are self-constructed and actionable;
+    the LLM uses them to switch to the right tool. See test_set_port_speed_*
+    for the device-error path that pins those hints reach the LLM.
+    """
+    import ac_infinity_mcp.server as server_module
+    tool = getattr(server_module, tool_name)
+    getattr(mock_client, fail_target).side_effect = exc_class(exc_msg)
+
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await tool(*args)
+
+    assert "leak@example.com" not in result, f"{tool_name} leaked appEmail"
+    assert "hunter2" not in result, f"{tool_name} leaked password"
+    assert "appEmail=" not in result
+    assert "appPasswordl=" not in result
+    # The response must route the caller to logs for both error classes.
+    data = json.loads(result)
+    assert data.get("detail") == "see server logs"
+
+
+@pytest.mark.parametrize("raw,expected_level,expected_warn", [
+    # Valid inputs pass through with no warning
+    ("DEBUG", "DEBUG", False),
+    ("INFO", "INFO", False),
+    ("WARNING", "WARNING", False),
+    ("ERROR", "ERROR", False),
+    ("CRITICAL", "CRITICAL", False),
+    # Case-insensitivity
+    ("debug", "DEBUG", False),
+    ("Warning", "WARNING", False),
+    # Invalid → INFO with warn flag (P2-C2-F003)
+    ("BOGUS", "INFO", True),
+    # Empty / None fall back to INFO default — operator didn't try anything, no warn
+    ("", "INFO", False),
+    (None, "INFO", False),
+    ("trace", "INFO", True),
+    ("verbose", "INFO", True),
+])
+def test_resolve_log_level(raw, expected_level, expected_warn):
+    """Pin the LOG_LEVEL validation contract directly (P2-C2-F003)."""
+    from ac_infinity_mcp.server import _resolve_log_level
+    level, warn = _resolve_log_level(raw)
+    assert level == expected_level
+    assert warn == expected_warn
+
+
+def test_credential_redactor_installed_on_root_handlers():
+    """P2-C2-F006: pin that the formatter is actually attached, not just constructible."""
+    import logging
+
+    from ac_infinity_mcp.server import _CredentialRedactingFormatter
+    handlers = logging.getLogger().handlers
+    assert handlers, "root logger has no handlers — install loop never ran"
+    assert any(
+        isinstance(h.formatter, _CredentialRedactingFormatter) for h in handlers
+    ), "no root handler has the credential redactor attached"
+
+
+def test_parse_device_data_drops_appEmail():
+    """parse_device_data must not propagate appEmail to its returned dict (P2-F003)."""
+    from ac_infinity_mcp.client import ACInfinityClient
+    client = ACInfinityClient("test@example.com", "pw")
+    parsed = client.parse_device_data(_device_with_pii())
+    assert _PII_EMAIL not in json.dumps(parsed)
+    assert "appEmail" not in parsed
+
+
+@pytest.mark.parametrize("tool_name,args", [
+    # P2-C2-F005: extend PII filter coverage to the rest of the read-side tools
+    ("get_historical_readings", ("C58ZA", "2024-04-25", "2024-04-25")),
+    ("check_vpd_drift", ("C58ZA", "veg")),
+    ("get_environment_health", ("C58ZA", "veg")),
+])
+async def test_more_read_tools_do_not_echo_appEmail(mock_client, caplog, tool_name, args):
+    """Extends the appEmail filter coverage to historical/analytics tools."""
+    import logging
+
+    import ac_infinity_mcp.server as server_module
+    tool = getattr(server_module, tool_name)
+    mock_client.get_devices.return_value = [_device_with_pii()]
+    # Stub historical-data fetch so the tool runs end-to-end.
+    mock_client.get_historical_data.return_value = []
+
+    with caplog.at_level(logging.DEBUG, logger="ac_infinity_mcp"):
+        with patch("ac_infinity_mcp.server.aci_client", mock_client):
+            result = await tool(*args)
+
+    assert _PII_EMAIL not in result, f"{tool_name} leaked appEmail in its response"
+    for record in caplog.records:
+        assert _PII_EMAIL not in record.getMessage()
+
+
+# ============ Edge-input device_id and port handling (P2-F014) ============
+#
+# LLMs occasionally hallucinate inputs like "" (empty), "  " (whitespace),
+# or very long strings. Tools must return graceful structured errors rather
+# than crashing or returning success-shaped responses with empty results.
+
+@pytest.mark.parametrize("bad_device_id", ["", "   ", "X" * 1000])
+async def test_tools_handle_edge_device_ids(mock_client, bad_device_id):
+    """Empty / whitespace / oversized device_id returns a structured error."""
+    for tool_name, args in [
+        ("get_device_reading", (bad_device_id,)),
+        ("get_port_status", (bad_device_id, 1)),
+        ("get_port_settings", (bad_device_id, 1)),
+    ]:
+        import ac_infinity_mcp.server as server_module
+        tool = getattr(server_module, tool_name)
+        with patch("ac_infinity_mcp.server.aci_client", mock_client):
+            result = await tool(*args)
+        data = json.loads(result)
+        assert "error" in data, f"{tool_name}({bad_device_id!r}) should error, got {data}"
+        # Bad device_id should produce a "not found" style error, not a traceback
+        assert "Traceback" not in result
+        assert "/Users/" not in result  # no local filesystem leakage
+
+
+async def test_set_port_speed_negative_speed(mock_client):
+    """Negative speed inputs should produce a structured validation error."""
+    from ac_infinity_mcp.server import set_port_speed
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_speed("C58ZA", 1, -1)
+    data = json.loads(result)
+    assert "error" in data
+    # Should not have attempted any client call
+    mock_client.set_port_mode.assert_not_called()
 
 
 # ============ get_device_reading ============
@@ -264,6 +561,28 @@ async def test_get_historical_readings_invalid_interval(mock_client):
     assert "sample_interval" in data["error"].lower() or "2x" in data["error"]
 
 
+@pytest.mark.parametrize("bad_value", ["bad", "25:00", "12:60", "1200", "noon", ""])
+async def test_get_historical_readings_invalid_time_start(mock_client, bad_value):
+    """Invalid time_start returns structured error instead of silent empty result (P1-F006)."""
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings(
+            "C58ZA", "2024-04-25", "2024-04-25", "1h", time_start=bad_value
+        )
+    data = json.loads(result)
+    assert "error" in data
+    assert "time_start" in data["error"]
+
+
+async def test_get_historical_readings_invalid_time_end(mock_client):
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings(
+            "C58ZA", "2024-04-25", "2024-04-25", "1h", time_end="bogus"
+        )
+    data = json.loads(result)
+    assert "error" in data
+    assert "time_end" in data["error"]
+
+
 async def test_get_historical_readings_no_device(mock_client):
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await get_historical_readings("NOTEXIST", "2024-04-25", "2024-04-25")
@@ -278,6 +597,33 @@ async def test_get_historical_readings_no_records(mock_client):
     data = json.loads(result)
     assert "error" in data
     assert "No readings" in data["error"]
+
+
+async def test_get_historical_readings_surfaces_dropped_count(mock_client):
+    """P2-C2-F004: dropped_readings and drop_reason must appear in the tool response.
+
+    The helper-level drop count is tested separately; this test pins that the
+    server wiring exposes both fields in the JSON output.
+    """
+    base_ts = 1714000000
+    # parse_history_record is called once per raw record; return a mix of
+    # well-formed and bad-timestamp readings so the time filter drops two.
+    mock_client.get_historical_data.return_value = [{"createTime": base_ts}] * 3
+    mock_client.parse_history_record.side_effect = [
+        {"timestamp": "2024-04-25T10:00:00Z", "temperature_c": 24.0,
+         "temperature_f": 75.2, "humidity": 60.0, "vpd": 1.2, "ports": []},
+        {"timestamp": "NOT_VALID", "temperature_c": 25.0,
+         "temperature_f": 77.0, "humidity": 61.0, "vpd": 1.3, "ports": []},
+        {"timestamp": "", "temperature_c": 26.0,
+         "temperature_f": 78.8, "humidity": 62.0, "vpd": 1.4, "ports": []},
+    ]
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_historical_readings(
+            "C58ZA", "2024-04-25", "2024-04-25", "raw", time_start="00:00",
+        )
+    data = json.loads(result)
+    assert data["dropped_readings"] == 2
+    assert data["drop_reason"] == "malformed timestamp"
 
 
 async def test_get_historical_readings_sampling_1h(mock_client):
@@ -422,34 +768,75 @@ _READINGS = [
 
 
 def test_filter_readings_by_time_no_filter():
-    result = _filter_readings_by_time(_READINGS)
+    result, dropped = _filter_readings_by_time(_READINGS)
     assert len(result) == 4
+    assert dropped == 0
 
 
 def test_filter_readings_by_time_start_only():
-    result = _filter_readings_by_time(_READINGS, time_start="12:00")
+    result, dropped = _filter_readings_by_time(_READINGS, time_start="12:00")
     assert len(result) == 3
     assert result[0]["timestamp"] == "2024-04-25T12:00:00Z"
+    assert dropped == 0
 
 
 def test_filter_readings_by_time_end_only():
-    result = _filter_readings_by_time(_READINGS, time_end="16:00")
+    result, dropped = _filter_readings_by_time(_READINGS, time_end="16:00")
     assert len(result) == 3
     assert result[-1]["timestamp"] == "2024-04-25T16:00:00Z"
+    assert dropped == 0
 
 
 def test_filter_readings_by_time_both():
-    result = _filter_readings_by_time(_READINGS, time_start="12:00", time_end="16:00")
+    result, _ = _filter_readings_by_time(_READINGS, time_start="12:00", time_end="16:00")
     assert len(result) == 2
 
 
-def test_filter_readings_bad_timestamp_skipped():
+def test_filter_readings_bad_timestamp_drops_and_counts():
+    """Malformed timestamps are dropped and surfaced via the drop count (P3-F017).
+
+    Asserts which record survives (P2-C2-F010) — a regression that swapped the
+    include condition (keeping bad records, dropping good) would still satisfy
+    the count alone.
+    """
     readings = [
         _make_history_record("2024-04-25T12:00:00Z"),
         {"timestamp": "NOT_A_TIMESTAMP", "temperature_c": 24.0},
+        {"timestamp": "", "temperature_c": 25.0},
     ]
-    result = _filter_readings_by_time(readings, time_start="10:00")
+    result, dropped = _filter_readings_by_time(readings, time_start="10:00")
     assert len(result) == 1
+    assert dropped == 2
+    assert result[0]["timestamp"] == "2024-04-25T12:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "time_start,time_end,timestamp,should_match",
+    [
+        # Standard overnight 22:00-06:00: OR of two halves
+        ("22:00", "06:00", "2024-04-25T05:00:00Z", True),    # in lower half
+        ("22:00", "06:00", "2024-04-25T22:30:00Z", True),    # in upper half
+        ("22:00", "06:00", "2024-04-25T12:00:00Z", False),   # midday out
+        # Boundary inclusivity in overnight window
+        ("22:00", "06:00", "2024-04-25T22:00:00Z", True),    # exact start
+        ("22:00", "06:00", "2024-04-25T06:00:00Z", True),    # exact end
+        # Equal times (same-day branch): only that exact minute matches
+        ("12:00", "12:00", "2024-04-25T12:00:00Z", True),
+        ("12:00", "12:00", "2024-04-25T11:59:00Z", False),
+        ("12:00", "12:00", "2024-04-25T12:01:00Z", False),
+        # Near-full-day same-day window
+        ("00:00", "23:59", "2024-04-25T12:00:00Z", True),
+        ("00:00", "23:59", "2024-04-25T23:59:00Z", True),
+    ],
+)
+def test_filter_readings_window_boundaries(time_start, time_end, timestamp, should_match):
+    """Overnight + same-day window edge cases including equal-times (P2-C2-F008)."""
+    readings = [_make_history_record(timestamp)]
+    result, _ = _filter_readings_by_time(readings, time_start=time_start, time_end=time_end)
+    if should_match:
+        assert len(result) == 1
+    else:
+        assert len(result) == 0
 
 
 # ============ apply_sampling ============
@@ -1012,6 +1399,27 @@ async def test_set_port_off_auth_error(mock_client):
     assert "error" in data
 
 
+@pytest.mark.parametrize("tool_name,args", [
+    ("set_port_on", ("C58ZA", 1)),
+    ("set_port_off", ("C58ZA", 1)),
+])
+async def test_set_port_on_off_does_not_pass_require_variable_speed(mock_client, tool_name, args):
+    """set_port_on/off must NOT set require_variable_speed=True — that's only for set_port_speed.
+
+    If they did, the loadType guard would reject on/off devices (loadType=4 or 128)
+    and prevent the user from turning them on/off (P2-F025).
+    """
+    import ac_infinity_mcp.server as server_module
+    tool = getattr(server_module, tool_name)
+    mock_client.set_port_mode.return_value = {
+        "payload": {}, "dry_run": True, "controller_type": "legacy", "sent": False,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        await tool(*args)
+    kwargs = mock_client.set_port_mode.call_args.kwargs
+    assert kwargs.get("require_variable_speed", False) is False
+
+
 # ============ Guard rails — Phase 8 ============
 
 MOCK_AI_PLUS_UNSUPPORTED = {
@@ -1437,6 +1845,26 @@ def test_format_schedule_time_none():
     assert _format_schedule_time(None) is None
 
 
+@pytest.mark.parametrize("s", ["00:00", "06:30", "08:00", "12:00", "20:00", "23:59"])
+def test_schedule_time_roundtrip(s):
+    """_format_schedule_time and _parse_schedule_time must be inverses (P2-F017).
+
+    Independent tests for each direction don't catch a regression that makes
+    one rounder or stricter than the other. Roundtrip pins them together.
+    """
+    assert _format_schedule_time(_parse_schedule_time(s)) == s
+
+
+@pytest.mark.parametrize("invalid_minutes", [1440, 1500, 65534, -1, -100])
+def test_format_schedule_time_out_of_range_returns_none(invalid_minutes):
+    """Out-of-range minutes (>= 1440 except sentinel 65535, or negative) → None (P2-F018).
+
+    A corrupt or unset field is indistinguishable from disabled — surfacing
+    None is safer than synthesizing nonsense like "25:00".
+    """
+    assert _format_schedule_time(invalid_minutes) is None
+
+
 # ============ get_port_status ============
 
 async def test_get_port_status_success(mock_client):
@@ -1600,6 +2028,17 @@ async def test_get_port_settings_vpd_target_active(mock_client):
     assert data["vpd_target_kpa"] == 1.4
 
 
+@pytest.mark.parametrize("raw_target_vpd", [-1, -1_000_000, 1000, 99999, "garbage", None])
+async def test_get_port_settings_vpd_target_out_of_range_is_none(mock_client, raw_target_vpd):
+    """Corrupted/out-of-range targetVpd from upstream parses to null, not nonsense (P3-F020)."""
+    settings = {**MOCK_MODE_SETTINGS_BASIC, "targetVpdSwitch": 1, "targetVpd": raw_target_vpd}
+    mock_client.get_mode_settings.return_value = settings
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["vpd_target_kpa"] is None
+
+
 async def test_get_port_settings_temp_range_active(mock_client):
     """activeLt=1 and activeHt=1 → temp_range_c populated (raw Celsius, no scaling)."""
     settings = {**MOCK_MODE_SETTINGS_BASIC, "activeLt": 1, "activeHt": 1,
@@ -1629,6 +2068,21 @@ async def test_get_port_settings_schedule_window_active(mock_client):
         result = await get_port_settings("C58ZA", 1)
     data = json.loads(result)
     assert data["schedule_window"] == {"start": "08:00", "end": "20:00"}
+
+
+@pytest.mark.parametrize("start,end", [
+    (480, 65535),    # start set, end disabled — partial = no window
+    (65535, 1200),   # start disabled, end set — partial = no window
+    (65535, 65535),  # both disabled — no window
+])
+async def test_get_port_settings_schedule_window_partial_is_none(mock_client, start, end):
+    """Half-configured schedule must return schedule_window=None, not a partial dict (P2-F015)."""
+    settings = {**MOCK_MODE_SETTINGS_BASIC, "schedStartTime": start, "schedEndtTime": end}
+    mock_client.get_mode_settings.return_value = settings
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_settings("C58ZA", 1)
+    data = json.loads(result)
+    assert data["schedule_window"] is None
 
 
 async def test_get_port_settings_mode_auto(mock_client):
@@ -1784,6 +2238,8 @@ async def test_set_vpd_automation_target_too_high(mock_client):
         result = await set_vpd_automation("C58ZA", 1, 3.1)
     data = json.loads(result)
     assert "error" in data
+    # P2-C2-F009: pin that the bounds-check fired, not some downstream error
+    assert "3.0" in data["error"] or "3.1" in data["error"]
 
 
 async def test_set_vpd_automation_boundary_min_valid(mock_client):
@@ -1910,6 +2366,7 @@ async def test_set_temperature_automation_out_of_range(mock_client):
         result = await set_temperature_automation("C58ZA", 1, -1.0, 30.0)
     data = json.loads(result)
     assert "error" in data
+    assert "between 0 and 50" in data["error"]  # P2-C2-F009
 
 
 async def test_set_temperature_automation_max_out_of_range(mock_client):
@@ -1917,6 +2374,7 @@ async def test_set_temperature_automation_max_out_of_range(mock_client):
         result = await set_temperature_automation("C58ZA", 1, 20.0, 51.0)
     data = json.loads(result)
     assert "error" in data
+    assert "between 0 and 50" in data["error"]  # P2-C2-F009
 
 
 async def test_set_temperature_automation_device_not_found(mock_client):
@@ -1959,6 +2417,33 @@ async def test_set_temperature_automation_generic_exception(mock_client):
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await set_temperature_automation("C58ZA", 1, 20.0, 28.0)
     assert "error" in json.loads(result)
+
+
+@pytest.mark.parametrize(
+    "min_c,max_c,expected_devLt,expected_devHt",
+    [
+        # Half-integer boundaries — banker's rounding (round()) would silently
+        # disagree with the docstring's documented round-half-up at every .5
+        # input. int(x + 0.5) is round-half-up.
+        (0.5, 1.5, 1, 2),
+        (1.5, 2.5, 2, 3),
+        (20.5, 24.5, 21, 25),
+        (49.5, 50.0, 50, 50),
+        # Non-half fractions should still round in the conventional direction
+        (20.4, 24.6, 20, 25),
+        (20.6, 24.4, 21, 24),
+    ],
+)
+async def test_set_temperature_automation_no_bankers_rounding(
+    mock_client, min_c, max_c, expected_devLt, expected_devHt,
+):
+    """Half-integer inputs round half-up, matching the docstring contract (P1-F002)."""
+    mock_client.set_port_mode.return_value = MOCK_TEMP_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        await set_temperature_automation("C58ZA", 1, min_c, max_c)
+    updates = mock_client.set_port_mode.call_args[0][2]
+    assert updates["devLt"] == expected_devLt
+    assert updates["devHt"] == expected_devHt
 
 
 # ============ set_humidity_automation ============
@@ -2008,6 +2493,7 @@ async def test_set_humidity_automation_out_of_range(mock_client):
         result = await set_humidity_automation("C58ZA", 1, -1.0, 70.0)
     data = json.loads(result)
     assert "error" in data
+    assert "between 0 and 100" in data["error"]  # P2-C2-F009
 
 
 async def test_set_humidity_automation_max_out_of_range(mock_client):
@@ -2015,6 +2501,7 @@ async def test_set_humidity_automation_max_out_of_range(mock_client):
         result = await set_humidity_automation("C58ZA", 1, 50.0, 101.0)
     data = json.loads(result)
     assert "error" in data
+    assert "between 0 and 100" in data["error"]  # P2-C2-F009
 
 
 async def test_set_humidity_automation_device_not_found(mock_client):
@@ -2059,6 +2546,32 @@ async def test_set_humidity_automation_generic_exception(mock_client):
     assert "error" in json.loads(result)
 
 
+@pytest.mark.parametrize(
+    "min_rh,max_rh,expected_devLh,expected_devHh",
+    [
+        # Half-percent boundaries — banker's rounding (round()) would silently
+        # disagree with the docstring's documented round-half-up at every .5
+        # input. int(x + 0.5) is round-half-up.
+        (0.5, 1.5, 1, 2),
+        (50.5, 70.5, 51, 71),
+        (99.5, 100.0, 100, 100),
+        # Non-half fractions still round in the conventional direction
+        (50.4, 70.6, 50, 71),
+        (50.6, 70.4, 51, 70),
+    ],
+)
+async def test_set_humidity_automation_no_bankers_rounding(
+    mock_client, min_rh, max_rh, expected_devLh, expected_devHh,
+):
+    """Half-percent inputs round half-up, matching the docstring contract (P1-F002)."""
+    mock_client.set_port_mode.return_value = MOCK_HUMI_DRY
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        await set_humidity_automation("C58ZA", 1, min_rh, max_rh)
+    updates = mock_client.set_port_mode.call_args[0][2]
+    assert updates["devLh"] == expected_devLh
+    assert updates["devHh"] == expected_devHh
+
+
 # ============ set_port_mode ============
 
 MOCK_MODE_DRY = {
@@ -2093,6 +2606,9 @@ async def test_set_port_mode_on(mock_client):
     assert data["mode"] == "ON"
     call_updates = mock_client.set_port_mode.call_args[0][2]
     assert call_updates["atType"] == 2
+    # ON must set a default nonzero speed so the port actually runs (P1-F003).
+    # Without onSpead, a port whose prior onSpead was 0 would stay at speed 0.
+    assert call_updates["onSpead"] == 10
 
 
 async def test_set_port_mode_auto(mock_client):
@@ -2300,73 +2816,83 @@ async def test_set_port_mode_generic_exception(mock_client):
 
 # ============ apply_grow_stage_template ============
 
-_STAGE_DRY = {"payload": {}, "dry_run": True, "controller_type": "legacy", "sent": False}
+
+def _stage_dry_response(payload: dict | None = None) -> dict:
+    """Return a fake set_port_mode dry-run result with the given payload."""
+    return {
+        "payload": payload or {},
+        "dry_run": True,
+        "controller_type": "legacy",
+        "sent": False,
+    }
+
+
 _STAGE_LIVE = {"payload": {}, "dry_run": False, "controller_type": "legacy", "sent": True}
 
 
 async def test_apply_grow_stage_template_dry_run(mock_client):
-    mock_client.set_port_mode.side_effect = [
-        {
-            "payload": {"atType": 8, "targetVpd": 13, "vpdSettingMode": 1, "targetVpdSwitch": 1},
-            "dry_run": True, "controller_type": "legacy", "sent": False,
-        },
-        {
-            "payload": {"atType": 3, "devLt": 20, "devHt": 28, "activeLt": 1, "activeHt": 1},
-            "dry_run": True, "controller_type": "legacy", "sent": False,
-        },
-        {
-            "payload": {"atType": 3, "devLh": 50, "devHh": 70, "activeLh": 1, "activeHh": 1},
-            "dry_run": True, "controller_type": "legacy", "sent": False,
-        },
-    ]
+    mock_client.set_port_mode.return_value = _stage_dry_response()
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=True)
     data = json.loads(result)
     assert "error" not in data
     assert data["stage"] == "veg"
     assert data["dry_run"] is True
+    assert data["sent"] is False
+    assert data["controller_type"] == "legacy"
     assert data["vpd"]["target_kpa"] == 1.25
-    assert data["vpd"]["sent"] is False
-    assert "payload" in data["vpd"]
     assert data["temperature"]["min_c"] == 20.0
     assert data["temperature"]["max_c"] == 28.0
-    assert data["temperature"]["sent"] is False
-    assert "payload" in data["temperature"]
     assert data["humidity"]["min_rh"] == 50.0
     assert data["humidity"]["max_rh"] == 70.0
-    assert data["humidity"]["sent"] is False
-    assert "payload" in data["humidity"]
-    assert "partial_write" not in data
+    assert "payload" in data
+    # Single atomic write with atType=8 (VPD mode active)
+    assert mock_client.set_port_mode.call_count == 1
+    updates = mock_client.set_port_mode.call_args.args[2]
+    assert updates["atType"] == 8
+    assert updates["vpdSettingMode"] == 1
+    assert updates["targetVpd"] == 13  # veg midpoint 1.25 kPa × 10, round-half-up
+    assert updates["targetVpdSwitch"] == 1
+    # Thresholds stored on the controller (inactive in VPD mode; available on switch to AUTO)
+    assert updates["devLt"] == 20
+    assert updates["devHt"] == 28
+    assert updates["devLh"] == 50
+    assert updates["devHh"] == 70
+    assert updates["activeLt"] == 1
+    assert updates["activeHt"] == 1
+    assert updates["activeLh"] == 1
+    assert updates["activeHh"] == 1
 
 
 async def test_apply_grow_stage_template_live(mock_client):
-    mock_client.set_port_mode.side_effect = [_STAGE_LIVE, _STAGE_LIVE, _STAGE_LIVE]
+    mock_client.set_port_mode.return_value = _STAGE_LIVE
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=False)
     data = json.loads(result)
     assert "error" not in data
     assert data["dry_run"] is False
-    assert data["vpd"]["sent"] is True
-    assert data["temperature"]["sent"] is True
-    assert data["humidity"]["sent"] is True
-    assert "payload" not in data["vpd"]
-    assert "payload" not in data["temperature"]
-    assert "payload" not in data["humidity"]
-    assert "partial_write" not in data
+    assert data["sent"] is True
+    assert "payload" not in data
+    assert mock_client.set_port_mode.call_count == 1
 
 
-@pytest.mark.parametrize("stage,expected_vpd,temp_min,temp_max,humi_min,humi_max", [
-    ("clones",       1.00, 22.0, 26.0, 70.0, 80.0),
-    ("seedling",     1.00, 22.0, 26.0, 65.0, 75.0),
-    ("veg",          1.25, 20.0, 28.0, 50.0, 70.0),
-    ("early_flower", 1.40, 20.0, 26.0, 40.0, 60.0),
-    ("mid_flower",   1.60, 18.0, 25.0, 35.0, 55.0),
-    ("late_flower",  1.50, 18.0, 24.0, 30.0, 50.0),
-])
+@pytest.mark.parametrize(
+    "stage,expected_vpd,expected_target_x10,temp_min,temp_max,humi_min,humi_max",
+    [
+        ("clones",       1.00, 10, 22.0, 26.0, 70.0, 80.0),
+        ("seedling",     1.00, 10, 22.0, 26.0, 65.0, 75.0),
+        ("veg",          1.25, 13, 20.0, 28.0, 50.0, 70.0),
+        ("early_flower", 1.40, 14, 20.0, 26.0, 40.0, 60.0),
+        ("mid_flower",   1.60, 16, 18.0, 25.0, 35.0, 55.0),
+        ("late_flower",  1.50, 15, 18.0, 24.0, 30.0, 50.0),
+    ],
+)
 async def test_apply_grow_stage_template_all_stages(
-    mock_client, stage, expected_vpd, temp_min, temp_max, humi_min, humi_max
+    mock_client, stage, expected_vpd, expected_target_x10,
+    temp_min, temp_max, humi_min, humi_max,
 ):
-    mock_client.set_port_mode.side_effect = [_STAGE_DRY, _STAGE_DRY, _STAGE_DRY]
+    """Each stage produces a single write with the correct encoded targetVpd (P2-F001)."""
+    mock_client.set_port_mode.return_value = _stage_dry_response()
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await apply_grow_stage_template("C58ZA", 1, stage, dry_run=True)
     data = json.loads(result)
@@ -2377,6 +2903,13 @@ async def test_apply_grow_stage_template_all_stages(
     assert data["temperature"]["max_c"] == temp_max
     assert data["humidity"]["min_rh"] == humi_min
     assert data["humidity"]["max_rh"] == humi_max
+    updates = mock_client.set_port_mode.call_args.args[2]
+    assert updates["atType"] == 8
+    assert updates["targetVpd"] == expected_target_x10
+    assert updates["devLt"] == int(temp_min + 0.5)
+    assert updates["devHt"] == int(temp_max + 0.5)
+    assert updates["devLh"] == int(humi_min + 0.5)
+    assert updates["devHh"] == int(humi_max + 0.5)
 
 
 async def test_apply_grow_stage_template_invalid_stage(mock_client):
@@ -2386,6 +2919,20 @@ async def test_apply_grow_stage_template_invalid_stage(mock_client):
     assert "error" in data
     assert "bloom" in data["error"]
     assert "veg" in data["error"]
+    mock_client.set_port_mode.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["VEG", "Veg", "VEG ", "vEg"])
+async def test_apply_grow_stage_template_stage_is_case_sensitive(mock_client, stage):
+    """Stage names are case-sensitive — "VEG" returns an error, not VEG defaults.
+
+    Documenting and pinning this contract (P2-F019). If we ever decide to
+    normalize input, this test changes intent and the contract is explicit.
+    """
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await apply_grow_stage_template("C58ZA", 1, stage)
+    data = json.loads(result)
+    assert "error" in data
     mock_client.set_port_mode.assert_not_called()
 
 
@@ -2416,85 +2963,78 @@ async def test_apply_grow_stage_template_ai_plus_live(mock_client):
     data = json.loads(result)
     assert "error" in data
     assert "AI+" in data["error"]
-    assert mock_client.set_port_mode.call_count == 1  # bails after first unsupported response
+    assert mock_client.set_port_mode.call_count == 1
 
 
 async def test_apply_grow_stage_template_ai_plus_dry_run(mock_client):
-    mock_client.set_port_mode.side_effect = [_STAGE_DRY, _STAGE_DRY, _STAGE_DRY]
+    mock_client.set_port_mode.return_value = _stage_dry_response()
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=True)
     data = json.loads(result)
     assert "error" not in data
-    assert data["vpd"]["sent"] is False
-    assert data["temperature"]["sent"] is False
-    assert data["humidity"]["sent"] is False
+    assert data["sent"] is False
 
 
-async def test_apply_grow_stage_template_partial_failure_vpd_ok_temp_fails(mock_client):
-    mock_client.set_port_mode.side_effect = [
-        {"payload": {}, "dry_run": False, "controller_type": "legacy", "sent": True},
-        ACInfinityAPIError("Data saving failed"),
-    ]
+async def test_apply_grow_stage_template_api_error_on_write(mock_client):
+    """API errors during write return a generic message (P3-C2-F003)."""
+    mock_client.set_port_mode.side_effect = ACInfinityAPIError("Data saving failed")
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=False)
     data = json.loads(result)
-    assert data["vpd"]["sent"] is True
-    assert data["temperature"]["sent"] is False
-    assert "error" in data["temperature"]
-    assert "not attempted" in data["humidity"]["error"]
-    assert "temperature" in data["humidity"]["error"]
-    assert data.get("partial_write") is True
-    assert "recovery_note" in data
-    assert "vpd" in data["recovery_note"].lower()
-
-
-async def test_apply_grow_stage_template_api_error_first_write(mock_client):
-    mock_client.set_port_mode.side_effect = ACInfinityAPIError("fail")
-    with patch("ac_infinity_mcp.server.aci_client", mock_client):
-        result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=False)
-    data = json.loads(result)
-    assert data["vpd"]["sent"] is False
-    assert "error" in data["vpd"]
-    assert "not attempted" in data["temperature"]["error"]
-    assert "not attempted" in data["humidity"]["error"]
-    assert "partial_write" not in data
+    assert data["error"] == "AC Infinity API error"
+    assert data["detail"] == "see server logs"
+    # Raw upstream text must not leak
+    assert "Data saving failed" not in result
 
 
 async def test_apply_grow_stage_template_auth_error(mock_client):
-    mock_client.set_port_mode.side_effect = ACInfinityAuthError("expired")
+    """Auth errors from the write call return a friendly auth-error message."""
+    mock_client.set_port_mode.side_effect = ACInfinityAuthError("token expired")
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=False)
     data = json.loads(result)
-    assert data["vpd"]["sent"] is False
-    assert "error" in data["vpd"]
+    assert "Authentication failed" in data["error"]
+    # Raw exception text must not leak (P1-C2-F003)
+    assert "token expired" not in result
+    assert data["detail"] == "see server logs"
 
 
 async def test_apply_grow_stage_template_get_devices_exception(mock_client):
-    mock_client.get_devices.side_effect = ACInfinityAPIError("network error")
+    """API errors during get_devices return a generic error, not str(e) (P1-C2-F003)."""
+    mock_client.get_devices.side_effect = ACInfinityAPIError("upstream said: foo bar")
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=True)
     data = json.loads(result)
-    assert "error" in data
+    assert data["error"] == "AC Infinity API error"
+    assert data["detail"] == "see server logs"
+    # Raw upstream text must not leak
+    assert "upstream said: foo bar" not in result
     assert mock_client.set_port_mode.call_count == 0
 
 
-async def test_apply_grow_stage_template_partial_failure_vpd_temp_ok_humi_fails(mock_client):
-    mock_client.set_port_mode.side_effect = [
-        {"payload": {}, "dry_run": False, "controller_type": "legacy", "sent": True},
-        {"payload": {}, "dry_run": False, "controller_type": "legacy", "sent": True},
-        ACInfinityAPIError("humidity write failed"),
-    ]
+async def test_apply_grow_stage_template_get_devices_auth_error(mock_client):
+    """Auth error during get_devices returns the auth-failure path (not generic)."""
+    mock_client.get_devices.side_effect = ACInfinityAuthError("login rejected")
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
-        result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=False)
+        result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=True)
     data = json.loads(result)
-    assert data["vpd"]["sent"] is True
-    assert data["temperature"]["sent"] is True
-    assert data["humidity"]["sent"] is False
-    assert "error" in data["humidity"]
-    assert data.get("partial_write") is True
-    assert "recovery_note" in data
-    assert "vpd" in data["recovery_note"].lower()
-    assert "temperature" in data["recovery_note"].lower()
+    assert "Authentication failed" in data["error"]
+    assert "login rejected" not in result
+    assert mock_client.set_port_mode.call_count == 0
+
+
+async def test_apply_grow_stage_template_get_devices_unexpected(mock_client):
+    """Unexpected RuntimeError during get_devices returns generic message (not str(e))."""
+    mock_client.get_devices.side_effect = RuntimeError(
+        "trace contains appPasswordl=should-not-leak"
+    )
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await apply_grow_stage_template("C58ZA", 1, "veg", dry_run=True)
+    data = json.loads(result)
+    assert data["error"] == "Unexpected error"
+    assert data["detail"] == "see server logs"
+    assert "should-not-leak" not in result
+    assert "appPasswordl=" not in result
 
 
 # ============ MCP Prompts ============

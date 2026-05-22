@@ -64,45 +64,80 @@ class ACInfinityClient:
 
         Held under a lock so concurrent writers serialize correctly — without it,
         parallel tool calls can pass the elapsed-time check simultaneously and
-        slam the API back-to-back.
+        slam the API back-to-back. _last_write_time is updated under the same
+        lock so concurrent waiters see the latest completion timestamp as soon
+        as the prior write returns.
         """
         with self._write_lock:
             elapsed = time.monotonic() - self._last_write_time
             if elapsed < 1.5:
                 time.sleep(1.5 - elapsed)
+            # Provisionally mark the start time so concurrent waiters in this
+            # method also serialize; the precise completion time is rewritten
+            # by _mark_write_completed() once the POST returns.
             self._last_write_time = time.monotonic()
 
+    def _mark_write_completed(self) -> None:
+        """Update _last_write_time to reflect the actual write completion.
+
+        Called immediately after the upstream POST returns (success or HTTP
+        error). The pre-POST update inside _enforce_write_rate_limit() set
+        the timestamp at the *start* of the call; rewriting it here ensures
+        the next write's 1.5s gap is measured from the prior call's
+        completion, not its start. Without this, an in-flight 500ms POST
+        would leave only ~1.0s of gap before the next caller proceeded,
+        risking a 403 rate-limit response from the upstream.
+        """
+        with self._write_lock:
+            self._last_write_time = time.monotonic()
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+        ),
+        reraise=True,
+    )
+    def _authenticate_inner(self) -> None:
+        """Single login attempt; retried by tenacity on transient network errors."""
+        # NOTE: API parameter name has intentional typo — 'appPasswordl' with 'l' at end
+        data = {
+            "appEmail": self.email,
+            "appPasswordl": self.password,
+        }
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "User-Agent": "ACController/1.8.2 (com.acinfinity.humiture; build:489; iOS 16.5.1)",
+        }
+
+        resp = self.session.post(self.LOGIN_ENDPOINT, data=data, headers=headers, timeout=10)
+        resp.raise_for_status()
+
+        result = resp.json()
+        if result.get("code") != 200:
+            error_msg = result.get("msg", "Unknown error")
+            logger.error("AC Infinity login failed: %s", error_msg)
+            raise ACInfinityAuthError(f"Authentication failed: {error_msg}")
+
+        self.token = result["data"]["appId"]
+        logger.info("AC Infinity authentication successful")
+
     def authenticate(self) -> bool:
-        """Login and get API token"""
+        """Login and get API token.
+
+        Transient network errors (Timeout, ConnectionError) trigger a tenacity
+        retry inside _authenticate_inner; only after exhaustion does this method
+        fall back to returning False. Returns False on credential failure as well.
+        """
         try:
-            # NOTE: API parameter name has intentional typo — 'appPasswordl' with 'l' at end
-            data = {
-                "appEmail": self.email,
-                "appPasswordl": self.password,
-            }
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                "User-Agent": "ACController/1.8.2 (com.acinfinity.humiture; build:489; iOS 16.5.1)",
-            }
-
-            resp = self.session.post(self.LOGIN_ENDPOINT, data=data, headers=headers, timeout=10)
-            resp.raise_for_status()
-
-            result = resp.json()
-            if result.get("code") != 200:
-                error_msg = result.get("msg", "Unknown error")
-                logger.error("AC Infinity login failed: %s", error_msg)
-                raise ACInfinityAuthError(f"Authentication failed: {error_msg}")
-
-            self.token = result["data"]["appId"]
-            logger.info("AC Infinity authentication successful")
+            self._authenticate_inner()
             return True
-
         except requests.exceptions.Timeout:
-            logger.error("AC Infinity authentication timeout (10s)")
+            logger.error("AC Infinity authentication timeout (10s) after retries")
             return False
         except requests.exceptions.ConnectionError as e:
-            logger.error("Failed to connect to AC Infinity: %s", e)
+            logger.error("Failed to connect to AC Infinity after retries: %s", e)
             return False
         except ACInfinityAuthError:
             return False
@@ -351,6 +386,16 @@ class ACInfinityClient:
             device_data, port, updates, dry_run, require_variable_speed,
         )
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        # ConnectionError fires before the request reaches the server, so retry is
+        # safe — the write hasn't been applied. Timeout is intentionally excluded:
+        # a read timeout can mean the server already processed the write and the
+        # response was lost, so retrying would risk double-applying state.
+        retry=retry_if_exception_type(requests.exceptions.ConnectionError),
+        reraise=True,
+    )
     def _set_port_mode_inner(
         self,
         device_data: dict,
@@ -454,9 +499,14 @@ class ACInfinityClient:
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             self._enforce_write_rate_limit()
-            resp = self.session.post(
-                self.ADD_DEV_MODE_ENDPOINT, data=payload, headers=headers, timeout=10
-            )
+            try:
+                resp = self.session.post(
+                    self.ADD_DEV_MODE_ENDPOINT, data=payload, headers=headers, timeout=10
+                )
+            finally:
+                # Anchor the next rate-limit gap from the POST's completion
+                # (or error) rather than its start (P1-F015).
+                self._mark_write_completed()
             resp.raise_for_status()
 
             write_result = resp.json()
@@ -476,54 +526,80 @@ class ACInfinityClient:
 
             logger.error("Write failed for devId=%s port=%s: %s", dev_id, port, error_msg)
             self._raise_for_api_code(code, error_msg, "Write")
+        else:  # pragma: no cover — defensive; current control flow always break/raise first
+            # Defensive guard (P1-F017): the loop above must either break on
+            # a 200 response or raise via _raise_for_api_code. If a future
+            # refactor breaks that invariant (e.g. reorders the retry guard),
+            # this else clause prevents the function from silently falling
+            # through and reporting sent=True for a write that never succeeded.
+            raise ACInfinityAPIError(
+                f"Write loop exited without success or explicit failure for "
+                f"devId={dev_id} port={port} — internal invariant violated"
+            )
 
         logger.info("Wrote mode settings for devId=%s port=%s", dev_id, port)
         result["sent"] = True
         return result
 
     def parse_device_data(self, device_data: dict, role: str | None = None) -> dict:
-        """Extract readable values from AC Infinity device response"""
-        info = device_data.get("deviceInfo", {})
+        """Extract readable values from AC Infinity device response.
 
-        # API returns values * 100 — divide to get actual readings
-        temp_c = info.get("temperature", 0) / 100.0
-        temp_f = info.get("temperatureF", 0) / 100.0
-        humidity = info.get("humidity", 0) / 100.0
-        vpd = round(info.get("vpdnums", 0) / 100.0, 2)
+        Type errors in the upstream response (a field arriving as a string
+        where the parser expects an int, etc.) are converted to a typed
+        ACInfinityAPIError so tool-level handlers log the structural issue
+        clearly rather than re-raising raw TypeError text to the LLM (P3-F011).
+        """
+        try:
+            info = device_data.get("deviceInfo", {})
 
-        raw_ports = info.get("ports", [])
-        ports = [
-            {
-                "port": p.get("port"),
-                "name": p.get("portName", f"Port {p.get('port')}"),
-                "speed": p.get("speak", 0),  # 0-10 scale from API
-                "load": p.get("portsLoad", 0),
-            }
-            for p in raw_ports
-        ]
+            # API returns values * 100 — divide to get actual readings
+            temp_c = info.get("temperature", 0) / 100.0
+            temp_f = info.get("temperatureF", 0) / 100.0
+            humidity = info.get("humidity", 0) / 100.0
+            vpd = round(info.get("vpdnums", 0) / 100.0, 2)
 
-        sensors = info.get("sensors")
-        external = []
-        if sensors:
-            external = [
+            raw_ports = info.get("ports", [])
+            ports = [
                 {
-                    "sensor_id": f"{s.get('accessPort')}.{s.get('sensorType')}",
-                    "value": s.get("sensorData", 0) / 100.0,
+                    "port": p.get("port"),
+                    "name": p.get("portName", f"Port {p.get('port')}"),
+                    "speed": p.get("speak", 0),  # 0-10 scale from API
+                    "load": p.get("portsLoad", 0),
                 }
-                for s in sensors
+                for p in raw_ports
             ]
 
-        return {
-            "timestamp": datetime.now(UTC).replace(tzinfo=None).isoformat() + "Z",
-            "device_id": device_data.get("devCode"),
-            "device_name": device_data.get("devName", "Unknown"),
-            "temperature_c": round(temp_c, 1),
-            "temperature_f": round(temp_f, 1),
-            "humidity": round(humidity, 1),
-            "vpd": vpd,
-            "ports": ports,
-            "external_sensors": external,
-        }
+            sensors = info.get("sensors")
+            external = []
+            if sensors:
+                external = [
+                    {
+                        "sensor_id": f"{s.get('accessPort')}.{s.get('sensorType')}",
+                        "value": s.get("sensorData", 0) / 100.0,
+                    }
+                    for s in sensors
+                ]
+
+            return {
+                "timestamp": datetime.now(UTC).replace(tzinfo=None).isoformat() + "Z",
+                "device_id": device_data.get("devCode"),
+                "device_name": device_data.get("devName", "Unknown"),
+                "temperature_c": round(temp_c, 1),
+                "temperature_f": round(temp_f, 1),
+                "humidity": round(humidity, 1),
+                "vpd": vpd,
+                "ports": ports,
+                "external_sensors": external,
+            }
+        except (TypeError, ValueError, AttributeError) as e:
+            logger.warning(
+                "Malformed device data for devCode=%s: %s",
+                device_data.get("devCode") if isinstance(device_data, dict) else "<non-dict>",
+                e,
+            )
+            raise ACInfinityAPIError(
+                "AC Infinity API returned malformed device data"
+            ) from e
 
     def parse_history_record(
         self, record: dict, port_names: dict[int, str] | None = None
@@ -544,38 +620,57 @@ class ACInfinityClient:
                 each decoded port entry.
 
         Returns:
-            Dict with parsed timestamp, temperature, humidity, VPD, and port data
+            Dict with parsed timestamp, temperature, humidity, VPD, and port data.
+
+        Raises:
+            ACInfinityAPIError: when the upstream record is malformed (wrong
+                field types — e.g. portSpead as a string rather than int).
+                Defense in depth so a poisoned response cannot surface raw
+                TypeError text to the LLM via the tool-level handlers (P3-F011).
         """
-        create_time = record.get("createTime", 0)
-        timestamp = (
-            datetime.fromtimestamp(int(create_time), UTC).replace(tzinfo=None).isoformat() + "Z"
-            if create_time
-            else None
-        )
+        try:
+            create_time = record.get("createTime", 0)
+            timestamp = (
+                datetime.fromtimestamp(int(create_time), UTC).replace(tzinfo=None).isoformat()
+                + "Z"
+                if create_time
+                else None
+            )
 
-        # Decode port speeds from portSpead bitmask (4 bits per port)
-        port_spead = record.get("portSpead", 0) or 0
-        port_status = record.get("portStatus", 0) or 0
-        port_count = record.get("devPortCount") or 8
+            # Decode port speeds from portSpead bitmask (4 bits per port). Quirk 6:
+            # portStatus is the "automation-triggered" flag, NOT the on/off state.
+            # The speed nibble alone is authoritative for on/off — a port can be
+            # automation-armed (status bit set) with nibble=0 (idle), which used
+            # to be reported as ON, overstating runtime in the activity report.
+            port_spead = record.get("portSpead", 0) or 0
+            port_status = record.get("portStatus", 0) or 0
+            port_count = record.get("devPortCount") or 8
 
-        ports = []
-        for i in range(port_count):
-            nibble = (port_spead >> (i * 4)) & 0xF
-            on = bool((port_status >> i) & 1) or nibble > 0
-            speed = 1 if nibble == 0xF else nibble  # 0xF = ON for toggle devices
-            name = (port_names or {}).get(i + 1, f"Port {i + 1}")
-            ports.append({
-                "port": i + 1,
-                "name": name,
-                "speed": speed,
-                "on": on,
-            })
+            ports = []
+            for i in range(port_count):
+                nibble = (port_spead >> (i * 4)) & 0xF
+                on = nibble > 0
+                automation_triggered = bool((port_status >> i) & 1)
+                speed = 1 if nibble == 0xF else nibble  # 0xF = ON for toggle devices
+                name = (port_names or {}).get(i + 1, f"Port {i + 1}")
+                ports.append({
+                    "port": i + 1,
+                    "name": name,
+                    "speed": speed,
+                    "on": on,
+                    "automation_triggered": automation_triggered,
+                })
 
-        return {
-            "timestamp": timestamp,
-            "temperature_c": round(record.get("temperature", 0) / 100.0, 1),
-            "temperature_f": round(record.get("fTemperature", 0) / 100.0, 1),
-            "humidity": round(record.get("humidity", 0) / 100.0, 1),
-            "vpd": round(record.get("vpdNums", 0) / 100.0, 2),
-            "ports": ports,
-        }
+            return {
+                "timestamp": timestamp,
+                "temperature_c": round(record.get("temperature", 0) / 100.0, 1),
+                "temperature_f": round(record.get("fTemperature", 0) / 100.0, 1),
+                "humidity": round(record.get("humidity", 0) / 100.0, 1),
+                "vpd": round(record.get("vpdNums", 0) / 100.0, 2),
+                "ports": ports,
+            }
+        except (TypeError, ValueError, AttributeError) as e:
+            logger.warning("Malformed history record: %s", e)
+            raise ACInfinityAPIError(
+                "AC Infinity API returned malformed history record"
+            ) from e

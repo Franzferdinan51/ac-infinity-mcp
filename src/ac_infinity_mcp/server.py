@@ -23,8 +23,123 @@ from ac_infinity_mcp.schema import (
     ACIReading,
 )
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+def _resolve_log_level(raw: str | None) -> tuple[str, bool]:
+    """Map a raw LOG_LEVEL env value to a valid logging level + warn flag.
+
+    Returns (effective_level, fallback_warning_needed).
+
+    Defensive: a malformed LOG_LEVEL would cause logging.basicConfig to raise
+    ValueError at import, before any error handler can format the failure for
+    the operator. Falls back to INFO and signals that a warning should be
+    emitted once the logger is configured. P3-F007 (Cycle 1); extracted into
+    a function for direct testability in Cycle 2 (P2-C2-F003).
+    """
+    candidate = (raw or "INFO").upper()
+    if candidate not in _VALID_LOG_LEVELS:
+        return "INFO", True
+    return candidate, False
+
+
+_log_level_raw = os.getenv("LOG_LEVEL", "INFO").upper()
+_log_level_effective, _log_level_fallback_warning = _resolve_log_level(_log_level_raw)
+
+logging.basicConfig(level=_log_level_effective)
 logger = logging.getLogger(__name__)
+if _log_level_fallback_warning:
+    logger.warning(
+        "LOG_LEVEL=%r is not a recognized level; falling back to INFO. "
+        "Valid: DEBUG, INFO, WARNING, ERROR, CRITICAL",
+        _log_level_raw,
+    )
+
+
+# Credential markers redacted in formatted log output. Tuple of (field_name,
+# value_pattern) — the field-name alternation matches the marker token, and the
+# value pattern is intentionally permissive to handle:
+#   field=value        (positional log args, e.g. "token=abc123")
+#   'field': 'value'   (dict repr from logger.debug("%s", payload_dict))
+#   "field": "value"   (json.dumps output)
+#   field=value with spaces in the value (greedy until a structural terminator)
+#   url?userId=value   (query-string credentials in HTTPError __str__)
+_FIELD_PATTERN = re.compile(
+    r"(appPasswordl|appPassword|AC_INFINITY_PASSWORD|appEmail|token|appId|userId)"
+    r"(['\"]?\s*[:=]\s*)"
+    # Value: either quoted (any chars until matching quote) or unquoted (any
+    # chars until a structural terminator). The terminator set covers JSON
+    # delimiters (newline, comma, closing brace/bracket) AND URL/query
+    # separators (`&`, `;`) so URL-query credentials don't swallow trailing
+    # params — `?userId=tok&other=val` redacts only the token, not `&other=val`
+    # (Cycle 3 P1-C3-F002).
+    #
+    # A naked whitespace inside a value (e.g. password with embedded space) is
+    # preserved as part of the value so we never under-redact a Cycle 2
+    # P3-C2-F004-class leak. The remaining edge case — two adjacent credential
+    # markers in space-separated positional form on the same log line
+    # (P1-C3-F001) — does not occur in any production log site in this server
+    # and is documented as an accepted trade-off.
+    r"(?:(['\"])([^'\"]*)\3|([^\n,}\];&]+))",
+    re.IGNORECASE,
+)
+
+
+def _redact_credentials(text: str) -> str:
+    """Redact credential-field values from any text. Idempotent."""
+    if not text:
+        return text
+
+    def _sub(match: re.Match[str]) -> str:
+        field = match.group(1)
+        sep = match.group(2)
+        quote = match.group(3)
+        if quote is not None:
+            return f"{field}{sep}{quote}<redacted>{quote}"
+        return f"{field}{sep}<redacted>"
+
+    return _FIELD_PATTERN.sub(_sub, text)
+
+
+class _CredentialRedactingFormatter(logging.Formatter):
+    """Formatter that scrubs credential markers from both the message line AND
+    any exception text (the traceback emitted by ``exc_info=True``).
+
+    Switched from a logging.Filter to a Formatter subclass during Cycle 2:
+    Filter only sees ``record.msg`` and cannot scrub the post-formatExc text,
+    which is what every ``logger.error(..., exc_info=True)`` site emits. The
+    formatter wraps both surfaces. Defense in depth: every existing logger.*
+    call site is audited clean; the formatter prevents future leaks.
+
+    Tracks the lineage of Cycle 1 P3-F006 / P3-F019 and Cycle 2
+    P1-C2-F001 / P1-C2-F002 / P3-C2-F001 / P3-C2-F002 / P3-C2-F004.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return _redact_credentials(formatted)
+
+    def formatException(self, ei: object) -> str:  # type: ignore[override]
+        return _redact_credentials(super().formatException(ei))  # type: ignore[arg-type]
+
+
+def _install_credential_redactor(target_logger: logging.Logger | None = None) -> None:
+    """Attach the credential-redacting formatter to every handler on the root logger.
+
+    Filters on logger objects (vs handlers) skip records propagated up from
+    child loggers — Python's logging design. Attaching at the handler layer
+    means every record emitted to a sink (stderr, file) passes through the
+    redactor regardless of origin logger. Also called from tests after they
+    add their own handlers.
+    """
+    target = target_logger or logging.getLogger()
+    for handler in target.handlers:
+        # Preserve any existing format string the operator may have configured.
+        existing_fmt = handler.formatter._fmt if handler.formatter else None  # type: ignore[union-attr]
+        handler.setFormatter(_CredentialRedactingFormatter(existing_fmt))
+
+
+_install_credential_redactor()
 
 mcp_server = FastMCP(name="ac-infinity-mcp")
 
@@ -81,14 +196,17 @@ async def discover_devices() -> str:
         logger.warning("Auth error in discover_devices: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in discover_devices: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in discover_devices: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in discover_devices: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -136,14 +254,17 @@ async def get_device_reading(device_id: str) -> str:
         logger.warning("Auth error in get_device_reading: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in get_device_reading: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in get_device_reading: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in get_device_reading: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -168,13 +289,22 @@ async def get_historical_readings(
             Default: "1h" (one averaged reading per hour).
         time_start: Optional UTC time filter in HH:MM format (e.g., "16:00").
             If provided, only readings at or after this time are returned.
+            Invalid HH:MM strings return a structured error.
         time_end: Optional UTC time filter in HH:MM format (e.g., "16:15").
             If provided, only readings at or before this time are returned.
+            Invalid HH:MM strings return a structured error.
+
+            When both bounds are set and time_start > time_end (e.g. "22:00"–"06:00"),
+            the window crosses midnight: the OR of [time_start, 24:00) and
+            [00:00, time_end] is returned.
 
     Returns:
         JSON with ``"readings"`` list and ``"statistics"`` summary. Each reading contains
         timestamp, temperature_c/f, humidity, vpd, and ports list. Statistics include
-        min/avg/max per metric across the returned window. See docs/API.md for full shape.
+        min/avg/max per metric across the returned window. If any readings were dropped
+        because their timestamps could not be parsed, the response also includes
+        ``"dropped_readings"`` (count) and ``"drop_reason"``. See docs/API.md for full
+        shape.
 
         On failure returns ``{"error": "...", "detail": "..."}``.
     """
@@ -193,6 +323,21 @@ async def get_historical_readings(
                 _parse_duration_seconds(sample_interval)
             except ValueError as exc:
                 return json.dumps({"error": str(exc)})
+
+        # Validate time_start / time_end as HH:MM. Without this, garbage input
+        # (e.g. "bad") silently excluded every reading from the result via
+        # lexicographic compare and the tool returned "No data available after
+        # sampling" with no hint that the filter was at fault.
+        for label, value in (("time_start", time_start), ("time_end", time_end)):
+            if value is not None:
+                try:
+                    _parse_schedule_time(value)
+                except ValueError:
+                    return json.dumps({
+                        "error": (
+                            f"Invalid {label} {value!r}: expected 'HH:MM' (00:00–23:59)"
+                        ),
+                    })
 
         devices = await asyncio.to_thread(_client().get_devices)
 
@@ -237,8 +382,11 @@ async def get_historical_readings(
 
         sampled = apply_sampling(readings, sample_interval)
 
+        dropped_readings = 0
         if time_start or time_end:
-            sampled = _filter_readings_by_time(sampled, time_start, time_end)
+            sampled, dropped_readings = _filter_readings_by_time(
+                sampled, time_start, time_end
+            )
 
         if sampled:
             temps_c = [r.get("temperature_c", 0) for r in sampled if "temperature_c" in r]
@@ -291,24 +439,31 @@ async def get_historical_readings(
         else:
             stats = {"error": "No data available after sampling"}
 
-        return json.dumps({
+        response: dict = {
             "device_id": device_id,
             "readings": sampled,
             "statistics": stats,
-        }, indent=2)
+        }
+        if dropped_readings:
+            response["dropped_readings"] = dropped_readings
+            response["drop_reason"] = "malformed timestamp"
+        return json.dumps(response, indent=2)
 
     except ACInfinityAuthError as e:
         logger.warning("Auth error in get_historical_readings: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in get_historical_readings: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in get_historical_readings: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in get_historical_readings: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -388,14 +543,17 @@ async def check_vpd_drift(device_id: str, stage: str = "veg") -> str:
         logger.warning("Auth error in check_vpd_drift: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in check_vpd_drift: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in check_vpd_drift: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in check_vpd_drift: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -438,14 +596,17 @@ async def get_all_device_readings() -> str:
         logger.warning("Auth error in get_all_device_readings: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in get_all_device_readings: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in get_all_device_readings: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in get_all_device_readings: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -482,14 +643,17 @@ async def get_environment_health(device_id: str, stage: str = "veg") -> str:
         logger.warning("Auth error in get_environment_health: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in get_environment_health: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in get_environment_health: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in get_environment_health: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -536,14 +700,17 @@ async def detect_environment_trends(device_id: str, days: int = 7) -> str:
         logger.warning("Auth error in detect_environment_trends: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in detect_environment_trends: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in detect_environment_trends: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in detect_environment_trends: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -586,14 +753,17 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         logger.warning("Auth error in get_port_activity_report: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in get_port_activity_report: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in get_port_activity_report: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in get_port_activity_report: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 # ============ New Read Tools ============
@@ -616,11 +786,19 @@ _MODE_AT_TYPES: dict[str, int] = {v: k for k, v in _MODE_LABELS.items()}
 
 
 def _format_schedule_time(minutes: int | None) -> str | None:
-    """Convert minutes-since-midnight to HH:MM string. Returns None if disabled (65535)."""
+    """Convert minutes-since-midnight to HH:MM string. Returns None when disabled.
+
+    65535 is the API's disabled-sentinel. Any other out-of-range value
+    (>= 1440 minutes = past 24h, or negative) is treated as None rather than
+    silently producing nonsense like "25:00" — a corrupt or unset field is
+    indistinguishable from disabled in this context.
+    """
     if minutes is None or minutes == 65535:
         return None
+    if not (0 <= minutes < 1440):
+        return None
     h, m = divmod(minutes, 60)
-    return f"{h:02d}:{m % 60:02d}"
+    return f"{h:02d}:{m:02d}"
 
 
 def _parse_schedule_time(time_str: str | None) -> int:
@@ -698,14 +876,17 @@ async def get_port_status(device_id: str, port: int) -> str:
         logger.warning("Auth error in get_port_status: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in get_port_status: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in get_port_status: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in get_port_status: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -761,7 +942,21 @@ async def get_port_settings(device_id: str, port: int) -> str:
 
         vpd_target = None
         if settings.get("targetVpdSwitch"):
-            vpd_target = round(settings.get("targetVpd", 0) / 10, 2)
+            raw = settings.get("targetVpd", 0)
+            # Clamp out-of-range / corrupted values. Realistic VPD targets are
+            # 0–3 kPa; anything outside [0, 50] (i.e. 0..500 raw) suggests a
+            # corrupt or unset field rather than a plant-bearable target. Return
+            # None instead of feeding nonsense to the LLM (P3-F020).
+            try:
+                vpd_target = round(int(raw) / 10, 2)
+                if not (0 <= vpd_target <= 50):
+                    logger.warning(
+                        "targetVpd out of range (%s) — returning null", vpd_target
+                    )
+                    vpd_target = None
+            except (TypeError, ValueError):
+                logger.warning("targetVpd is non-numeric (%r) — returning null", raw)
+                vpd_target = None
 
         temp_range = None
         if settings.get("activeLt") or settings.get("activeHt"):
@@ -779,9 +974,12 @@ async def get_port_settings(device_id: str, port: int) -> str:
 
         sched_start = _format_schedule_time(settings.get("schedStartTime"))
         sched_end = _format_schedule_time(settings.get("schedEndtTime"))  # API typo: EndtTime
+        # A half-configured schedule (only start, or only end) is not a meaningful
+        # window — return None rather than {"start": "...", "end": None}, which
+        # forces the caller to interpret a confusing partial state.
         schedule_window = (
             {"start": sched_start, "end": sched_end}
-            if sched_start is not None
+            if sched_start is not None and sched_end is not None
             else None
         )
 
@@ -804,14 +1002,17 @@ async def get_port_settings(device_id: str, port: int) -> str:
         logger.warning("Auth error in get_port_settings: %s", e)
         return json.dumps({
             "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
-            "detail": str(e),
+            "detail": "see server logs",
         })
     except ACInfinityAPIError as e:
         logger.error("API error in get_port_settings: %s", e)
-        return json.dumps({"error": "AC Infinity API error", "detail": str(e)})
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except Exception as e:
-        logger.error("Unexpected error in get_port_settings: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in get_port_settings: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 # ============ Write Tools ============
@@ -898,12 +1099,26 @@ async def set_port_speed(
 
         return json.dumps(response, indent=2)
 
-    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
-        logger.warning("Error in set_port_speed (device=%s port=%s): %s", device_id, port, e)
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in set_port_speed (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in set_port_speed (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        # Device-guard text (loadType=4/128, modeType=15) is self-constructed
+        # and actionable — the LLM uses these hints to switch tools.
+        logger.warning("Device error in set_port_speed (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
     except Exception as e:
-        logger.error("Unexpected error in set_port_speed: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in set_port_speed: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -966,12 +1181,26 @@ async def set_port_on(
 
         return json.dumps(response, indent=2)
 
-    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
-        logger.warning("Error in set_port_on (device=%s port=%s): %s", device_id, port, e)
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in set_port_on (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in set_port_on (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        # Device-guard text (loadType=4/128, modeType=15) is self-constructed
+        # and actionable — the LLM uses these hints to switch tools.
+        logger.warning("Device error in set_port_on (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
     except Exception as e:
-        logger.error("Unexpected error in set_port_on: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in set_port_on: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -980,7 +1209,13 @@ async def set_port_off(
     port: int,
     dry_run: bool = True,
 ) -> str:
-    """Turn a port off (onSpead=0).
+    """Zero a port's speed (onSpead=0).
+
+    Sends onSpead=0 only — the port's active automation mode (atType) is left
+    unchanged. If the port is in AUTO or VPD mode, the controller's automation
+    logic may re-engage the port when its trigger condition is next met. To
+    keep the port off until manually re-enabled, switch the mode to OFF first
+    via ``set_port_mode(device_id, port, mode="OFF")``.
 
     Uses read-before-write. Defaults to dry_run=True — set dry_run=False to
     write to the device.
@@ -1034,23 +1269,29 @@ async def set_port_off(
 
         return json.dumps(response, indent=2)
 
-    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
-        logger.warning("Error in set_port_off (device=%s port=%s): %s", device_id, port, e)
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in set_port_off (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in set_port_off (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        # Device-guard text (loadType=4/128, modeType=15) is self-constructed
+        # and actionable — the LLM uses these hints to switch tools.
+        logger.warning("Device error in set_port_off (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
     except Exception as e:
-        logger.error("Unexpected error in set_port_off: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in set_port_off: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 # ============ Automation Write Tools ============
-
-
-def _recovery_note(sent_writes: list[str]) -> str:
-    applied = ", ".join(sent_writes)
-    return (
-        f"{applied.capitalize()} automation was applied (sent=true). "
-        "To revert: call set_port_mode with mode=AUTO or set_port_speed to restore prior state."
-    )
 
 
 def _ai_plus_unsupported_error(device_id: str, port: int, controller_type: str) -> str:
@@ -1133,12 +1374,35 @@ async def set_vpd_automation(
             response["payload"] = write_result["payload"]
         return json.dumps(response, indent=2)
 
-    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
-        logger.warning("Error in set_vpd_automation (device=%s port=%s): %s", device_id, port, e)
+    except ACInfinityAuthError as e:
+        logger.warning(
+            "Auth error in set_vpd_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error(
+            "API error in set_vpd_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        # Device-guard text (loadType=4/128, modeType=15) is self-constructed
+        # and actionable — the LLM uses these hints to switch tools.
+        logger.warning(
+            "Device error in set_vpd_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
         return json.dumps({"error": str(e)})
     except Exception as e:
-        logger.error("Unexpected error in set_vpd_automation: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in set_vpd_automation: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -1185,8 +1449,11 @@ async def set_temperature_automation(
 
         updates = {
             "atType": 3,  # AUTO mode
-            "devLt": round(min_c),  # raw °C integer — no ×100 scaling
-            "devHt": round(max_c),
+            # raw °C integer — no ×100 scaling. int(x + 0.5) is round-half-up;
+            # round() uses banker's rounding and would silently disagree with
+            # the docstring at half-integer inputs (e.g. round(20.5) == 20).
+            "devLt": int(min_c + 0.5),
+            "devHt": int(max_c + 0.5),
             "activeLt": 1,
             "activeHt": 1,
         }
@@ -1211,14 +1478,35 @@ async def set_temperature_automation(
             response["payload"] = write_result["payload"]
         return json.dumps(response, indent=2)
 
-    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+    except ACInfinityAuthError as e:
         logger.warning(
-            "Error in set_temperature_automation (device=%s port=%s): %s", device_id, port, e
+            "Auth error in set_temperature_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error(
+            "API error in set_temperature_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        # Device-guard text (loadType=4/128, modeType=15) is self-constructed
+        # and actionable — the LLM uses these hints to switch tools.
+        logger.warning(
+            "Device error in set_temperature_automation (device=%s port=%s): %s",
+            device_id, port, e,
         )
         return json.dumps({"error": str(e)})
     except Exception as e:
-        logger.error("Unexpected error in set_temperature_automation: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in set_temperature_automation: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -1265,8 +1553,10 @@ async def set_humidity_automation(
 
         updates = {
             "atType": 3,  # AUTO mode
-            "devLh": round(min_rh),  # raw % RH integer — no ×100 scaling
-            "devHh": round(max_rh),
+            # raw % RH integer — no ×100 scaling. int(x + 0.5) is round-half-up;
+            # see set_temperature_automation for rationale.
+            "devLh": int(min_rh + 0.5),
+            "devHh": int(max_rh + 0.5),
             "activeLh": 1,
             "activeHh": 1,
         }
@@ -1291,14 +1581,35 @@ async def set_humidity_automation(
             response["payload"] = write_result["payload"]
         return json.dumps(response, indent=2)
 
-    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
+    except ACInfinityAuthError as e:
         logger.warning(
-            "Error in set_humidity_automation (device=%s port=%s): %s", device_id, port, e
+            "Auth error in set_humidity_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error(
+            "API error in set_humidity_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        # Device-guard text (loadType=4/128, modeType=15) is self-constructed
+        # and actionable — the LLM uses these hints to switch tools.
+        logger.warning(
+            "Device error in set_humidity_automation (device=%s port=%s): %s",
+            device_id, port, e,
         )
         return json.dumps({"error": str(e)})
     except Exception as e:
-        logger.error("Unexpected error in set_humidity_automation: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in set_humidity_automation: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 _VALID_MODES = frozenset(_MODE_AT_TYPES)
@@ -1386,7 +1697,14 @@ async def set_port_mode(
         at_type = _MODE_AT_TYPES[mode_upper]
         updates: dict = {"atType": at_type}
 
-        if mode_upper == "CYCLE":
+        if mode_upper == "ON":
+            # The bare atType=2 (ON) preserves whatever onSpead was previously set.
+            # If the port was last left at onSpead=0 (e.g. via a prior set_port_off
+            # or a fresh port), switching to ON mode would leave the port running
+            # at speed 0 — functionally still off. Match set_port_on by setting a
+            # default nonzero speed so "ON" actually turns the port on.
+            updates["onSpead"] = 10
+        elif mode_upper == "CYCLE":
             updates["activeCycleOn"] = cycle_on_seconds
             updates["activeCycleOff"] = cycle_off_seconds
         elif mode_upper == "SCHEDULE":
@@ -1420,12 +1738,26 @@ async def set_port_mode(
             response["payload"] = write_result["payload"]
         return json.dumps(response, indent=2)
 
-    except (ACInfinityAuthError, ACInfinityAPIError, ACInfinityDeviceError) as e:
-        logger.warning("Error in set_port_mode (device=%s port=%s): %s", device_id, port, e)
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in set_port_mode (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error("API error in set_port_mode (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        # Device-guard text (loadType=4/128, modeType=15) is self-constructed
+        # and actionable — the LLM uses these hints to switch tools.
+        logger.warning("Device error in set_port_mode (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
     except Exception as e:
-        logger.error("Unexpected error in set_port_mode: %s", e)
-        return json.dumps({"error": str(e)})
+        logger.error("Unexpected error in set_port_mode: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
 
 
 @mcp_server.tool()
@@ -1437,8 +1769,10 @@ async def apply_grow_stage_template(
 ) -> str:
     """Apply a grow-stage automation template (VPD + temperature + humidity) in one call.
 
-    Sets VPD automation, temperature automation, and humidity automation in sequence
-    using the built-in sensors. Defaults to dry_run=True — set dry_run=False to write.
+    Issues a single atomic write that puts the port in VPD mode (atType=8) with the
+    stage's VPD midpoint as the active target, and simultaneously stores the stage's
+    temperature and humidity thresholds on the controller for fallback when the user
+    later switches modes. Defaults to dry_run=True — set dry_run=False to write.
 
     Stage targets (VPD midpoint used as single target):
 
@@ -1456,13 +1790,12 @@ async def apply_grow_stage_template(
         port: 1-based port number.
         stage: Growth stage name. One of: clones, seedling, veg, early_flower,
             mid_flower, late_flower.
-        dry_run: If True (default), returns payloads without writing.
+        dry_run: If True (default), returns the payload without writing.
 
     Returns:
-        JSON with per-write status for vpd, temperature, and humidity. Each entry
-        includes sent, controller_type, and payload (when dry_run=True). On partial
-        failure, partial_write=True and recovery_note lists what was applied so the
-        caller can revert if needed. On failure returns ``{"error": "..."}``.
+        JSON with action, device_id, port, stage, dry_run, controller_type, sent,
+        per-target summary (vpd/temperature/humidity), and payload (when dry_run=True).
+        On failure returns ``{"error": "..."}``.
     """
     if port < 1:
         return json.dumps({"error": "port must be a positive integer"})
@@ -1474,141 +1807,106 @@ async def apply_grow_stage_template(
     vpd_min, vpd_max = targets["vpd"]
     temp_min, temp_max = targets["temp_c"]
     humi_min, humi_max = targets["humidity"]
-    target_vpd = round((vpd_min + vpd_max) / 2, 2)
+    # Compute the 2-dp midpoint via integer math (round-half-up at 2 dp) so the
+    # displayed target reflects the stage's actual midpoint (e.g. veg → 1.25, not
+    # 1.30). Encoding is round-half-up at 1 dp (×10), matching the VPD field.
+    midpoint_x100 = int((vpd_min + vpd_max) * 50 + 0.5)
+    target_vpd = midpoint_x100 / 100
+    target_vpd_x10 = int(midpoint_x100 / 10 + 0.5)
 
     try:
         devices = await asyncio.to_thread(_client().get_devices)
-    except Exception as e:
+    except ACInfinityAuthError as e:
         logger.warning(
-            "Error fetching devices in apply_grow_stage_template (device=%s): %s", device_id, e
+            "Auth error fetching devices in apply_grow_stage_template (device=%s): %s",
+            device_id, e,
         )
-        return json.dumps({"error": str(e)})
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except ACInfinityAPIError as e:
+        logger.error(
+            "API error fetching devices in apply_grow_stage_template (device=%s): %s",
+            device_id, e,
+        )
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except Exception as e:
+        # P1-C2-F003 / P3-C2-F010: previously returned str(e) here, which echoed
+        # arbitrary exception text into the LLM-facing response. Match the
+        # generic pattern used elsewhere.
+        logger.error(
+            "Unexpected error fetching devices in apply_grow_stage_template (device=%s): %s",
+            device_id, e, exc_info=True,
+        )
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
 
     device = next((d for d in devices if d.get("devCode") == device_id), None)
     if not device:
         return json.dumps({"error": f"Device {device_id} not found"})
 
-    # Each write has its own try/except for partial-failure tracking.
-    # The outer structure (device lookup + response setup above) cannot raise.
+    # Single atomic write: VPD mode active, temp/humidity thresholds stored on the
+    # controller for fallback if the user later switches to AUTO mode. Earlier
+    # versions issued three separate writes; the temp and humidity writes carried
+    # atType=3 (AUTO), which clobbered the VPD mode set by the first write.
+    updates = {
+        "atType": 8,  # VPD mode active
+        "vpdSettingMode": 1,
+        "targetVpd": target_vpd_x10,
+        "targetVpdSwitch": 1,
+        "devLt": int(temp_min + 0.5),
+        "devHt": int(temp_max + 0.5),
+        "activeLt": 1,
+        "activeHt": 1,
+        "devLh": int(humi_min + 0.5),
+        "devHh": int(humi_max + 0.5),
+        "activeLh": 1,
+        "activeHh": 1,
+    }
+
+    try:
+        write_result = await asyncio.to_thread(
+            _client().set_port_mode, device, port, updates, dry_run
+        )
+    except ACInfinityAuthError as e:
+        logger.warning(
+            "Auth error in apply_grow_stage_template (device=%s port=%s stage=%s): %s",
+            device_id, port, stage, e,
+        )
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
+    except (ACInfinityAPIError, ACInfinityDeviceError) as e:
+        logger.error(
+            "API/device error in apply_grow_stage_template (device=%s port=%s stage=%s): %s",
+            device_id, port, stage, e,
+        )
+        return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
+    except Exception as e:
+        logger.error("Unexpected error in apply_grow_stage_template: %s", e, exc_info=True)
+        return json.dumps({
+            "error": "Unexpected error",
+            "detail": "see server logs",
+        })
+
+    if write_result.get("ai_plus_write_unsupported"):
+        return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
+
     response: dict = {
         "action": "apply grow stage template",
         "device_id": device_id,
         "port": port,
         "stage": stage,
-        "dry_run": dry_run,
+        "dry_run": write_result["dry_run"],
+        "controller_type": write_result["controller_type"],
+        "sent": write_result["sent"],
+        "vpd": {"target_kpa": target_vpd},
+        "temperature": {"min_c": temp_min, "max_c": temp_max},
+        "humidity": {"min_rh": humi_min, "max_rh": humi_max},
     }
-    sent_writes: list[str] = []
-
-    # VPD write
-    vpd_updates = {
-        "atType": 8,
-        "vpdSettingMode": 1,
-        "targetVpd": int(target_vpd * 10 + 0.5),  # ×10; int(x+0.5) avoids banker's rounding
-        "targetVpdSwitch": 1,
-    }
-    try:
-        vpd_result = await asyncio.to_thread(
-            _client().set_port_mode, device, port, vpd_updates, dry_run
-        )
-        if vpd_result.get("ai_plus_write_unsupported"):
-            return _ai_plus_unsupported_error(device_id, port, vpd_result["controller_type"])
-        vpd_entry: dict = {
-            "target_kpa": target_vpd,
-            "sent": vpd_result["sent"],
-            "controller_type": vpd_result["controller_type"],
-        }
-        if vpd_result["dry_run"]:
-            vpd_entry["payload"] = vpd_result["payload"]
-        if vpd_result["sent"]:
-            sent_writes.append("vpd")
-        response["vpd"] = vpd_entry
-    except Exception as e:
-        logger.warning(
-            "VPD write failed in apply_grow_stage_template (device=%s port=%s): %s",
-            device_id, port, e,
-        )
-        response["vpd"] = {"target_kpa": target_vpd, "sent": False, "error": str(e)}
-        response["temperature"] = {
-            "min_c": temp_min, "max_c": temp_max, "sent": False,
-            "error": "not attempted — vpd write failed",
-        }
-        response["humidity"] = {
-            "min_rh": humi_min, "max_rh": humi_max, "sent": False,
-            "error": "not attempted — vpd write failed",
-        }
-        return json.dumps(response, indent=2)
-
-    # Temperature write
-    temp_updates = {
-        "atType": 3,
-        "devLt": round(temp_min),
-        "devHt": round(temp_max),
-        "activeLt": 1,
-        "activeHt": 1,
-    }
-    try:
-        temp_result = await asyncio.to_thread(
-            _client().set_port_mode, device, port, temp_updates, dry_run
-        )
-        temp_entry: dict = {
-            "min_c": temp_min,
-            "max_c": temp_max,
-            "sent": temp_result["sent"],
-            "controller_type": temp_result["controller_type"],
-        }
-        if temp_result["dry_run"]:
-            temp_entry["payload"] = temp_result["payload"]
-        if temp_result["sent"]:
-            sent_writes.append("temperature")
-        response["temperature"] = temp_entry
-    except Exception as e:
-        logger.warning(
-            "Temperature write failed in apply_grow_stage_template (device=%s port=%s): %s",
-            device_id, port, e,
-        )
-        response["temperature"] = {
-            "min_c": temp_min, "max_c": temp_max, "sent": False, "error": str(e),
-        }
-        response["humidity"] = {
-            "min_rh": humi_min, "max_rh": humi_max, "sent": False,
-            "error": "not attempted — temperature write failed",
-        }
-        response["partial_write"] = True
-        response["recovery_note"] = _recovery_note(sent_writes)
-        return json.dumps(response, indent=2)
-
-    # Humidity write
-    humi_updates = {
-        "atType": 3,
-        "devLh": round(humi_min),
-        "devHh": round(humi_max),
-        "activeLh": 1,
-        "activeHh": 1,
-    }
-    try:
-        humi_result = await asyncio.to_thread(
-            _client().set_port_mode, device, port, humi_updates, dry_run
-        )
-        humi_entry: dict = {
-            "min_rh": humi_min,
-            "max_rh": humi_max,
-            "sent": humi_result["sent"],
-            "controller_type": humi_result["controller_type"],
-        }
-        if humi_result["dry_run"]:
-            humi_entry["payload"] = humi_result["payload"]
-        response["humidity"] = humi_entry
-    except Exception as e:
-        logger.warning(
-            "Humidity write failed in apply_grow_stage_template (device=%s port=%s): %s",
-            device_id, port, e,
-        )
-        response["humidity"] = {
-            "min_rh": humi_min, "max_rh": humi_max, "sent": False, "error": str(e),
-        }
-        response["partial_write"] = True
-        response["recovery_note"] = _recovery_note(sent_writes)
-        return json.dumps(response, indent=2)
+    if write_result["dry_run"]:
+        response["payload"] = write_result["payload"]
 
     return json.dumps(response, indent=2)
 
@@ -1805,32 +2103,60 @@ def _parse_duration_seconds(interval: str) -> int:
 
 def _filter_readings_by_time(
     readings: list, time_start: str | None = None, time_end: str | None = None
-) -> list:
-    """Filter readings to only include those within a UTC time window (HH:MM format)."""
-    if not time_start and not time_end:
-        return readings
+) -> tuple[list, int]:
+    """Filter readings to only include those within a UTC time window (HH:MM format).
 
+    Returns:
+        (filtered_readings, dropped_count) where dropped_count is the number of
+        readings whose timestamps could not be parsed (and were therefore excluded
+        from the result). The caller is expected to surface a non-zero drop count
+        in the response so the user knows data was dropped.
+
+    Overnight windows: when time_start > time_end (e.g. "22:00"-"06:00"), the
+    filter is the OR of [time_start, 24:00) and [00:00, time_end] — i.e. the
+    window crosses midnight. Same-day windows use the inclusive intersection.
+    """
+    if not time_start and not time_end:
+        return readings, 0
+
+    overnight = (
+        time_start is not None and time_end is not None and time_start > time_end
+    )
     filtered = []
+    dropped = 0
     for reading in readings:
         timestamp_str = reading.get("timestamp", "")
         try:
-            ts_dt = datetime.fromisoformat(timestamp_str.rstrip("Z").replace("+00:00", ""))
-            ts_dt = ts_dt.replace(tzinfo=UTC)
+            # P1-C2-F005: handle both UTC-naive (..."T...Z") and aware (...+HH:MM)
+            # timestamps. The historical-data parser always emits the naive-Z
+            # form today, but a future fixture or hand-crafted payload could
+            # carry a non-UTC offset — converting via astimezone preserves the
+            # instant, where the old .replace(tzinfo=UTC) silently corrupted it.
+            ts_dt = datetime.fromisoformat(timestamp_str.rstrip("Z"))
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=UTC)
+            else:
+                ts_dt = ts_dt.astimezone(UTC)
             reading_time = ts_dt.strftime("%H:%M")
-
-            include = True
-            if time_start and reading_time < time_start:
-                include = False
-            if time_end and reading_time > time_end:
-                include = False
-
-            if include:
-                filtered.append(reading)
-        except Exception as e:
+        except (ValueError, AttributeError, TypeError) as e:
             logger.warning("Could not parse timestamp %s: %s", timestamp_str, e)
+            dropped += 1
             continue
 
-    return filtered
+        if time_start and time_end:
+            if overnight:
+                include = reading_time >= time_start or reading_time <= time_end
+            else:
+                include = time_start <= reading_time <= time_end
+        elif time_start:
+            include = reading_time >= time_start
+        else:  # time_end only
+            include = reading_time <= time_end  # type: ignore[operator]
+
+        if include:
+            filtered.append(reading)
+
+    return filtered, dropped
 
 
 def apply_sampling(readings: list, interval: str) -> list:
@@ -1852,7 +2178,12 @@ def apply_sampling(readings: list, interval: str) -> list:
         try:
             ts_dt = datetime.fromisoformat(timestamp_str.rstrip("Z"))
             unix_ts = int(ts_dt.replace(tzinfo=UTC).timestamp())
-        except Exception:
+        except (ValueError, AttributeError, TypeError) as e:
+            # Narrow exception set: only timestamp-parse failures (bad string,
+            # None, unexpected type) should drop a reading. Anything else
+            # should propagate — silently swallowing every Exception masks
+            # real bugs in the parser layer (P1-F014).
+            logger.debug("apply_sampling skipping bad timestamp %r: %s", timestamp_str, e)
             continue
         bucket_key = (unix_ts // bucket_secs) * bucket_secs
         sampled.setdefault(bucket_key, []).append(reading)
@@ -1917,8 +2248,12 @@ def main() -> None:  # pragma: no cover
     password = os.getenv("AC_INFINITY_PASSWORD")
 
     if not email or not password:
+        # The server reads env vars directly; it does not auto-load .env.
+        # Set via your MCP client's env config (Claude Desktop / Cline / Codex
+        # config block) or export them in your shell before launching.
         logger.error(
-            "Missing AC_INFINITY_EMAIL or AC_INFINITY_PASSWORD — set in .env"
+            "Missing AC_INFINITY_EMAIL or AC_INFINITY_PASSWORD — "
+            "set them in your MCP client config or shell environment"
         )
         sys.exit(1)
 

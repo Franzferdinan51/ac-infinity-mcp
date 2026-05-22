@@ -1,3 +1,4 @@
+import copy
 from unittest.mock import MagicMock
 
 import pytest
@@ -6,7 +7,13 @@ MOCK_DEVICE_LEGACY: dict = {
     "devCode": "C58ZA",
     "devName": "Test 69 Pro",
     "devType": 11,
-    "devId": 12345,
+    # Per docs/API.md Quirk 7: devId is a string at the top level of device
+    # records (large integer values that lose precision if int()-cast). The
+    # value used here is a representative 19-digit ID matching the real API
+    # shape; the previous int-typed fixture (12345) wouldn't surface a
+    # precision-loss bug if a future caller did int(device["devId"]).
+    # P2-C2-F011.
+    "devId": "1424979258063367506",
     "online": True,
     "newFrameworkDevice": False,
     "deviceInfo": {
@@ -41,18 +48,26 @@ MOCK_DEVICE_AI_PLUS: dict = {
 }
 
 
-@pytest.fixture(autouse=True)
-def mock_env_vars(monkeypatch):
-    monkeypatch.setenv("AC_INFINITY_EMAIL", "test@example.com")
-    monkeypatch.setenv("AC_INFINITY_PASSWORD", "testpassword123")
+# NOTE: the autouse fixture that injects test credentials lives in
+# tests/common/conftest.py and tests/devices/conftest.py — explicitly NOT here.
+# Putting it at the tests/ root would apply to tests/integration/test_live.py,
+# which depends on the REAL AC_INFINITY_EMAIL / AC_INFINITY_PASSWORD captured
+# from the developer's environment. See P2-F011 in
+# .claude/internal/REVIEW_FINDINGS.md (gitignored).
 
 
 @pytest.fixture
 def mock_client():
-    """MagicMock of ACInfinityClient with sensible defaults."""
+    """MagicMock of ACInfinityClient with sensible defaults.
+
+    Default return values are deep-copied so a test that mutates them
+    (e.g. ``mock_client.parse_device_data.return_value["vpd"] = 0.5``) does not
+    leak state to other tests. Without the copy, the shared module-level dict
+    would carry the mutation across test boundaries (P2-F016).
+    """
     client = MagicMock()
-    client.get_devices.return_value = [MOCK_DEVICE_LEGACY]
-    client.parse_device_data.return_value = {
+    client.get_devices.return_value = [copy.deepcopy(MOCK_DEVICE_LEGACY)]
+    client.parse_device_data.return_value = copy.deepcopy({
         "timestamp": "2026-01-01T00:00:00Z",
         "device_id": "C58ZA",
         "device_name": "Test 69 Pro",
@@ -62,5 +77,5 @@ def mock_client():
         "vpd": 1.24,
         "ports": [],
         "external_sensors": [],
-    }
+    })
     return client

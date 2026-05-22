@@ -1,4 +1,10 @@
-"""Live integration tests — skipped in CI without AC_INFINITY_EMAIL credential."""
+"""Live integration tests — skipped in CI without AC_INFINITY_EMAIL credential.
+
+Belt-and-braces opt-in: the live marker is deselected by default in pyproject.toml.
+A contributor who wants to run these must pass ``-m live`` explicitly. CI does
+not pass that flag, so even if AC_INFINITY_EMAIL leaked into the workflow env
+(e.g. via a future secrets edit), the suite would still skip. See P3-F009.
+"""
 
 import asyncio
 import json
@@ -10,10 +16,13 @@ import pytest
 from ac_infinity_mcp import server as srv
 from ac_infinity_mcp.client import ACInfinityClient
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv("AC_INFINITY_EMAIL"),
-    reason="AC_INFINITY_EMAIL not set — skipping live API tests",
-)
+pytestmark = [
+    pytest.mark.live,  # opt-in marker — deselected by default (see pyproject.toml)
+    pytest.mark.skipif(
+        not os.getenv("AC_INFINITY_EMAIL"),
+        reason="AC_INFINITY_EMAIL not set — skipping live API tests",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -165,14 +174,17 @@ def test_live_apply_grow_stage_template_dry_run(
         srv.apply_grow_stage_template(live_device_id, port=1, stage="veg", dry_run=True)
     )
     data = json.loads(result)
+    # Cycle 1 refactor (commit 4fd7497) collapsed the three sequential writes
+    # into a single atomic write — response is now flat sent/payload, not
+    # per-target nested. P2-C2-F002.
     assert data.get("dry_run") is True
-    assert data["vpd"]["sent"] is False
-    assert data["temperature"]["sent"] is False
-    assert data["humidity"]["sent"] is False
-    assert "payload" in data["vpd"]
-    assert "payload" in data["temperature"]
-    assert "payload" in data["humidity"]
+    assert data["sent"] is False
+    assert "payload" in data
     assert data["vpd"]["target_kpa"] == 1.25
+    assert data["temperature"]["min_c"] == 20.0
+    assert data["temperature"]["max_c"] == 28.0
+    assert data["humidity"]["min_rh"] == 50.0
+    assert data["humidity"]["max_rh"] == 70.0
     assert "error" not in data
 
 

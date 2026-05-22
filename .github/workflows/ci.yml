@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Lock down GITHUB_TOKEN to read-only — neither job needs write access to repo
+# contents, issues, PRs, or anything else. Without this, the workflow inherits
+# the repo's default GITHUB_TOKEN permissions (which under classic settings can
+# be write-all) and a malicious fork PR could exfiltrate the token. P3-C2-F007.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: "Python ${{ matrix.python-version }}"
@@ -17,10 +24,10 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -41,13 +48,17 @@ jobs:
           AC_INFINITY_PASSWORD: ""
 
       - name: Security audit — pip-audit
+        # PYSEC-2025-183 is an upstream `mcp` package CVE that does not affect
+        # this server's stdio-only transport. Rationale + re-evaluation date
+        # documented in docs/SECURITY-RISKS.md. Do not blanket-add new CVEs
+        # here — file an issue and document the exposure first.
         run: pip-audit --ignore-vuln PYSEC-2025-183
 
   docker:
     name: "Docker build"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Build image
         run: docker build -t ac-infinity-mcp-test .

@@ -18,6 +18,8 @@ from ac_infinity_mcp.analytics import (
 )
 from ac_infinity_mcp.client import ACInfinityClient
 from ac_infinity_mcp.schema import (
+    _ADVANCE_MODE_TYPE,
+    ADVANCE_REVERT_BEHAVIOR_CONFIRMED,
     ACInfinityAdvanceConflictError,
     ACInfinityAPIError,
     ACInfinityAuthError,
@@ -154,6 +156,70 @@ def _client() -> ACInfinityClient:
     if aci_client is None:
         raise RuntimeError("AC Infinity client not initialized — call main() first")
     return aci_client
+
+
+# ============ Advance Automation Helpers ============
+
+# Per-device async locks for break_out_of_automation sequencing.
+# Prevents concurrent break-out operations on the same device from interleaving
+# the disable + port-lock steps (a race could partially apply state).
+_device_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_device_lock(device_id: str) -> asyncio.Lock:
+    """Return (creating if absent) the per-device async lock."""
+    if device_id not in _device_locks:
+        _device_locks[device_id] = asyncio.Lock()
+    return _device_locks[device_id]
+
+
+_AUTOMATION_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
+
+
+def _validate_automation_id(automation_id: str) -> int | None:
+    """Validate that automation_id is a pure integer string. Returns int or None."""
+    if _AUTOMATION_ID_RE.match(automation_id or ""):
+        return int(automation_id)
+    return None
+
+
+def _group_automations(raw_entries: list[dict]) -> list[dict]:
+    """Group flat getGroups entries by advName into user-visible automations.
+
+    One user-visible automation = multiple entries sharing the same advName
+    (one per port-speed group). The first entry's advId is the canonical ID
+    used for enable/disable/delete operations (the API toggles all same-name
+    entries together when called on any one of them).
+
+    Returns a list of grouped automation dicts.
+    """
+    # Preserve insertion order so the list is stable across calls.
+    groups: dict[str, list[dict]] = {}
+    for entry in raw_entries:
+        name = entry.get("advName") or ""
+        groups.setdefault(name, []).append(entry)
+
+    result = []
+    for name, entries in groups.items():
+        clean_name = _sanitize_api_string(name, 64)
+        result.append({
+            "automation_id": entries[0].get("advId"),
+            "name": clean_name,
+            "enabled": bool(entries[0].get("isOn", 0)),
+            "adv_ids": [e.get("advId") for e in entries if e.get("advId") is not None],
+            "port_groups": [
+                {
+                    "adv_id": e.get("advId"),
+                    "on_speed": e.get("onSpeed", 0),
+                    "grp_dev_type": e.get("grouptDevType", 0),
+                }
+                for e in entries
+            ],
+            "run_state": bool(entries[0].get("runState", 0)),
+            "begin_time": entries[0].get("beginTime"),
+            "end_time": entries[0].get("endTime"),
+        })
+    return result
 
 
 # ============ MCP Tools ============
@@ -781,9 +847,9 @@ _MODE_LABELS: dict[int, str] = {
     6: "CYCLE", 7: "SCHEDULE", 8: "VPD",
 }
 
-# modeType=15 signals Advance Automation control. NOT added to _MODE_LABELS — doing so
-# would allow set_port_mode(mode="ADVANCE") to write atType=15 and trigger 999999 errors.
-_ADVANCE_MODE_TYPE: int = 15
+# _ADVANCE_MODE_TYPE = 15 is imported from schema above.
+# NOT added to _MODE_LABELS — doing so would allow set_port_mode(mode="ADVANCE")
+# to write atType=15 and trigger 999999 errors.
 
 
 def _decode_mode(mode_int: int | None) -> str:
@@ -803,7 +869,7 @@ def _format_schedule_time(minutes: int | None) -> str | None:
     silently producing nonsense like "25:00" — a corrupt or unset field is
     indistinguishable from disabled in this context.
     """
-    if minutes is None or minutes == 65535:
+    if minutes is None or minutes == 65535 or minutes == 255:
         return None
     if not (0 <= minutes < 1440):
         return None
@@ -829,7 +895,7 @@ def _parse_schedule_time(time_str: str | None) -> int:
         ) from None
 
 
-def _sanitize_api_string(value: str | None, max_len: int) -> str:
+def _sanitize_api_string(value: str | None, max_len: int = 64) -> str:
     """Strip Unicode control/format characters, truncate to max_len codepoints.
 
     Preserves non-ASCII printable characters (Japanese, Korean, Chinese) — the
@@ -871,35 +937,72 @@ def _get_port_name_from_device(device: dict | None, port: int) -> str:
     return _sanitize_api_string(raw_name, 64) if raw_name else f"Port {port}"
 
 
-def _build_advance_conflict_response(
-    device_id: str, port: int, port_name: str
+async def _build_advance_conflict_response(
+    device_id: str, dev_id: object, port: int, port_name: str
 ) -> str:
-    """Build a structured ADVANCE_AUTOMATION conflict response for write tools.
+    """Build a structured ADVANCE_AUTOMATION conflict response for write tools."""
+    try:
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        automations = _group_automations(raw)
+        governing = next(
+            (a for a in automations if a.get("enabled") or a.get("run_state")),
+            automations[0] if automations else None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not fetch automations for conflict response (device=%s): %s", device_id, exc
+        )
+        governing = None
 
-    The automation management API endpoints are not yet confirmed — automation name
-    and co-governed ports are not available until network capture is done (see Quirk 18
-    in docs/API.md). Returns a fully structured conflict response with all fields present.
-    """
-    summary = (
-        f"{port_name} (Port {port}) is under Advance Automation control. "
-        "Your change requires resolving this conflict first."
-    )
+    if governing:
+        auto_name = governing["name"]
+        auto_id = governing["automation_id"]
+        summary = (
+            f"{port_name} (Port {port}) is governed by \"{auto_name}\"."
+            " Your change requires resolving this conflict first."
+        )
+        opt1: dict = {
+            "description": (
+                f"Disable \"{auto_name}\", lock co-governed ports to their current "
+                "settings, then apply your change."
+            ),
+            "tool": "break_out_of_automation",
+            "instruction": (
+                f"Call break_out_of_automation(device_id='{device_id}', port={port}, "
+                "dry_run=True) to preview this option."
+            ),
+            "available": True,
+        }
+    else:
+        auto_name = None
+        auto_id = None
+        summary = (
+            f"{port_name} (Port {port}) is under Advance Automation control."
+            " Your change requires resolving this conflict first."
+        )
+        opt1 = {
+            "description": "Break the port out of automation and lock co-governed ports.",
+            "tool": "break_out_of_automation",
+            "instruction": (
+                f"Call break_out_of_automation(device_id='{device_id}', port={port}, "
+                "dry_run=True) to preview this option."
+            ),
+            "available": True,
+        }
+
     return json.dumps({
         "conflict": "ADVANCE_AUTOMATION",
         "summary": summary,
         "target_port": f"{port_name} (Port {port})",
-        "automation_name": None,
-        "automation_id": None,
+        "automation_name": auto_name,
+        "automation_id": auto_id,
         "co_governed_ports": [],
         "switching_guidance": (
-            "To manage automations, use the AC Infinity app or provide a network capture "
-            "to enable the automation management tools."
+            "To switch automations: call disable_advance_automation on the current one, "
+            "then enable_advance_automation on the desired one."
         ),
         "options": {
-            "1_break_out_manually": {
-                "available": False,
-                "status": "requires_automation_api_discovery",
-            },
+            "1_break_out_manually": opt1,
             "2_edit_automation": {
                 "available": False,
                 "status": "not_yet_implemented",
@@ -1247,7 +1350,8 @@ async def set_port_speed(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_speed (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
@@ -1330,7 +1434,8 @@ async def set_port_on(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_on (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
@@ -1419,7 +1524,8 @@ async def set_port_off(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_off (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
@@ -1531,7 +1637,8 @@ async def set_vpd_automation(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning(
             "Device error in set_vpd_automation (device=%s port=%s): %s",
@@ -1636,7 +1743,8 @@ async def set_temperature_automation(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning(
             "Device error in set_temperature_automation (device=%s port=%s): %s",
@@ -1740,7 +1848,8 @@ async def set_humidity_automation(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning(
             "Device error in set_humidity_automation (device=%s port=%s): %s",
@@ -1892,7 +2001,8 @@ async def set_port_mode(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_mode (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
@@ -2029,7 +2139,8 @@ async def apply_grow_stage_template(
         return json.dumps({"error": "AC Infinity API error", "detail": "see server logs"})
     except ACInfinityAdvanceConflictError:
         port_name = _get_port_name_from_device(device, port)
-        return _build_advance_conflict_response(device_id, port, port_name)
+        dev_id = device.get("devId") if device else None
+        return await _build_advance_conflict_response(device_id, dev_id, port, port_name)
     except ACInfinityDeviceError as e:
         logger.warning(
             "Device error in apply_grow_stage_template (device=%s port=%s stage=%s): %s",
@@ -2062,6 +2173,877 @@ async def apply_grow_stage_template(
         response["payload"] = write_result["payload"]
 
     return json.dumps(response, indent=2)
+
+
+# ============ Advance Automation Tools ============
+
+
+@mcp_server.tool()
+async def list_advance_automations(device_id: str) -> str:
+    """List all Advance Automations configured on a device.
+
+    Advance Automations (also called "programs" in the AC Infinity app) are
+    named schedules that can govern one or more ports simultaneously.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+
+    Returns:
+        JSON with ``"automations"`` list. Each entry includes automation_id,
+        name, enabled status, and currently_running flag.
+        Empty: ``{"device_id": "...", "automations": []}``.
+        On failure returns ``{"error": "...", "detail": "..."}``.
+    """
+    try:
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        grouped = _group_automations(raw)
+
+        automations = [
+            {
+                "automation_id": g["automation_id"],
+                "name": g["name"],
+                "enabled": g["enabled"],
+                "currently_running": g["run_state"],
+            }
+            for g in grouped
+        ]
+
+        return json.dumps({"device_id": device_id, "automations": automations}, indent=2)
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": "Authentication failed", "detail": "see server logs"})
+    except ACInfinityAPIError:
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in list_advance_automations (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in list_advance_automations: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def get_advance_automation(device_id: str, automation_id: str) -> str:
+    """Get full detail for a single Advance Automation by ID.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        automation_id: The automation_id from list_advance_automations.
+
+    Returns:
+        JSON with automation detail including name, enabled status, port_groups,
+        schedule (if any), run_state, and human_summary.
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        adv_id_int = _validate_automation_id(automation_id)
+        if adv_id_int is None:
+            return json.dumps({"error": "Invalid automation_id format"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        grouped = _group_automations(raw)
+
+        found = next((g for g in grouped if g["automation_id"] == adv_id_int), None)
+        if found is None:
+            return json.dumps({"error": f"Automation {automation_id} not found"})
+
+        # Build human-readable summary.
+        name = found["name"]
+        enabled = found["enabled"]
+        state_str = "enabled" if enabled else "disabled"
+        port_groups = found["port_groups"]
+
+        if len(port_groups) == 1:
+            speed = port_groups[0]["on_speed"]
+            begin_str = _format_schedule_time(found.get("begin_time"))
+            end_str = _format_schedule_time(found.get("end_time"))
+            if begin_str and end_str:
+                schedule_desc = f"from {begin_str} to {end_str}"
+            else:
+                schedule_desc = "with no schedule (always active when enabled)"
+            human_summary = (
+                f"'{name}' runs at speed {speed} {schedule_desc}, "
+                f"currently {state_str}."
+            )
+        else:
+            human_summary = (
+                "This automation has multiple port groups — see port_groups for full detail."
+            )
+
+        begin_disp = _format_schedule_time(found.get("begin_time"))
+        end_disp = _format_schedule_time(found.get("end_time"))
+
+        return json.dumps({
+            "device_id": device_id,
+            "automation_id": found["automation_id"],
+            "name": name,
+            "enabled": enabled,
+            "currently_running": found["run_state"],
+            "schedule": {
+                "begin_time": begin_disp,
+                "end_time": end_disp,
+            },
+            "port_groups": port_groups,
+            "human_summary": human_summary,
+        }, indent=2)
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": "Authentication failed", "detail": "see server logs"})
+    except ACInfinityAPIError:
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in get_advance_automation (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in get_advance_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def enable_advance_automation(
+    device_id: str,
+    automation_id: str,
+    dry_run: bool = True,
+) -> str:
+    """Enable a previously disabled Advance Automation.
+
+    Reads current state before toggling — no-ops if already enabled.
+    Defaults to dry_run=True — set dry_run=False to execute.
+
+    IMPORTANT: The AC Infinity API uses a toggle endpoint (updateGroupsIsOn).
+    This tool reads the current enabled state first and only calls the API if
+    the automation is currently disabled, ensuring the toggle results in enabled.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        automation_id: The automation_id from list_advance_automations.
+        dry_run: If True (default), returns the action plan without executing.
+
+    Returns:
+        JSON with action, automation_name, automation_id, dry_run, sent.
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        adv_id_int = _validate_automation_id(automation_id)
+        if adv_id_int is None:
+            return json.dumps({"error": "Invalid automation_id format"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        grouped = _group_automations(raw)
+
+        found = next((g for g in grouped if g["automation_id"] == adv_id_int), None)
+        if found is None:
+            return json.dumps({"error": f"Automation {automation_id} not found"})
+
+        name = found["name"]
+
+        if found["enabled"]:
+            return json.dumps({
+                "info": f"Automation '{name}' is already enabled. No action taken.",
+                "dry_run": dry_run,
+            })
+
+        if dry_run:
+            return json.dumps({
+                "action": "enable",
+                "automation_name": name,
+                "automation_id": found["automation_id"],
+                "adv_ids_to_toggle": found["adv_ids"],
+                "dry_run": True,
+                "sent": False,
+            })
+
+        # Live: call once with adv_ids[0]. The API's updateGroupsIsOn endpoint
+        # toggles ALL entries sharing the same advName when called with ANY one
+        # of their advId values — calling it N times causes N toggles (a no-op
+        # for even N). One call is the correct behaviour (Fix 1).
+        await asyncio.to_thread(
+            _client().enable_advance_automation, str(dev_id), found["adv_ids"][0]
+        )
+
+        return json.dumps({
+            "action": "enable",
+            "automation_name": name,
+            "automation_id": found["automation_id"],
+            "dry_run": False,
+            "sent": True,
+        })
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": "Authentication failed", "detail": "see server logs"})
+    except ACInfinityAPIError:
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in enable_advance_automation (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in enable_advance_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def disable_advance_automation(
+    device_id: str,
+    automation_id: str,
+    dry_run: bool = True,
+) -> str:
+    """Disable a currently enabled Advance Automation.
+
+    Reads current state before toggling — no-ops if already disabled.
+    Defaults to dry_run=True — set dry_run=False to execute.
+
+    WARNING: Whether disabling reverts ports to a previous state is not yet
+    confirmed (revert_behavior_confirmed=False). Use break_out_of_automation
+    for a controlled handoff that locks co-governed ports to safe manual speeds.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        automation_id: The automation_id from list_advance_automations.
+        dry_run: If True (default), returns the action plan without executing.
+
+    Returns:
+        JSON with action, automation_name, automation_id, revert_behavior_confirmed,
+        dry_run, sent, and to_restore (restore command string).
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        adv_id_int = _validate_automation_id(automation_id)
+        if adv_id_int is None:
+            return json.dumps({"error": "Invalid automation_id format"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        grouped = _group_automations(raw)
+
+        found = next((g for g in grouped if g["automation_id"] == adv_id_int), None)
+        if found is None:
+            return json.dumps({"error": f"Automation {automation_id} not found"})
+
+        name = found["name"]
+        to_restore = (
+            f"Call enable_advance_automation(device_id='{device_id}', "
+            f"automation_id='{automation_id}') to re-enable."
+        )
+
+        if not found["enabled"]:
+            return json.dumps({
+                "info": f"Automation '{name}' is already disabled. No action taken.",
+                "dry_run": dry_run,
+            })
+
+        if dry_run:
+            return json.dumps({
+                "action": "disable",
+                "automation_name": name,
+                "automation_id": found["automation_id"],
+                "revert_behavior_confirmed": ADVANCE_REVERT_BEHAVIOR_CONFIRMED,
+                "adv_ids_to_toggle": found["adv_ids"],
+                "dry_run": True,
+                "sent": False,
+                "to_restore": to_restore,
+            })
+
+        # Live: call once with adv_ids[0]. The API's updateGroupsIsOn endpoint
+        # toggles ALL entries sharing the same advName on a single call —
+        # calling it N times causes N toggles (a no-op for even N). (Fix 1)
+        await asyncio.to_thread(
+            _client().disable_advance_automation, str(dev_id), found["adv_ids"][0]
+        )
+
+        return json.dumps({
+            "action": "disable",
+            "automation_name": name,
+            "automation_id": found["automation_id"],
+            "revert_behavior_confirmed": ADVANCE_REVERT_BEHAVIOR_CONFIRMED,
+            "dry_run": False,
+            "sent": True,
+            "to_restore": to_restore,
+        })
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": "Authentication failed", "detail": "see server logs"})
+    except ACInfinityAPIError:
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in disable_advance_automation (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in disable_advance_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def create_advance_automation(
+    device_id: str,
+    name: str,
+    on_speed: int,
+    off_speed: int = 0,
+    begin_time: int = 0,
+    end_time: int = 1439,
+    dry_run: bool = True,
+) -> str:
+    """Create a new Advance Automation on a device.
+
+    Defaults to dry_run=True — set dry_run=False to create on the device.
+    The automation is enabled immediately after creation (isOn=1).
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        name: Automation name (max 64 chars, control chars stripped).
+        on_speed: Fan speed when automation is active (1–10).
+        off_speed: Fan speed when automation is inactive (0–10). Default: 0.
+        begin_time: Schedule start in minutes since midnight (0–1439, or 255=no schedule).
+            Default: 0 (midnight). Use 255 for "always active".
+        end_time: Schedule end in minutes since midnight (0–1439, or 255=no schedule).
+            Default: 1439 (23:59). Use 255 for "always active".
+        dry_run: If True (default), returns the payload without creating.
+
+    Returns:
+        JSON with action, name, on_speed, dry_run, sent.
+        Live response includes automation_id (server-assigned).
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        # Validate original name before sanitizing so empty input produces an error
+        # rather than the "(unnamed)" fallback (which is reserved for API-returned data).
+        if not (name or "").strip():
+            return json.dumps({"error": "name must not be empty"})
+        clean_name = _sanitize_api_string(name, 64)
+        # If sanitizing stripped all printable content (e.g. only control chars), reject it.
+        if clean_name == "(unnamed)":
+            return json.dumps({"error": "name must not be empty"})
+        if not 1 <= on_speed <= 10:
+            return json.dumps({"error": "on_speed must be 1–10"})
+        if not 0 <= off_speed <= 10:
+            return json.dumps({"error": "off_speed must be 0–10"})
+        if not (0 <= begin_time <= 1439 or begin_time == 255):
+            return json.dumps({"error": "begin_time must be 0–1439 or 255 (no schedule)"})
+        if not (0 <= end_time <= 1439 or end_time == 255):
+            return json.dumps({"error": "end_time must be 0–1439 or 255 (no schedule)"})
+        if begin_time != 255 and end_time != 255 and begin_time > end_time:
+            return json.dumps(
+                {"error": "begin_time must be <= end_time (or both 255 for no schedule)"}
+            )
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        if dry_run:
+            return json.dumps({
+                "action": "create",
+                "name": clean_name,
+                "on_speed": on_speed,
+                "off_speed": off_speed,
+                "begin_time": begin_time,
+                "end_time": end_time,
+                "dry_run": True,
+                "sent": False,
+            })
+
+        # Build full payload with safe defaults from the confirmed network capture.
+        payload: dict = {
+            "advName": clean_name,
+            "devId": str(dev_id),
+            "currentMode": 1,
+            "isOn": 1,
+            "onSpeed": on_speed,
+            "offSpeed": off_speed,
+            "beginTime": begin_time,
+            "endTime": end_time,
+            "groupNums": 9,
+            "sortType": 9,
+            "subNumber": 0,
+            "subNumberSort": 0,
+            "isDel": 0,
+            "isFlag": 1,
+            "returnData": 1,
+            "templateType": 0,
+            "grouptDevType": 4,
+            "portType": 0,
+            "portState": 0,
+            # Threshold defaults (all inactive)
+            "autoHighTempF": 110,
+            "autoLowTempF": 40,
+            "autoHighTempC": 90,
+            "autoLowTempC": 0,
+            "autoHighTempSwitch": 0,
+            "autoLowTempSwitch": 0,
+            "autoHighHumi": 90,
+            "autoLowHumi": 40,
+            "autoHighHumiSwitch": 0,
+            "autoLowHumiSwitch": 0,
+            "highVpd": 99,
+            "lowVpd": 0,
+            "highVpdSwitch": 0,
+            "lowVpdSwitch": 0,
+            "cycleOn": 0,
+            "cycleOff": 0,
+            "onTime": 0,
+            "onTimeSwitch": 0,
+            "switchTime": 255,
+            "dualZoneSwitch": 0,
+            "photocellSwitch": 0,
+            "isOpenDoseTime": 0,
+            "onDoseTime": 60,
+            "offDoseTime": 1,
+            "isOnMinMaxTime": 1,
+            "onMinTime": 0,
+            "onMaxTime": 0,
+            "settingMode": 0,
+            "targetTSwitch": 1,
+            "targetHumiSwitch": 1,
+            "targetVpdSwitch": 1,
+            "targetTemp": 0,
+            "targetTempF": 32,
+            "targetHumi": 0,
+            "targetVpd": 0,
+            "insidePort": 255,
+            "insideType": 15,
+            "outsidePort": 255,
+            "outsideType": 15,
+            "runState": 0,
+            "setSelect": 0,
+            "nameLangKey": "",
+            "remarkLangKey": "",
+        }
+
+        result = await asyncio.to_thread(
+            _client().create_advance_automation, str(dev_id), payload
+        )
+
+        return json.dumps({
+            "action": "create",
+            "automation_id": result.get("advId"),
+            "name": clean_name,
+            "on_speed": on_speed,
+            "dry_run": False,
+            "sent": True,
+        })
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": "Authentication failed", "detail": "see server logs"})
+    except ACInfinityAPIError:
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in create_advance_automation (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in create_advance_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def delete_advance_automation(
+    device_id: str,
+    automation_id: str,
+    dry_run: bool = True,
+) -> str:
+    """Delete an Advance Automation from a device.
+
+    If the automation is currently enabled, it is disabled first before deletion.
+    Defaults to dry_run=True — set dry_run=False to delete.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        automation_id: The automation_id from list_advance_automations.
+        dry_run: If True (default), returns the action plan without executing.
+
+    Returns:
+        JSON with action, automation_name, automation_id, was_enabled, dry_run, sent.
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        adv_id_int = _validate_automation_id(automation_id)
+        if adv_id_int is None:
+            return json.dumps({"error": "Invalid automation_id format"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        grouped = _group_automations(raw)
+
+        found = next((g for g in grouped if g["automation_id"] == adv_id_int), None)
+        if found is None:
+            return json.dumps({"error": f"Automation {automation_id} not found"})
+
+        name = found["name"]
+        was_enabled = found["enabled"]
+
+        if dry_run:
+            return json.dumps({
+                "action": "delete",
+                "automation_name": name,
+                "automation_id": found["automation_id"],
+                "was_enabled": was_enabled,
+                "dry_run": True,
+                "sent": False,
+            })
+
+        # If enabled, disable first with a single toggle call (Fix 1: the API
+        # toggles all same-name entries on one call — N calls cause N toggles).
+        # Then delete each adv_id individually (each entry must be explicitly deleted).
+        if was_enabled:
+            await asyncio.to_thread(
+                _client().disable_advance_automation, str(dev_id), found["adv_ids"][0]
+            )
+
+        for adv_id in found["adv_ids"]:
+            await asyncio.to_thread(
+                _client().delete_advance_automation, str(dev_id), adv_id
+            )
+
+        return json.dumps({
+            "action": "delete",
+            "automation_name": name,
+            "automation_id": found["automation_id"],
+            "was_enabled": was_enabled,
+            "dry_run": False,
+            "sent": True,
+        })
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": "Authentication failed", "detail": "see server logs"})
+    except ACInfinityAPIError:
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in delete_advance_automation (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in delete_advance_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def break_out_of_automation(
+    device_id: str,
+    port: int,
+    dry_run: bool = True,
+    confirm_automation_name: str | None = None,
+) -> str:
+    """Break a port out of Advance Automation control and lock co-governed ports.
+
+    This is the safe way to manually override a port that is currently under
+    Advance Automation. It:
+
+    1. Checks that the port is actually under automation (idempotent: no-ops if not).
+    2. Finds the governing automation.
+    3. Identifies all other ports currently in ADVANCE mode on this device (co-ports).
+       Note: This locks *all* ADVANCE-mode ports on the device, not only those belonging
+       to the governing automation. On devices with multiple active automations all
+       ADVANCE-mode ports will be locked to manual control.
+    4. On dry_run=False:
+       a. Disables the automation.
+       b. Locks each co-port to its current manual speed (prevents unexpected speed changes).
+       c. Leaves the target port free for your manual change.
+
+    Defaults to dry_run=True. For live execution (dry_run=False), you must supply
+    ``confirm_automation_name`` matching the automation name (case-insensitive) as a
+    safety confirmation.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        port: The port number you want to break free (1-based).
+        dry_run: If True (default), returns the execution plan without making changes.
+        confirm_automation_name: Required when dry_run=False — the name of the
+            automation to disable, for safety confirmation.
+
+    Returns:
+        Dry-run: JSON plan with sequence of steps, co_ports_to_lock, estimated_duration.
+        Live: JSON with co_ports_locked and target_port_freed.
+        Idempotent: ``{"info": "Port is not currently under automation control."}``
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if port < 1:
+            return json.dumps({"error": "port must be a positive integer"})
+
+        devices = await asyncio.to_thread(_client().get_devices)
+        device = next((d for d in devices if d.get("devCode") == device_id), None)
+        if not device:
+            return json.dumps({"error": f"Device {device_id} not found"})
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        # Step 0: Idempotency check — is this port actually under automation?
+        port_settings = await asyncio.to_thread(
+            _client().get_mode_settings, dev_id, port
+        )
+        mode_type = port_settings.get("modeType")
+
+        # Get port info from device data for display names.
+        ports_data = device.get("deviceInfo", {}).get("ports", [])
+        port_info = next((p for p in ports_data if p.get("port") == port), None)
+        raw_port_name = port_info.get("portName") if port_info else None
+        port_name = _sanitize_api_string(raw_port_name, 64) if raw_port_name else f"Port {port}"
+
+        if mode_type != _ADVANCE_MODE_TYPE:
+            return json.dumps({
+                "info": (
+                    f"Port {port_name} (Port {port}) is not currently under automation control. "
+                    "No action taken."
+                ),
+            })
+
+        # Step 1: Find governing automation.
+        raw_automations = await asyncio.to_thread(
+            _client().get_advance_automations, str(dev_id)
+        )
+        grouped = _group_automations(raw_automations)
+
+        # Find the first enabled+running automation; fall back to first enabled.
+        automation = next(
+            (g for g in grouped if g["enabled"] and g["run_state"]), None
+        ) or next((g for g in grouped if g["enabled"]), None)
+
+        if automation is None:
+            return json.dumps({
+                "error": (
+                    "Could not identify governing automation. "
+                    "No enabled automations found on this device."
+                ),
+            })
+
+        auto_name = automation["name"]
+        auto_id = automation["automation_id"]
+        adv_ids = automation["adv_ids"]
+
+        # Step 2: Identify co-governed ports — all ports currently under automation
+        # control except the target port.
+        co_ports: list[dict] = []
+        for p_data in ports_data:
+            p_num = p_data.get("port")
+            if p_num is None or p_num == port:
+                continue
+            p_settings = await asyncio.to_thread(_client().get_mode_settings, dev_id, p_num)
+            if p_settings.get("modeType") == _ADVANCE_MODE_TYPE:
+                raw_p_name = p_data.get("portName")
+                p_name = _sanitize_api_string(raw_p_name, 64) if raw_p_name else f"Port {p_num}"
+                current_speed = p_data.get("speak", 0)
+                co_ports.append({
+                    "port": p_num,
+                    "port_name": p_name,
+                    "current_speed": current_speed,
+                })
+
+        # Estimate: 1.5s rate limit per write; 1 disable + len(co_ports) locks.
+        n_writes = 1 + len(co_ports)
+        estimated_duration = round(n_writes * 1.5, 1)
+
+        sequence = [
+            {"step": 1, "action": f"disable automation '{auto_name}'"},
+        ]
+        for i, cp in enumerate(co_ports, start=2):
+            lock_mode = "ON" if cp["current_speed"] > 0 else "OFF"
+            sequence.append({
+                "step": i,
+                "action": (
+                    f"lock {cp['port_name']} (Port {cp['port']}) to "
+                    f"current speed {cp['current_speed']} (manual {lock_mode})"
+                ),
+            })
+        sequence.append({
+            "step": len(sequence) + 1,
+            "action": "target port freed from automation — apply your change manually",
+        })
+
+        if dry_run:
+            return json.dumps({
+                "action": "break_out",
+                "dry_run": True,
+                "automation_name": auto_name,
+                "automation_id": auto_id,
+                "target_port": port,
+                "target_port_name": port_name,
+                "estimated_duration_seconds": estimated_duration,
+                "revert_behavior_confirmed": ADVANCE_REVERT_BEHAVIOR_CONFIRMED,
+                "sequence": sequence,
+                "co_ports_to_lock": [
+                    {
+                        "port_name": cp["port_name"],
+                        "port": cp["port"],
+                        "current_speed": cp["current_speed"],
+                        "lock_mode": "ON" if cp["current_speed"] > 0 else "OFF",
+                    }
+                    for cp in co_ports
+                ],
+            }, indent=2)
+
+        # Live execution.
+        if confirm_automation_name is None:
+            return json.dumps({
+                "error": (
+                    "confirm_automation_name is required when dry_run=False. "
+                    f"Pass confirm_automation_name='{auto_name}' to confirm "
+                    f"you intend to disable automation '{auto_name}'."
+                ),
+            })
+
+        if len(confirm_automation_name) > 256:
+            return json.dumps({"error": "confirm_automation_name is too long (max 256 characters)"})
+
+        if confirm_automation_name.casefold() != auto_name.casefold():
+            safe_confirm = _sanitize_api_string(confirm_automation_name or "", 64)
+            return json.dumps({
+                "error": (
+                    f"confirm_automation_name '{safe_confirm}' does not match "
+                    f"governing automation '{auto_name}'. Re-run with the correct name."
+                ),
+            })
+
+        device_lock = _get_device_lock(device_id)
+        if device_lock.locked():
+            return json.dumps({
+                "conflict": "SEQUENCE_IN_PROGRESS",
+                "device_id": device_id,
+                "message": (
+                    "Another break_out_of_automation is already in progress for this device."
+                ),
+            })
+
+        async with device_lock:
+            # Step A: Disable the automation with a single toggle call (Fix 1: the
+            # API toggles all same-name entries on one call — N calls cause N toggles).
+            try:
+                await asyncio.to_thread(
+                    _client().disable_advance_automation, str(dev_id), adv_ids[0]
+                )
+            except Exception as disable_exc:
+                logger.error(
+                    "break_out_of_automation failed at disable step "
+                    "(device=%s auto=%s): %s", device_id, auto_name, disable_exc,
+                )
+                return json.dumps({
+                    "error": "Failed to disable automation",
+                    "failed_step": "disable_automation",
+                    "detail": "see server logs",
+                })
+
+            # Step B: Lock co-governed ports to their current speeds.
+            co_ports_locked: list[dict] = []
+            failed_port = None
+            for cp in co_ports:
+                cp_num = cp["port"]
+                cp_speed = cp["current_speed"]
+                try:
+                    if cp_speed > 0:
+                        lock_updates = {"atType": 2, "onSpead": cp_speed}  # ON at current speed
+                        lock_mode_str = "ON"
+                    else:
+                        lock_updates = {"atType": 1, "onSpead": 0}  # OFF
+                        lock_mode_str = "OFF"
+                    await asyncio.to_thread(
+                        _client().set_port_mode, device, cp_num, lock_updates, False
+                    )
+                    co_ports_locked.append({
+                        "port_name": cp["port_name"],
+                        "port": cp_num,
+                        "locked_to_speed": cp_speed,
+                        "locked_to_mode": lock_mode_str,
+                    })
+                except Exception as lock_exc:
+                    logger.error(
+                        "break_out_of_automation failed locking port %s "
+                        "(device=%s): %s", cp_num, device_id, lock_exc,
+                    )
+                    failed_port = cp_num
+                    break
+
+            if failed_port is not None:
+                # Attempt rollback: re-enable the automation with a single toggle call
+                # (Fix 1: same API behaviour as disable — one call toggles all entries).
+                rollback_succeeded = False
+                try:
+                    await asyncio.to_thread(
+                        _client().enable_advance_automation, str(dev_id), adv_ids[0]
+                    )
+                    rollback_succeeded = True
+                except Exception as rb_exc:
+                    logger.error(
+                        "break_out_of_automation rollback failed (device=%s): %s",
+                        device_id, rb_exc,
+                    )
+                return json.dumps({
+                    "error": f"Failed to lock co-port {failed_port}",
+                    "failed_step": f"lock_port_{failed_port}",
+                    "rollback_attempted": True,
+                    "rollback_succeeded": rollback_succeeded,
+                    "recovery_steps": [
+                        f"Manually re-enable automation '{auto_name}' via the AC Infinity app.",
+                        "Or call enable_advance_automation to restore automation control.",
+                    ],
+                })
+
+        return json.dumps({
+            "action": "break_out",
+            "dry_run": False,
+            "automation_name": auto_name,
+            "automation_id": auto_id,
+            "co_ports_locked": co_ports_locked,
+            "target_port": port,
+            "target_port_freed": True,
+            "sent": True,
+        }, indent=2)
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": "Authentication failed", "detail": "see server logs"})
+    except ACInfinityAPIError:
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in break_out_of_automation (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in break_out_of_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
 
 
 # ============ MCP Prompts ============

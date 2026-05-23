@@ -10,6 +10,48 @@ This file is the authoritative source for how Claude agents contribute to this r
 - Each phase = one PR. Phases are never bundled.
 - Every issue follows the **4-Stage Issue Workflow Protocol** (see below).
 - No PR is raised until all four stages pass. Any stage failure restarts from Stage 1.
+- **All PRs are created as drafts.** Convert to "ready for review" only after Gate 5 (manual
+  smoke test) is approved by the user. CI runs on draft PRs, so the test gate is not bypassed.
+- **PRs are never merged without explicit user permission.** After Gate 5 approval and all CI
+  gates pass, present the status to the user and wait for them to say "merge" (or equivalent)
+  before running `gh pr merge`.
+- **Before declaring CI green or recommending merge, verify the PR's actual branch state:**
+  Run `gh pr view <N> --json mergeStateStatus,headRefOid,headRefName` and confirm
+  `mergeStateStatus` is `CLEAN` (not `BEHIND` or `DIRTY`), and that `headRefOid` matches the
+  local branch HEAD (`git rev-parse HEAD`). A PR that is `BEHIND` main must be rebased and
+  re-pushed before the all-clear is given. Never report CI passing from a stale run — confirm
+  the run SHA matches the current HEAD SHA.
+
+---
+
+## GitHub Issue Hygiene
+
+Every issue must have **both a label and a milestone** applied before a PR is raised against it.
+When creating a new issue, apply both immediately. When triaging unlabeled or un-milestoned
+issues, audit and update before beginning work.
+
+### Labels
+
+| Label | When to apply |
+|---|---|
+| `bug` | Incorrect behavior in an existing tool |
+| `enhancement` | New feature or capability |
+| `documentation` | Doc-only changes (API.md, README, CLAUDE.md, etc.) |
+| `security` | Security vulnerability or hardening |
+| `usability` | Response wording, field ordering, conflict UX, grower-readable output |
+| `api-discovery` | New API endpoints or fields discovered via network capture or reverse engineering |
+
+### Milestones
+
+| Milestone | When to apply |
+|---|---|
+| `v1.0` | Core feature set — all 25 tools working, Gate 5 smoke-tested |
+| `v1.0-beta` | Pre-release stabilization work |
+| `v2.0` | Post-v1.0 new capabilities |
+| `v2.0-beta` | Pre-v2.0 work |
+
+Default to `v1.0` for any issue that completes or improves existing tool behavior. Use `v2.0`
+only for net-new tools or major architecture changes agreed with the user.
 
 ---
 
@@ -274,6 +316,20 @@ personas until convergence (Cycle N returns 0 findings). The plan caps at
 - `asyncio.to_thread()` for all blocking operations in async context
 - 1.5s rate limit between write API calls (enforced in `client.py`)
 - All write tools support `dry_run=True` parameter
+
+### Usability — IDs are internal, names are user-facing
+
+Never surface raw internal identifiers (`automation_id`, `devId`, port integers used as
+keys, etc.) in user-facing messages. Users do not know these values and cannot act on
+them. Always use the human-readable name from the API response:
+
+- When reporting the result of `create_advance_automation`, reference the automation by
+  `name`, not `automation_id`. The ID is returned in the JSON for programmatic chaining
+  only — do not mention it to the user.
+- When listing automations, present them as a named list. If a follow-up operation
+  requires an ID, resolve it by matching the user's name input against the list.
+- The same rule applies to device IDs and port numbers: prefer "Humidifier (Port 1)"
+  over "port 1" or a raw devId.
 
 ### Bulk replacements
 

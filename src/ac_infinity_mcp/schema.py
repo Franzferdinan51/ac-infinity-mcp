@@ -66,13 +66,11 @@ class ACIReading:
 # Writing to a port in this mode returns API code 999999.
 _ADVANCE_MODE_TYPE: int = 15
 
-# Tracks whether the revert-on-disable behaviour of Advance Automations has
-# been confirmed against the live API. Set to True once a live test confirms
-# that disabling an automation does NOT revert ports to a previous state.
-# Used in disable_advance_automation and break_out_of_automation tool responses
-# to surface the uncertainty to the operator.
-# TODO(gate-6): update to True after live test confirms revert behavior.
-ADVANCE_REVERT_BEHAVIOR_CONFIRMED: bool = False
+# Live-tested (2026-05-22): disabling an Advance Automation sets governed ports
+# to OFF (mode=OFF, power_level=0); re-enabling immediately restores them to
+# ADVANCE mode at the automation-defined speeds — no next-trigger wait required.
+# Used in disable_advance_automation and break_out_of_automation tool responses.
+ADVANCE_REVERT_BEHAVIOR_CONFIRMED: bool = True
 
 
 def calculate_vpd(temp_c: float, humidity: float) -> float:

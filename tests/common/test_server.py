@@ -3758,7 +3758,7 @@ async def test_disable_advance_automation_dry_run(mock_client):
     assert data["sent"] is False
     assert data["action"] == "disable"
     assert "revert_behavior_confirmed" in data
-    assert data["revert_behavior_confirmed"] is False
+    assert data["revert_behavior_confirmed"] is True
     assert "to_restore" in data
     mock_client.disable_advance_automation.assert_not_called()
 

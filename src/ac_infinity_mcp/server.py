@@ -218,6 +218,7 @@ def _group_automations(raw_entries: list[dict]) -> list[dict]:
             "run_state": bool(entries[0].get("runState", 0)),
             "begin_time": entries[0].get("beginTime"),
             "end_time": entries[0].get("endTime"),
+            "on_time_switch": entries[0].get("onTimeSwitch", 0),
         })
     return result
 
@@ -2348,12 +2349,16 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
         automation_id: The automation_id from list_advance_automations.
 
     Returns:
-        JSON with automation detail including name, enabled status, schedule,
+        JSON with automation detail including name, enabled status, schedule
+        (with ``mode``: ``"continuous"`` or ``"scheduled"`` per Quirk 21;
+        ``begin_time``/``end_time`` as ``"HH:MM"`` or ``null``; optional
+        ``schedule_note`` when scheduled mode has no time window configured),
         port_groups (with human-readable device_type label per group),
         governed_ports (list of ports this automation controls, resolved from
         devInfoListAll isOpenAutomation flags), port_resolution status
         ("resolved", "multiple_automations_ambiguous", or "error"), and
-        human_summary. On failure returns ``{"error": "..."}``.
+        human_summary (adapts to continuous/scheduled/no-window variants).
+        On failure returns ``{"error": "..."}``.
     """
     try:
         adv_id_int = _validate_automation_id(automation_id)
@@ -2428,19 +2433,31 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
             port_resolution = "error"
 
         # Build human-readable summary.
+        # onTimeSwitch=0 means the "Continuous 24H/7D" toggle is OFF — the time window
+        # applies when real begin/end times are present.
+        # onTimeSwitch=1 means the toggle is ON — runs 24/7 regardless of time values.
+        on_time_switch = found.get("on_time_switch", 0)
         begin_str = _format_schedule_time(found.get("begin_time"))
         end_str = _format_schedule_time(found.get("end_time"))
-        if begin_str and end_str:
-            schedule_desc = f"from {begin_str} to {end_str}"
-        else:
-            schedule_desc = "with no schedule (always active when enabled)"
+
+        # Scheduled only when toggle is OFF (0) and both formatted times are real values.
+        is_scheduled = on_time_switch == 0 and bool(begin_str) and bool(end_str)
+        if not is_scheduled:
+            begin_str = None
+            end_str = None
 
         if len(port_groups) == 1:
             speed = port_groups[0]["on_speed"]
-            human_summary = (
-                f"'{name}' runs at speed {speed} {schedule_desc}, "
-                f"currently {state_str}."
-            )
+            if is_scheduled and begin_str and end_str:
+                human_summary = (
+                    f"'{name}' runs at speed {speed} from {begin_str} to {end_str}, "
+                    f"currently {state_str}."
+                )
+            else:
+                human_summary = (
+                    f"'{name}' runs continuously at speed {speed}, "
+                    f"currently {state_str}."
+                )
         elif port_resolution == "multiple_automations_ambiguous":
             human_summary = (
                 f"'{name}' is configured across multiple ports at varying speeds. "
@@ -2454,11 +2471,19 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
                 if governed_ports
                 else "multiple ports"
             )
-            schedule_suffix = f" from {begin_str} to {end_str}" if begin_str and end_str else ""
+            schedule_suffix = (
+                f" from {begin_str} to {end_str}" if is_scheduled and begin_str and end_str else ""
+            )
             human_summary = (
                 f"'{name}' controls {port_list_str} at varying speeds.{schedule_suffix}"
                 f" Currently {state_str}."
             )
+
+        schedule_dict: dict[str, str | None] = {
+            "mode": "scheduled" if is_scheduled else "continuous",
+            "begin_time": begin_str,
+            "end_time": end_str,
+        }
 
         return json.dumps({
             "device_id": device_id,
@@ -2466,10 +2491,7 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
             "name": name,
             "enabled": enabled,
             "currently_running": found["run_state"],
-            "schedule": {
-                "begin_time": _format_schedule_time(found.get("begin_time")),
-                "end_time": _format_schedule_time(found.get("end_time")),
-            },
+            "schedule": schedule_dict,
             "port_groups": port_groups_out,
             "governed_ports": governed_ports,
             "port_resolution": port_resolution,

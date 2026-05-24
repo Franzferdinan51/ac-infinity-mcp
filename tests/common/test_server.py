@@ -4405,7 +4405,6 @@ async def test_conflict_response_option_1_is_break_out(mock_client):
     [
         (1, 1),  # enabled=True, run_state=True → available True (normal case)
         (0, 1),  # enabled=False, run_state=True → available True (Issue #84 bug case)
-        (1, 0),  # enabled=True, run_state=False → available True
     ],
 )
 @pytest.mark.asyncio
@@ -4539,8 +4538,25 @@ async def test_break_out_no_enabled_automation(mock_client):
         result = await break_out_of_automation("C58ZA", port=1, dry_run=True)
     data = json.loads(result)
     assert "error" in data
-    assert "enabled" in data["error"].lower()
+    assert "No enabled or actively running" in data["error"]
     mock_client.disable_advance_automation.assert_not_called()
+
+
+async def test_break_out_selects_run_state_only_automation(mock_client):
+    """Port is ADVANCE; isOn=0 but runState=1 (mid-toggle) → run_state-only fallback selects."""
+    fixture = copy.deepcopy(MOCK_ADVANCE_AUTOMATIONS_LIST)
+    fixture[0]["isOn"] = 0
+    fixture[0]["runState"] = 1
+    fixture[1]["isOn"] = 0
+    fixture[1]["runState"] = 1
+    mock_client.get_mode_settings.return_value = {"modeType": _ADVANCE_MODE_TYPE, "onSpead": 2}
+    mock_client.get_advance_automations.return_value = fixture
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await break_out_of_automation("C58ZA", port=1, dry_run=True)
+    data = json.loads(result)
+    assert data.get("action") == "break_out"
+    assert "sequence" in data
+    assert data.get("automation_name") == "Moderate Airflow"
 
 
 async def test_break_out_disable_fails_rolls_back(mock_client):

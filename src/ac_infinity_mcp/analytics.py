@@ -5,6 +5,7 @@ Pure functions — no API calls. All data comes from client.py responses.
 
 from __future__ import annotations
 
+import re
 import statistics
 from dataclasses import dataclass
 from datetime import datetime
@@ -50,7 +51,7 @@ class ActivityReport:
     transitions: int
     avg_speed_when_running: float
     uptime_pct: float
-    peak_hour_utc: int
+    peak_hour_utc: int | None = None
 
 
 def _range_score(value: float, low: float, high: float) -> float:
@@ -208,12 +209,20 @@ def detect_trends(readings: list[dict[str, Any]], days: int) -> list[TrendReport
     return reports
 
 
-def build_activity_report(readings: list[dict[str, Any]]) -> list[ActivityReport]:
+def build_activity_report(
+    readings: list[dict[str, Any]],
+    days: int = 1,
+    port_loads: dict[int, int] | None = None,
+) -> list[ActivityReport]:
     """Build per-port runtime activity report from parsed history readings.
 
     Each reading is treated as one equal time slice.
-    on_hours/off_hours are expressed as a fraction of a 24-hour day.
+    on_hours/off_hours are cumulative hours over the full ``days`` window.
     """
+    days = max(days, 1)  # defense-in-depth: prevents ZeroDivisionError in Rule B
+    if not port_loads:
+        # normalizes {} to None — empty dict would enable Rule A with all-zero defaults
+        port_loads = None
     if not readings:
         return []
 
@@ -262,10 +271,9 @@ def build_activity_report(readings: list[dict[str, Any]]) -> list[ActivityReport
             continue
 
         on_count = sum(1 for f in pd["on_flags"] if f)
-        off_count = total - on_count
 
-        on_hours = round(on_count / total * 24, 2)
-        off_hours = round(off_count / total * 24, 2)
+        on_hours = round(on_count / total * 24 * days, 2)
+        off_hours = round(days * 24 - on_hours, 2)
 
         running_speeds = [s for s, f in zip(pd["speeds"], pd["on_flags"]) if f and s > 0]
         avg_speed = round(sum(running_speeds) / len(running_speeds), 2) if running_speeds else 0.0
@@ -276,7 +284,7 @@ def build_activity_report(readings: list[dict[str, Any]]) -> list[ActivityReport
         for h in pd["hours"]:
             if h is not None:
                 hour_counts[h] = hour_counts.get(h, 0) + 1
-        peak_hour_utc = max(hour_counts, key=lambda k: hour_counts[k]) if hour_counts else 0
+        peak_hour_utc = max(hour_counts, key=hour_counts.get) if hour_counts else None  # type: ignore[arg-type]
 
         reports.append(
             ActivityReport(
@@ -291,4 +299,18 @@ def build_activity_report(readings: list[dict[str, Any]]) -> list[ActivityReport
             )
         )
 
-    return reports
+    filtered: list[ActivityReport] = []
+    for rep in reports:
+        # Rule A: constant-100%-uptime ghost port with no current draw
+        if (
+            rep.transitions == 0
+            and rep.uptime_pct == 100.0
+            and port_loads is not None
+            and port_loads.get(rep.port, 0) == 0
+        ):
+            continue
+        # Rule B: auto-named port with < 1 hour/day average activity
+        if re.match(r"^Port \d+$", str(rep.name)) and (rep.on_hours / days) < 1.0:
+            continue
+        filtered.append(rep)
+    return filtered

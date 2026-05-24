@@ -272,7 +272,7 @@ def test_build_activity_report_always_on():
         }
         for h in range(10)
     ]
-    result = build_activity_report(readings)
+    result = build_activity_report(readings, port_loads={1: 5})
     assert len(result) == 1
     assert result[0].uptime_pct == 100.0
     assert result[0].off_hours == 0.0
@@ -320,7 +320,7 @@ def test_build_activity_report_avg_speed():
         }
         for h in range(4)
     ]
-    result = build_activity_report(readings)
+    result = build_activity_report(readings, port_loads={1: 5})
     assert result[0].avg_speed_when_running == 5.0
 
 
@@ -334,7 +334,7 @@ def test_build_activity_report_peak_hour_utc():
             "humidity": 60.0, "vpd": 1.24,
             "ports": [_port(1, "Fan", 5, True)],
         })
-    result = build_activity_report(readings)
+    result = build_activity_report(readings, port_loads={1: 5})
     assert result[0].peak_hour_utc == 14
 
 
@@ -353,7 +353,7 @@ def test_build_activity_report_multiple_ports():
         }
         for h in range(5)
     ]
-    result = build_activity_report(readings)
+    result = build_activity_report(readings, port_loads={1: 5, 2: 5})
     assert len(result) == 4
     assert [r.port for r in result] == [1, 2, 3, 4]
 
@@ -458,3 +458,226 @@ def test_activity_report_skips_port_with_zero_total_readings():
     # Edge case: empty readings list yields no reports
     result = build_activity_report([])
     assert result == []
+
+
+# ============ build_activity_report — days param and peak_hour_utc fixes (#57 #58) ============
+
+def _port_readings_for_days(on_count: int, off_count: int) -> list[dict]:
+    """Generate a flat list of on/off port readings with sequential timestamps."""
+    readings = []
+    for i in range(on_count):
+        readings.append({
+            "timestamp": _ts(i % 24, day=25 + i // 24),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5, True)],
+        })
+    for i in range(off_count):
+        readings.append({
+            "timestamp": _ts(i % 24, day=25 + (on_count + i) // 24),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 0, False)],
+        })
+    return readings
+
+
+def test_build_activity_report_days_param_scales_on_hours():
+    """50% uptime over 3 days → on_hours = 36.0 (not 12.0)."""
+    # 3 days = 72 hours total; 50% uptime → 36 on-hours
+    # Use equal on/off counts to achieve exactly 50%
+    on_count = 12
+    off_count = 12
+    readings = _port_readings_for_days(on_count, off_count)
+    result = build_activity_report(readings, days=3)
+    assert len(result) == 1
+    assert result[0].on_hours == pytest.approx(36.0)
+    assert result[0].uptime_pct == 50.0
+
+
+def test_build_activity_report_peak_hour_detected_correctly():
+    """peak_hour_utc returns the UTC hour with the most ON readings."""
+    readings = []
+    # Hour 14 has 3 on-readings; hour 10 and 18 each have 1
+    for h in [10, 14, 14, 14, 18]:
+        readings.append({
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5, True)],
+        })
+    result = build_activity_report(readings, days=1)
+    assert len(result) == 1
+    assert result[0].peak_hour_utc == 14
+
+
+def test_build_activity_report_peak_hour_none_when_never_ran():
+    """All-off readings → peak_hour_utc is None (not 0)."""
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 0, False)],
+        }
+        for h in range(10)
+    ]
+    result = build_activity_report(readings, days=1)
+    assert len(result) == 1
+    assert result[0].peak_hour_utc is None
+
+
+def test_build_activity_report_on_off_hours_complement():
+    """on_hours + off_hours == days * 24; on_hours magnitude is correct (70% of 72h)."""
+    readings = _port_readings_for_days(on_count=7, off_count=3)
+    days = 3
+    result = build_activity_report(readings, days=days)
+    assert len(result) == 1
+    assert result[0].on_hours == pytest.approx(50.4)  # 7/10 * 24 * 3
+    total = result[0].on_hours + result[0].off_hours
+    assert total == pytest.approx(days * 24)
+
+
+def test_build_activity_report_single_day_unchanged():
+    """days=1 (default) matches the original per-day behavior (regression guard)."""
+    # 100% uptime → on_hours should be 24.0 for a single day
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Fan", 5, True)],
+        }
+        for h in range(24)
+    ]
+    result = build_activity_report(readings, days=1)
+    assert len(result) == 1
+    assert result[0].on_hours == pytest.approx(24.0)
+    assert result[0].off_hours == pytest.approx(0.0)
+    assert result[0].uptime_pct == 100.0
+
+
+# ---- Issue #86: ghost port filter tests ----
+
+def test_build_activity_report_rule_a_excludes_ghost_constant() -> None:
+    """Rule A: port with 0 transitions, 100% uptime, portsLoad=0 is excluded."""
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Port 1", 5, True)],
+        }
+        for h in range(24)
+    ]
+    result = build_activity_report(readings, days=1, port_loads={1: 0})
+    assert len(result) == 0
+
+
+@pytest.mark.parametrize(
+    "on_pattern,port_loads,expected_excluded",
+    [
+        # All on: 0 transitions, 100% uptime, load=0 → excluded
+        ([True] * 24, {1: 0}, True),
+        # One off at end: 1 transition, <100% uptime, load=0 → NOT excluded (has transition)
+        ([True] * 23 + [False], {1: 0}, False),
+        # All on, load > 0 → NOT excluded
+        ([True] * 24, {1: 5}, False),
+        # All on, port_loads=None → Rule A disabled → NOT excluded
+        ([True] * 24, None, False),
+        # All on, port_loads={} → normalized to None → NOT excluded
+        ([True] * 24, {}, False),
+    ],
+)
+def test_build_activity_report_rule_a_boundary(
+    on_pattern: list[bool],
+    port_loads: "dict[int, int] | None",
+    expected_excluded: bool,
+) -> None:
+    """Rule A boundary: all four conditions must be met for exclusion."""
+    readings = [
+        {
+            "timestamp": _ts(i % 24, day=25 + i // 24),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Port 1", 5 if on else 0, on)],
+        }
+        for i, on in enumerate(on_pattern)
+    ]
+    result = build_activity_report(readings, days=1, port_loads=port_loads)
+    if expected_excluded:
+        assert len(result) == 0
+    else:
+        assert len(result) == 1
+
+
+def test_build_activity_report_rule_b_excludes_low_activity_auto_named() -> None:
+    """Rule B: auto-named 'Port N' with < 1 hour/day average is excluded."""
+    # 2 on readings out of 72 total, days=3: on_hours/days = (2/72*24*3)/3 = 0.67 < 1.0
+    readings = (
+        [
+            {
+                "timestamp": _ts(i % 24, day=25 + i // 24),
+                "temperature_c": 24.0, "temperature_f": 75.2,
+                "humidity": 60.0, "vpd": 1.24,
+                "ports": [_port(1, "Port 1", 5, True)],
+            }
+            for i in range(2)
+        ]
+        + [
+            {
+                "timestamp": _ts(i % 24, day=25 + (i + 2) // 24),
+                "temperature_c": 24.0, "temperature_f": 75.2,
+                "humidity": 60.0, "vpd": 1.24,
+                "ports": [_port(1, "Port 1", 0, False)],
+            }
+            for i in range(70)
+        ]
+    )
+    result = build_activity_report(readings, days=3)
+    assert len(result) == 0
+
+
+def test_build_activity_report_rule_b_does_not_exclude_user_named() -> None:
+    """Rule B must not exclude a user-named port (name != 'Port N' pattern)."""
+    # Same low-activity scenario but with a custom name → should NOT be excluded
+    readings = (
+        [
+            {
+                "timestamp": _ts(i % 24, day=25 + i // 24),
+                "temperature_c": 24.0, "temperature_f": 75.2,
+                "humidity": 60.0, "vpd": 1.24,
+                "ports": [_port(1, "Humidifier", 5, True)],
+            }
+            for i in range(2)
+        ]
+        + [
+            {
+                "timestamp": _ts(i % 24, day=25 + (i + 2) // 24),
+                "temperature_c": 24.0, "temperature_f": 75.2,
+                "humidity": 60.0, "vpd": 1.24,
+                "ports": [_port(1, "Humidifier", 0, False)],
+            }
+            for i in range(70)
+        ]
+    )
+    result = build_activity_report(readings, days=3)
+    assert len(result) == 1
+    assert result[0].name == "Humidifier"
+
+
+def test_build_activity_report_empty_port_loads_normalized() -> None:
+    """port_loads={} is normalized to None so Rule A is disabled (no false exclusions)."""
+    readings = [
+        {
+            "timestamp": _ts(h),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(1, "Port 1", 5, True)],
+        }
+        for h in range(24)
+    ]
+    # port_loads={} means we don't have load data — Rule A must be disabled
+    result = build_activity_report(readings, days=1, port_loads={})
+    # Port 1 with 100% uptime and 0 transitions but port_loads={} → NOT excluded
+    assert len(result) == 1

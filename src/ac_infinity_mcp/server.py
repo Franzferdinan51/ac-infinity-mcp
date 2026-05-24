@@ -1204,8 +1204,10 @@ async def _build_advance_conflict_response(
 ) -> str:
     """Build a structured ADVANCE_AUTOMATION conflict response for write tools.
 
-    Three paths depending on the secondary automation lookup result:
+    Four paths depending on the secondary automation lookup result:
 
+    - **Auth-error path** (secondary lookup raises ``ACInfinityAuthError``): returns
+      auth error JSON immediately; credential expiry must be resolved before conflict UX.
     - **Normal path** (governing automation found and enabled): option key
       ``"1_break_out"`` pointing to ``break_out_of_automation``; option key
       ``"2_disable_automation"`` pointing to ``disable_advance_automation``.
@@ -1232,6 +1234,14 @@ async def _build_advance_conflict_response(
             {"name": a["name"], "automation_id": a["automation_id"]}
             for a in automations if a.get("enabled") or a.get("run_state")
         ]
+    except ACInfinityAuthError:
+        logger.warning(
+            "Auth error in _build_advance_conflict_response (device=%s)", device_id
+        )
+        return json.dumps({
+            "error": "Authentication failed — check AC_INFINITY_EMAIL and AC_INFINITY_PASSWORD",
+            "detail": "see server logs",
+        })
     except Exception as exc:
         logger.warning(
             "Could not fetch automations for conflict response (device=%s): %s",

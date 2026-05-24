@@ -858,7 +858,7 @@ def test_rule_c_fires_for_named_port_not_caught_by_rule_b() -> None:
     assert len(result) == 0  # Rule D excluded it
 
 
-def test_rule_a_b_c_together_multi_port_scenario() -> None:
+def test_rule_a_b_c_d_e_together_multi_port_scenario() -> None:
     """Multi-port: each rule catches a distinct port; only 'Exhaust Fan' survives.
 
     Uses 48 readings (days=2) so that h==0 in 24-reading blocks gives 2 on-readings
@@ -868,12 +868,18 @@ def test_rule_a_b_c_together_multi_port_scenario() -> None:
     # Rule A candidate: Port 2 — 100% uptime, 0 transitions, load=0
     # Rule B candidate: Port 3 — auto-named "Port 3", < 1 h/day (low on-time guard)
     # Rule C candidate: Port 4 — named "Misting Pump", zero load, < 1 h/day
+    # Rule D candidate: Port 4 "Misting Pump" catches speed=1 case; see below
+    # Rule E candidate: Port 5 — named "Carbon", speed=5 stale config,
+    #   transitions>0, load=0, sub-threshold
     # Survivor: Port 1 — named "Exhaust Fan", load=5, meaningful uptime
     days = 2
     total_readings = 48
     readings = []
     for i in range(total_readings):
         h = i % 24
+        # Port 5 "Carbon": 1 on reading, then off — speed=5 stale config, transitions=1
+        carbon_on = i == 0  # only first reading on
+        carbon_speed = 5 if carbon_on else 0
         readings.append({
             "timestamp": _ts(h, day=25 + i // 24),
             "temperature_c": 24.0, "temperature_f": 75.2,
@@ -883,9 +889,10 @@ def test_rule_a_b_c_together_multi_port_scenario() -> None:
                 _port(2, "Port 2", 5, True),                   # Rule A: 100% uptime, load=0
                 _port(3, "Port 3", 5 if i == 0 else 0, i == 0),  # Rule B: 1/48*24*2/2=0.5 h/day
                 _port(4, "Misting Pump", 1 if i == 0 else 0, i == 0),  # Rule D: speed=1, load=0
+                _port(5, "Carbon", carbon_speed, carbon_on),   # Rule E: speed=5, load=0
             ],
         })
-    port_loads = {1: 5, 2: 0, 3: 0, 4: 0}
+    port_loads = {1: 5, 2: 0, 3: 0, 4: 0, 5: 0}
     result = build_activity_report(readings, days=days, port_loads=port_loads)
     assert len(result) == 1
     assert result[0].name == "Exhaust Fan"
@@ -899,9 +906,13 @@ def test_rule_a_b_c_together_multi_port_scenario() -> None:
     (0,  24, 1, 0, 1, 0, "zero runtime → excluded"),              # Rule C fires (transitions=0)
     (1,  48, 1, 0, 1, 0, "toggle 0.5 h/day, no load → excluded"), # Rule D fires (speed=1, load=0)
     (1,  30, 1, 0, 1, 0, "toggle 0.8 h/day, no load → excluded"), # Rule D fires (speed=1, load=0)
-    (1,  24, 1, 0, 5, 1, "real fan 1.0 h/day, no load → kept"),   # speed=5 → Rule D skips
+    (1,  24, 1, 0, 5, 1, "real fan 1.0 h/day → kept (at Rule E boundary)"),  # strict < not <=
     (2,  24, 1, 0, 5, 1, "real fan 2.0 h/day, no load → kept"),   # speed=5 → Rule D skips
     (1,  48, 1, 5, 5, 1, "0.5 h/day but has load → kept"),        # load>0 → all rules skip
+    # Rule E: named port, speed=5 stale config, transitions=1, load=0, sub-threshold runtime
+    # on_count=1 out of 48, days=3 → on_hours = 1/48*24*3 = 1.5h; 1.5/3 = 0.5 h/day < 1.0
+    # transitions>0 (1 on→off = 1 transition); speed=5 → Rule D skips; Rule E fires
+    (1,  48, 3, 0, 5, 0, "stale speed=5, load=0, 0.5 h/day → excluded by Rule E"),
 ])
 def test_rule_c_threshold_boundary_named_port(
     on_count: int, total: int, days: int, port_load: int, speed: int,
@@ -1063,21 +1074,44 @@ def test_rule_d_exempts_toggle_hardware_currently_off():
     assert result[0].data_quality == "api_constant_speed"
 
 
-def test_rule_d_filters_toggle_hardware_with_artifact_transitions():
-    """Toggle hardware with spurious transitions (API co-runs with other ports) is filtered.
+def test_rule_d_keeps_toggle_hardware_with_genuine_transitions():
+    """Confirmed toggle hardware (loadType=4) with transitions > 0 is kept by Rule D, not dropped.
 
-    Real scenario: heater/humidifier ports emit speed=1 ghost readings whenever any other
-    port on the device runs — creating transitions>0 and sub-100% uptime.  These ports have
-    no actual load and must be filtered, not preserved.
+    Rule D is exempt for confirmed toggle hardware that ran — the grower should see the data.
+    The data_quality early-exit handles the 100%-uptime constant-speed artifact; any toggle
+    port with transitions > 0 (an actual on→off cycle) is a genuine runner.
+    Gate 5 (PR #114, Issue #101): Heater ran 2+ days then turned off; Rule D was incorrectly
+    dropping it because avg_speed=1.0 (expected for toggle hardware) and portsLoad=0 (now off).
     """
-    # 4 on readings then 68 off — produces transitions=2, uptime<100%, avg_speed=1.0
+    # 4 on readings then 68 off — transitions=1, uptime<100%, avg_speed=1.0
     readings = _toggle_readings(speed=1, on=True, count=4) + _toggle_readings(
         speed=0, on=False, count=68
     )
     result = build_activity_report(
         readings, days=3, port_loads={2: 0}, port_load_types={2: 4}
     )
-    assert len(result) == 0, "Toggle ghost with artifact transitions must be filtered by Rule D"
+    assert len(result) == 1, "Confirmed toggle hardware with transitions>0 must survive Rule D"
+    assert result[0].data_quality is None  # ran briefly but not the constant-speed artifact
+
+
+def test_rule_d_keeps_genuine_toggle_runner_currently_off():
+    """Toggle hardware (loadType=4) that ran significantly and is now off is kept.
+
+    Regression for Gate 5 T4 (PR #114 / Issue #101): Heater ran ~2.5 days in a 7-day
+    window (transitions=1, on_hours≈60h, avg_speed=1.0), then portsLoad dropped to 0.
+    Rule D must not silently discard it — the grower needs to see the runtime data.
+    Simulated with 60 on + 108 off out of 168 total readings over 7 days.
+    """
+    readings = _toggle_readings(speed=1, on=True, count=60) + _toggle_readings(
+        speed=0, on=False, count=108
+    )
+    result = build_activity_report(
+        readings, days=7, port_loads={2: 0}, port_load_types={2: 4}
+    )
+    assert len(result) == 1, "Toggle hardware with significant runtime must survive Rule D"
+    assert result[0].name == "Heater"
+    assert result[0].transitions == 1
+    assert result[0].data_quality is None
 
 
 def test_rule_d_still_filters_non_toggle_ghost_ports():
@@ -1097,3 +1131,88 @@ def test_data_quality_none_when_port_load_types_not_provided():
     )
     assert len(result) == 1
     assert result[0].data_quality is None
+
+
+# ============ Rule E tests (#101) — stale configured speed phantom ============
+
+def _filter_port_readings(
+    port_num: int,
+    name: str,
+    speed: int,
+    on_count: int,
+    total: int,
+    days: int,
+) -> list[dict]:
+    """Build readings for a named port: on_count on-readings (speed) then off."""
+    off_count = total - on_count
+    readings = []
+    for i in range(on_count):
+        readings.append({
+            "timestamp": _ts(i % 24, day=25 + i // 24),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(port_num, name, speed, True)],
+        })
+    for i in range(off_count):
+        readings.append({
+            "timestamp": _ts(i % 24, day=25 + (on_count + i) // 24),
+            "temperature_c": 24.0, "temperature_f": 75.2,
+            "humidity": 60.0, "vpd": 1.24,
+            "ports": [_port(port_num, name, 0, False)],
+        })
+    return readings
+
+
+def test_rule_e_filters_stale_config_speed_phantom() -> None:
+    """Exact Issue #101 reproduction: Filter (Port 4), speed=5, load=0, sub-threshold.
+
+    4 on-readings out of 288 total over 3 days:
+      on_hours = 4/288 * 24 * 3 = 1.0 h; 1.0/3 = 0.333 h/day < 1.0 threshold.
+    avg_speed = 5.0 > 1.0 → Rule D skips. transitions=2 > 0 → Rule C skips.
+    port_loads={4: 0} → Rule E fires.
+    """
+    readings = _filter_port_readings(4, "Filter", speed=5, on_count=4, total=288, days=3)
+    result = build_activity_report(readings, days=3, port_loads={4: 0})
+    assert len(result) == 0, "Stale-speed phantom port must be filtered by Rule E"
+
+
+def test_rule_e_does_not_filter_above_threshold() -> None:
+    """Port with same stale speed=5 and zero load is kept when runtime exceeds 1 h/day.
+
+    216 on-readings out of 288 total over 3 days:
+      on_hours = 216/288 * 24 * 3 = 54.0 h; 54.0/3 = 18.0 h/day >> 1.0 threshold.
+    Rule E sub-threshold guard does not fire → port is kept.
+    """
+    readings = _filter_port_readings(4, "Filter", speed=5, on_count=216, total=288, days=3)
+    result = build_activity_report(readings, days=3, port_loads={4: 0})
+    assert len(result) == 1, "Port with sufficient runtime must not be filtered by Rule E"
+    assert result[0].name == "Filter"
+
+
+def test_rule_e_does_not_filter_port_with_load() -> None:
+    """Rule E must not fire when portsLoad > 0, even with sub-threshold runtime and speed=5."""
+    readings = _filter_port_readings(4, "Filter", speed=5, on_count=4, total=288, days=3)
+    result = build_activity_report(readings, days=3, port_loads={4: 10})
+    assert len(result) == 1, "Port with non-zero load must not be filtered by Rule E"
+    assert result[0].name == "Filter"
+
+
+def test_rule_e_does_not_fire_when_port_loads_none() -> None:
+    """Rule E is disabled when port_loads is None (supplementary call failed)."""
+    readings = _filter_port_readings(4, "Filter", speed=5, on_count=4, total=288, days=3)
+    result = build_activity_report(readings, days=3, port_loads=None)
+    assert len(result) == 1, "Rule E must be disabled when port_loads is None"
+    assert result[0].name == "Filter"
+
+
+def test_rule_d_handles_toggle_speed_before_rule_e_is_reached() -> None:
+    """Rule D regression guard: avg_speed=1.0 with load=0 is caught by Rule D, not Rule E.
+
+    Port "Misting Pump" with avg_speed=1.0 (toggle-nibble artifact), sub-threshold runtime,
+    and port_loads=0 must be excluded by Rule D. Rule E's avg_speed>1.0 condition is false,
+    so Rule E never evaluates this port. This test documents that avg_speed<=1.0 is owned
+    by Rule D.
+    """
+    readings = _filter_port_readings(4, "Misting Pump", speed=1, on_count=4, total=288, days=3)
+    result = build_activity_report(readings, days=3, port_loads={4: 0})
+    assert len(result) == 0, "avg_speed=1.0 port with zero load must be filtered by Rule D"

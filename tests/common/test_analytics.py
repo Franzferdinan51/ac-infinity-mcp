@@ -953,3 +953,147 @@ def test_calculate_health_score_missing_keys_default_to_zero():
     assert result.temperature_f == 0.0
     assert result.humidity_pct == 0.0
     assert result.vpd_kpa == 0.0
+
+
+# ============ data_quality — toggle-device history artifact detection (#85) ============
+
+
+def _toggle_readings(
+    name: str = "Heater",
+    port_num: int = 2,
+    speed: int = 1,
+    on: bool = True,
+    count: int = 72,
+) -> list[dict]:
+    return [
+        {
+            "timestamp": _ts(i % 24, day=25 + i // 24),
+            "temperature_c": 22.0, "temperature_f": 71.6,
+            "humidity": 55.0, "vpd": 1.2,
+            "ports": [_port(port_num, name, speed, on)],
+        }
+        for i in range(count)
+    ]
+
+
+def test_data_quality_api_constant_speed_toggle_hardware():
+    """Heater with loadType=4, transitions=0, uptime=100%, all speed=1 → data_quality set."""
+    readings = _toggle_readings(speed=1, on=True)
+    result = build_activity_report(
+        readings, days=3, port_loads={2: 5}, port_load_types={2: 4}
+    )
+    assert len(result) == 1
+    assert result[0].data_quality == "api_constant_speed"
+
+
+def test_data_quality_api_constant_speed_loadtype_128():
+    """loadType=128 (toggle hardware variant) also triggers data_quality flag."""
+    readings = _toggle_readings(speed=1, on=True)
+    result = build_activity_report(
+        readings, days=3, port_loads={2: 5}, port_load_types={2: 128}
+    )
+    assert len(result) == 1
+    assert result[0].data_quality == "api_constant_speed"
+
+
+def test_data_quality_none_with_transitions():
+    """Port with transitions > 0 does not get flagged, even with toggle loadType."""
+    readings = []
+    speeds = [1, 1, 0, 1, 1]
+    ons = [s > 0 for s in speeds]
+    for i, (spd, on) in enumerate(zip(speeds, ons)):
+        readings.append({
+            "timestamp": _ts(i),
+            "temperature_c": 22.0, "temperature_f": 71.6,
+            "humidity": 55.0, "vpd": 1.2,
+            "ports": [_port(2, "Heater", spd, on)],
+        })
+    result = build_activity_report(
+        readings, days=1, port_loads={2: 5}, port_load_types={2: 4}
+    )
+    assert len(result) == 1
+    assert result[0].data_quality is None
+
+
+@pytest.mark.parametrize("description,speed,on,load_type,expected_quality", [
+    ("mixed speeds → not flagged", 5, True, 4, None),         # speed != 1 → not all-one
+    ("always off → not flagged", 0, False, 4, None),          # no running_speeds → bool([])=False
+    ("on=True speed=0 → not flagged", 0, True, 4, None),      # speed=0 excluded from running_speeds
+    ("no loadType info → not flagged", 1, True, None, None),  # port_load_types=None
+    ("loadType=0 → not flagged", 1, True, 0, None),           # loadType not in {4, 128}
+])
+def test_data_quality_none_various_scenarios(
+    description: str,
+    speed: int,
+    on: bool,
+    load_type: int | None,
+    expected_quality: str | None,
+) -> None:
+    """data_quality is None unless all three conditions hold for confirmed toggle hardware."""
+    readings = _toggle_readings(speed=speed, on=on)
+    port_load_types = {2: load_type} if load_type is not None else None
+    result = build_activity_report(
+        readings, days=3, port_loads={2: 5}, port_load_types=port_load_types
+    )
+    # Always-off ports may be filtered or show uptime=0; always-on at speed=0 is unusual
+    if result:
+        assert result[0].data_quality == expected_quality, description
+
+
+def test_data_quality_not_100pct_uptime():
+    """Port with some off-slots is not flagged even with toggle loadType."""
+    readings = _toggle_readings(speed=1, on=True, count=36)
+    readings += _toggle_readings(speed=0, on=False, count=36)
+    result = build_activity_report(
+        readings, days=3, port_loads={2: 5}, port_load_types={2: 4}
+    )
+    assert len(result) == 1
+    assert result[0].data_quality is None
+    assert result[0].uptime_pct == pytest.approx(50.0)
+
+
+def test_rule_d_exempts_toggle_hardware_currently_off():
+    """Toggle hardware (loadType=4) with portsLoad=0 and the 100%-uptime artifact survives via
+    the data_quality early-exit and appears with the api_constant_speed caveat."""
+    readings = _toggle_readings(speed=1, on=True)
+    result = build_activity_report(
+        readings, days=3, port_loads={2: 0}, port_load_types={2: 4}
+    )
+    assert len(result) == 1, "Toggle hardware must survive even when currently off"
+    assert result[0].data_quality == "api_constant_speed"
+
+
+def test_rule_d_filters_toggle_hardware_with_artifact_transitions():
+    """Toggle hardware with spurious transitions (API co-runs with other ports) is filtered.
+
+    Real scenario: heater/humidifier ports emit speed=1 ghost readings whenever any other
+    port on the device runs — creating transitions>0 and sub-100% uptime.  These ports have
+    no actual load and must be filtered, not preserved.
+    """
+    # 4 on readings then 68 off — produces transitions=2, uptime<100%, avg_speed=1.0
+    readings = _toggle_readings(speed=1, on=True, count=4) + _toggle_readings(
+        speed=0, on=False, count=68
+    )
+    result = build_activity_report(
+        readings, days=3, port_loads={2: 0}, port_load_types={2: 4}
+    )
+    assert len(result) == 0, "Toggle ghost with artifact transitions must be filtered by Rule D"
+
+
+def test_rule_d_still_filters_non_toggle_ghost_ports():
+    """Non-toggle ghost port (loadType=0, portsLoad=0, avg_speed<=1) is filtered by Rule D."""
+    readings = _toggle_readings(name="Port 3", port_num=3, speed=1, on=True)
+    result = build_activity_report(
+        readings, days=3, port_loads={3: 0}, port_load_types={3: 0}
+    )
+    assert len(result) == 0, "Non-toggle ghost port must still be filtered by Rule D"
+
+
+def test_data_quality_none_when_port_load_types_not_provided():
+    """Without port_load_types, no port is flagged (safe default)."""
+    readings = _toggle_readings(speed=1, on=True)
+    result = build_activity_report(
+        readings, days=3, port_loads={2: 5}, port_load_types=None
+    )
+    assert len(result) == 1
+    assert result[0].data_quality is None

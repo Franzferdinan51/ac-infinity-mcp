@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from mcp.server.fastmcp import FastMCP
 
 from ac_infinity_mcp.analytics import (
+    _ZERO_LOAD_DEV_TYPES,
     STAGE_TARGETS,
     build_activity_report,
     calculate_health_score,
@@ -903,15 +904,22 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         ports_excluded_count is the number of ports removed by the ghost-port filter,
         capped at devPortCount when the device's physical port count is known (prevents
         over-counting on sub-8-port devices; unknown/zero devPortCount means no cap).
-        Five rules apply: Rule A (constant 100%% uptime + zero load), Rule B
+        Six rules apply: Rule A (constant 100%% uptime + zero load), Rule B
         (auto-named Port N with low average runtime or zero load), Rule C (named
         port with zero transitions + zero load + < 1 h/day average runtime), Rule D
         (non-toggle named port with speed history ≤ 1 and zero load — confirmed toggle
-        hardware with transitions > 0 is exempt; see Quirk 22 in docs/API.md), and Rule E
+        hardware with transitions > 0 is exempt; see Quirk 22 in docs/API.md), Rule E
         (named port, non-toggle hardware, zero current load,
         sub-threshold runtime — stale configured speed from a port previously set to
-        OFF). The human_summary field already includes a brief note about excluded ports
-        when ports_excluded_count > 0. Do not repeat the exclusion count in prose response.
+        OFF), and Rule F (phantom clone detection — custom-named ports sharing identical
+        activity signatures with low average on-time are excluded as legacy controller
+        artifacts; fires only when port_loads data is available; proper-subset guard
+        ensures at least one port is always retained). The human_summary field already
+        includes a brief note about excluded ports when ports_excluded_count > 0. Do not
+        repeat the exclusion count in prose response.
+        The transitions count uses debouncing (_MIN_DWELL_READINGS=2): single-reading
+        state changes at automation window edges are not counted — only transitions
+        where the new state persists for ≥ 2 consecutive readings are recorded.
 
         Ports whose timing data is unreliable appear only as a ▎-prefixed caveat
         line in human_summary (e.g. "▎ Heater (Port 2): Activity data not supported
@@ -994,12 +1002,13 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         physical_port_count = device.get("devPortCount") or unique_port_count
         unique_port_count = min(unique_port_count, physical_port_count)
 
+        dev_type = device.get("devType")
         result = build_activity_report(
             readings,
             days=days,
             port_loads=port_loads if port_loads else None,
             port_load_types=port_load_types if port_load_types else None,
-            dev_type=device.get("devType"),
+            dev_type=dev_type,
         )
         ports_excluded_count = max(0, unique_port_count - len(result))
 
@@ -1028,7 +1037,6 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
             d for d in port_dicts if d.get("data_quality") in (None, "no_load_signal")
         ]
         caveat_results = [r for r in result if r.data_quality == "api_constant_speed"]
-        no_load_signal_ports = [r for r in result if r.data_quality == "no_load_signal"]
 
         day_word = "day" if days == 1 else "days"
         if result:
@@ -1036,7 +1044,7 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
                 f"{p['name']} (Port {p['port']}) ran {p['uptime_pct']}% uptime "
                 f"({p['on_hours']}h total)"
                 + (
-                    f", most active around {p['peak_hour_local']}"
+                    f", typically active around {p['peak_hour_local']}"
                     if p["peak_hour_local"] else ""
                 )
                 for p in reliable_dicts
@@ -1058,17 +1066,17 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
                 f" {len(result)} active {active_port_word}."
             )
             summary_parts = [preamble]
+            if dev_type in _ZERO_LOAD_DEV_TYPES:
+                summary_parts.append(
+                    "Note: This controller does not report power draw for individual"
+                    " ports — activity results are based on recorded run times only."
+                )
             if port_lines:
                 summary_parts.append(f"{port_lines}.")
             if caveat_lines:
                 summary_parts.append(caveat_lines)
             if excl:
                 summary_parts.append(excl.strip())
-            if no_load_signal_ports:
-                summary_parts.append(
-                    "Note: This controller does not report power draw for individual"
-                    " ports — activity results are based on recorded run times only."
-                )
             human_summary = " ".join(summary_parts)
         else:
             port_word = "port" if ports_excluded_count == 1 else "ports"

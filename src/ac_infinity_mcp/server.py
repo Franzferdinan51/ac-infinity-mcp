@@ -890,11 +890,16 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         JSON with window_start_local and window_end_local (the exact local time range
         analyzed, e.g. 'May 23, 10:35 AM CDT' to 'May 24, 10:35 AM CDT'), per-port
         on_hours (total hours ON over the full period), off_hours, transitions,
-        avg_speed_when_running, uptime_pct, peak_hour_local (device-local time string
-        with peak date, e.g. '3:00 PM CDT (peak on May 23)', or null if the port
-        never ran), and
-        data_quality (null for reliable history; 'api_constant_speed' for toggle
-        hardware whose history is unreliable — heaters, lights, humidifiers).
+        avg_speed_when_running, uptime_pct, and peak_hour_local (device-local time
+        string with peak date, e.g. '3:00 PM CDT (peak on May 23)', or null if the
+        port never ran).
+        Note: data_quality is an internal classification field stripped from the JSON
+        output before serialization — it is NOT present in the response JSON. Its
+        effects are visible only in human_summary: toggle hardware (heaters, lights,
+        humidifiers — loadType 4 or 128 on standard devices, or pattern-detected on
+        devType=18/22 where loadType is unreliable) produces a ▎-prefixed caveat line;
+        no_load_signal ports (devType=18 UIS 69 Pro+, devType=22 Q0KT4 Genetics Lab)
+        produce a device-level Note about missing power-draw data.
         ports_excluded_count is the number of ports removed by the ghost-port filter,
         capped at devPortCount when the device's physical port count is known (prevents
         over-counting on sub-8-port devices; unknown/zero devPortCount means no cap).
@@ -914,8 +919,9 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         relay the caveat line verbatim instead.
 
         All ports listed under the main runtime sentences have reliable timing data
-        and should be presented normally. When a device-level note about missing load
-        data appears in human_summary, relay it once — do not add further caveats.
+        and should be presented normally. When a device-level Note about missing load
+        data appears in human_summary (devType=18/22 devices), relay it once — do not
+        add further caveats.
 
     Presentation guidance:
         - Always refer to ports as 'Name (Port N)', e.g., 'Exhaust Fan (Port 3)'.
@@ -944,14 +950,17 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         tz = _effective_tz(zone_id)
 
         # port_loads for ghost-port Rule A filter; port_load_types for data_quality detection
+        # port_speaks: current ON/OFF state (speak: 0=off, None=unavailable; treat both as off)
         port_loads: dict[int, int] = {}
         port_load_types: dict[int, int] = {}
+        port_speaks: dict[int, bool] = {}
         port_names: dict[int, str] = {}
         for p in device.get("deviceInfo", {}).get("ports", []):
             pn = p.get("port")
             if pn is not None:
                 port_loads[pn] = p.get("portsLoad") or 0
                 port_load_types[pn] = p.get("loadType") or 0
+                port_speaks[pn] = (p.get("speak") or 0) > 0
                 port_names[pn] = p.get("portName", f"Port {pn}")
 
         now_utc = _utcnow()
@@ -1034,7 +1043,7 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
             )
             caveat_lines = " ".join(
                 f"▎ {r.name} (Port {r.port}): Activity data not supported"
-                f" (currently {'ON' if port_loads.get(r.port, 0) > 0 else 'OFF'})."
+                f" (currently {'ON' if port_speaks.get(r.port, False) else 'OFF'})."
                 for r in caveat_results
             )
             port_word = "port" if ports_excluded_count == 1 else "ports"

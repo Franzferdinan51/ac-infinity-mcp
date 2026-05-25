@@ -14,6 +14,9 @@ from typing import Any
 # h/day: zero-load ports below this are treated as ghost candidates
 _GHOST_LOAD_ZERO_THRESHOLD: float = 1.0
 
+# devType values where portsLoad is always 0 regardless of actual current draw (Quirk 24)
+_ZERO_LOAD_DEV_TYPES: frozenset[int] = frozenset({18})
+
 STAGE_TARGETS: dict[str, dict[str, tuple[float, float]]] = {
     "clones":       {"temp_c": (22.0, 26.0), "humidity": (70.0, 80.0), "vpd": (0.8, 1.2)},
     "seedling":     {"temp_c": (22.0, 26.0), "humidity": (65.0, 75.0), "vpd": (0.8, 1.2)},
@@ -230,6 +233,7 @@ def build_activity_report(
     days: int = 1,
     port_loads: dict[int, int] | None = None,
     port_load_types: dict[int, int] | None = None,
+    dev_type: int | None = None,
 ) -> list[ActivityReport]:
     """Build per-port runtime activity report from parsed history readings.
 
@@ -239,6 +243,9 @@ def build_activity_report(
     days = max(days, 1)  # defense-in-depth: prevents ZeroDivisionError in Rule B
     if not port_loads:
         # normalizes {} to None — empty dict would enable Rule A with all-zero defaults
+        port_loads = None
+    if dev_type in _ZERO_LOAD_DEV_TYPES:
+        # Quirk 24: this device always reports portsLoad=0; load-based ghost rules are unreliable
         port_loads = None
     if not readings:
         return []
@@ -309,21 +316,23 @@ def build_activity_report(
 
         # Detect toggle-device history artifact: AC Infinity always emits nibble 0xF
         # (decoded speed=1) for heaters/lights/humidifiers, even when physically off.
-        # All three conditions must hold AND the port must be confirmed toggle hardware
-        # (loadType 4 or 128) to avoid flagging a variable-speed device stuck at speed 1.
+        # Confirmed toggle hardware (loadType 4/128) is sufficient. For _ZERO_LOAD_DEV_TYPES,
+        # loadType is also unreliable (Quirk 24), so the pattern alone is used instead —
+        # a variable-speed device stuck at speed 1 is indistinguishable, but that is an
+        # acceptable trade-off given the load signal is completely absent on these devices.
         all_running_are_one = bool(running_speeds) and all(s == 1 for s in running_speeds)
         is_toggle_hardware = (
             port_load_types is not None
             and port_load_types.get(port_num) in _TOGGLE_LOAD_TYPES
         )
+        is_toggle_pattern = (
+            pd["transitions"] == 0 and uptime_pct == 100.0 and all_running_are_one
+        )
         data_quality: str | None = None
-        if (
-            pd["transitions"] == 0
-            and uptime_pct == 100.0
-            and all_running_are_one
-            and is_toggle_hardware
-        ):
+        if is_toggle_pattern and (is_toggle_hardware or dev_type in _ZERO_LOAD_DEV_TYPES):
             data_quality = "api_constant_speed"
+        if dev_type in _ZERO_LOAD_DEV_TYPES and data_quality is None:
+            data_quality = "no_load_signal"
 
         reports.append(
             ActivityReport(

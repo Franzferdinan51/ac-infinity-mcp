@@ -203,7 +203,7 @@ re-run all four. The approved plan is the contract for Stage 2.
 
 **Gate 1 — Deep Code Review (Senior Python Engineer persona)**
 - Correctness, idiomatic Python, async safety, error handling
-- API quirk compliance (see `docs/API.md` for all 20 quirks)
+- API quirk compliance (see `docs/API.md` for all 25 quirks)
 - No blocking calls in async context — all HTTP calls wrapped in `asyncio.to_thread()`
 - Retry logic applied to all external HTTP calls via `tenacity`
 
@@ -315,6 +315,29 @@ them. Always use the human-readable name from the API response:
   requires an ID, resolve it by matching the user's name input against the list.
 - The same rule applies to device IDs and port numbers: prefer "Humidifier (Port 1)"
   over "port 1" or a raw devId.
+
+### User-facing text rules (instruction, description, suggested_reply, summary fields)
+
+These rules apply to every string returned in a tool's JSON response that a grower (via
+Claude) will read aloud or act on. Violations were codified from the #108 audit.
+
+- **No Python function call syntax** — never write `call foo()`, `foo(param=value)`,
+  or any text that looks like a Python invocation. Growers cannot execute Python.
+- **The word `dry_run` must never appear** in any user-facing string. It is an
+  internal implementation detail. Write "preview the action" or "I'll show you what
+  will happen before doing it" instead.
+- **No internal parameter names** — `device_id`, `adv_ids`, `automation_id`, `port`
+  as a raw integer, `devId`, etc. must not appear in `instruction`, `description`,
+  `suggested_reply`, `summary`, or `human_summary` fields.
+- **No raw numeric IDs** — always use the human-readable name from the API response.
+  `automation_id` is returned in the JSON for programmatic chaining only.
+- **Options are named for growers, not developers** — option descriptions say
+  "release from automation" not "break_out_of_automation".
+- **`instruction` fields must be natural-language prompts** — write them as text
+  Claude can read aloud: "Ask me to release Filter (Port 4) from the 'Night Cycle'
+  automation so you can control it manually." Not: "Call break_out_of_automation(...)".
+- **Port references always use name + number** — "Filter (Port 4)" never just "port=4"
+  or a bare integer.
 
 ### Bulk replacements
 

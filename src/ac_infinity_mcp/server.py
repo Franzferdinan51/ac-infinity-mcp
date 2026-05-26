@@ -900,8 +900,10 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
         effects are visible only in human_summary: toggle hardware (heaters, lights,
         humidifiers — loadType 4 or 128 on standard devices, or pattern-detected on
         devType=18/22 where loadType is unreliable) produces a ▎-prefixed caveat line;
-        no_load_signal ports (devType=18 UIS 69 Pro+, devType=22 Q0KT4 Genetics Lab)
-        produce a device-level Note about missing power-draw data.
+        devType=22 (Q0KT4 Genetics Lab) produces a device-level Note about missing
+        power-draw data. devType=18 (UIS 69 Pro+) does NOT emit this Note — its active
+        ports produce reliable runtime data in historical records even though portsLoad
+        is always 0.
         ports_excluded_count is the number of ports removed by the ghost-port filter,
         capped at devPortCount when the device's physical port count is known (prevents
         over-counting on sub-8-port devices; unknown/zero devPortCount means no cap).
@@ -931,7 +933,7 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
 
         All ports listed under the main runtime sentences have reliable timing data
         and should be presented normally. When a device-level Note about missing load
-        data appears in human_summary (devType=18/22 devices), relay it once — do not
+        data appears in human_summary (devType=22 devices only), relay it once — do not
         add further caveats.
 
     Presentation guidance:
@@ -1105,7 +1107,7 @@ async def get_port_activity_report(device_id: str, days: int = 7) -> str:
                     f" {len(result)} active {active_port_word}."
                 )
             summary_parts = [preamble]
-            if dev_type in _ZERO_LOAD_DEV_TYPES:
+            if dev_type == 22:
                 summary_parts.append(
                     "Note: This controller does not report power draw for individual"
                     " ports. ON/OFF state is the only reliable activity indicator —"
@@ -2008,14 +2010,14 @@ async def set_port_speed(
         sent, and payload (when dry_run=True).
 
         When the port is in OFF mode (atType=0 or atType=1) at call time, the
-        response also includes a ``warning`` field advising the grower to call
-        set_port_mode with mode='ON' to activate the port. The speed is stored
+        response also includes a ``warning`` field telling the grower to ask
+        Claude to switch the port to ON mode to activate it. The speed is stored
         on the controller but the port will not run until the mode is changed.
 
         Example (dry_run=True)::
 
             {
-              "action": "set port 2 speed to 5",
+              "action": "set Exhaust Fan (Port 2) speed to 5",
               "device_id": "C58ZA",
               "port": 2,
               "speed": 5,
@@ -2056,8 +2058,14 @@ async def set_port_speed(
                 "controller_type": write_result["controller_type"],
             })
 
+        ports_list = device.get("deviceInfo", {}).get("ports", []) if device else []
+        port_data = next((p for p in ports_list if p.get("port") == port), None)
+        has_custom_name = bool(port_data and port_data.get("portName"))
+        port_name = _get_port_name_from_device(device, port)
+        port_label = f"{port_name} (Port {port})" if has_custom_name else port_name
+
         response: dict = {
-            "action": f"set port {port} speed to {speed}",
+            "action": f"set {port_label} speed to {speed}",
             "device_id": device_id,
             "port": port,
             "speed": speed,
@@ -2074,7 +2082,7 @@ async def set_port_speed(
             response["warning"] = (
                 f"{port_name} is currently in OFF mode — speed was stored but the port "
                 "will not run until the mode is changed to ON. "
-                "Call set_port_mode with mode='ON' to activate it."
+                "To activate it, ask me to switch this port to ON mode."
             )
 
         return json.dumps(response, indent=2)
@@ -2152,8 +2160,14 @@ async def set_port_on(
                 "controller_type": write_result["controller_type"],
             })
 
+        ports_list = device.get("deviceInfo", {}).get("ports", []) if device else []
+        port_data = next((p for p in ports_list if p.get("port") == port), None)
+        has_custom_name = bool(port_data and port_data.get("portName"))
+        port_name = _get_port_name_from_device(device, port)
+        port_label = f"{port_name} (Port {port})" if has_custom_name else port_name
+
         response: dict = {
-            "action": f"turn port {port} on",
+            "action": f"turn {port_label} on",
             "device_id": device_id,
             "port": port,
             "dry_run": write_result["dry_run"],
@@ -2242,8 +2256,14 @@ async def set_port_off(
                 "controller_type": write_result["controller_type"],
             })
 
+        ports_list = device.get("deviceInfo", {}).get("ports", []) if device else []
+        port_data = next((p for p in ports_list if p.get("port") == port), None)
+        has_custom_name = bool(port_data and port_data.get("portName"))
+        port_name = _get_port_name_from_device(device, port)
+        port_label = f"{port_name} (Port {port})" if has_custom_name else port_name
+
         response: dict = {
-            "action": f"turn port {port} off",
+            "action": f"turn {port_label} off",
             "device_id": device_id,
             "port": port,
             "dry_run": write_result["dry_run"],
@@ -2349,8 +2369,14 @@ async def set_vpd_automation(
         if write_result.get("ai_plus_write_unsupported"):
             return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
 
+        ports_list = device.get("deviceInfo", {}).get("ports", []) if device else []
+        port_data = next((p for p in ports_list if p.get("port") == port), None)
+        has_custom_name = bool(port_data and port_data.get("portName"))
+        port_name = _get_port_name_from_device(device, port)
+        port_label = f"{port_name} (Port {port})" if has_custom_name else port_name
+
         response: dict = {
-            "action": f"set port {port} VPD automation to {target_vpd} kPa",
+            "action": f"set {port_label} VPD automation to {target_vpd} kPa",
             "device_id": device_id,
             "port": port,
             "target_vpd_kpa": target_vpd,
@@ -2489,8 +2515,14 @@ async def set_temperature_automation(
         if write_result.get("ai_plus_write_unsupported"):
             return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
 
+        ports_list = device.get("deviceInfo", {}).get("ports", []) if device else []
+        port_data = next((p for p in ports_list if p.get("port") == port), None)
+        has_custom_name = bool(port_data and port_data.get("portName"))
+        port_name = _get_port_name_from_device(device, port)
+        port_label = f"{port_name} (Port {port})" if has_custom_name else port_name
+
         response: dict = {
-            "action": f"set port {port} temperature automation {min_temp}–{max_temp}{unit_label}",
+            "action": f"set {port_label} temperature automation {min_temp}–{max_temp}{unit_label}",
             "device_id": device_id,
             "port": port,
             "min_temp": min_temp,
@@ -2595,8 +2627,14 @@ async def set_humidity_automation(
         if write_result.get("ai_plus_write_unsupported"):
             return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
 
+        ports_list = device.get("deviceInfo", {}).get("ports", []) if device else []
+        port_data = next((p for p in ports_list if p.get("port") == port), None)
+        has_custom_name = bool(port_data and port_data.get("portName"))
+        port_name = _get_port_name_from_device(device, port)
+        port_label = f"{port_name} (Port {port})" if has_custom_name else port_name
+
         response: dict = {
-            "action": f"set port {port} humidity automation {min_rh}–{max_rh}%",
+            "action": f"set {port_label} humidity automation {min_rh}–{max_rh}%",
             "device_id": device_id,
             "port": port,
             "min_rh": min_rh,
@@ -2755,8 +2793,14 @@ async def set_port_mode(
         if write_result.get("ai_plus_write_unsupported"):
             return _ai_plus_unsupported_error(device_id, port, write_result["controller_type"])
 
+        ports_list = device.get("deviceInfo", {}).get("ports", []) if device else []
+        port_data = next((p for p in ports_list if p.get("port") == port), None)
+        has_custom_name = bool(port_data and port_data.get("portName"))
+        port_name = _get_port_name_from_device(device, port)
+        port_label = f"{port_name} (Port {port})" if has_custom_name else port_name
+
         response: dict = {
-            "action": f"set port {port} mode to {mode_upper}",
+            "action": f"set {port_label} mode to {mode_upper}",
             "device_id": device_id,
             "port": port,
             "mode": mode_upper,

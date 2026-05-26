@@ -1380,22 +1380,56 @@ def _get_port_name_from_device(device: dict | None, port: int) -> str:
     return _sanitize_api_string(raw_name, 64) if raw_name else f"Port {port}"
 
 
+def _find_governing_automation(automations: list[dict], port: int) -> dict | None:
+    """Return the first enabled/running automation whose bitmask covers ``port``, or None.
+
+    Uses the ``grp_dev_type`` bitmask stored in each port_group entry by
+    ``_group_automations``.  Port N maps to bit (N-1): a bitmask of 8 (0b1000)
+    covers Port 4.  Only automations with ``enabled=True`` or ``run_state=True``
+    are considered.
+    """
+    for auto in automations:
+        if not (auto.get("enabled") or auto.get("run_state")):
+            continue
+        for pg in auto.get("port_groups", []):
+            bitmask = int(pg.get("grp_dev_type") or 0)
+            if bitmask & (1 << (port - 1)):
+                return auto
+    return None
+
+
+def _find_governing_port_group(automation: dict, port: int) -> dict | None:
+    """Return the port_group entry whose bitmask covers ``port``, or None.
+
+    Iterates ``automation["port_groups"]`` and returns the first entry where
+    ``grp_dev_type`` has the bit for ``port`` set.
+    """
+    for pg in automation.get("port_groups", []):
+        bitmask = int(pg.get("grp_dev_type") or 0)
+        if bitmask & (1 << (port - 1)):
+            return pg
+    return None
+
+
 async def _build_advance_conflict_response(
     device_id: str, dev_id: object, port: int, port_name: str,
     requested_speed: int | None = None,
 ) -> str:
     """Build a structured ADVANCE_AUTOMATION conflict response for write tools.
 
-    Four paths depending on the secondary automation lookup result:
+    Five paths depending on the secondary automation lookup result:
 
     - **Auth-error path** (secondary lookup raises ``ACInfinityAuthError``): returns
       auth error JSON immediately; credential expiry must be resolved before conflict UX.
-    - **Normal path** (governing automation found and enabled): option key
-      ``"0_update_speed"`` (only when ``requested_speed`` is not None) pointing to
-      update-the-automation in natural language; option key ``"1_break_out"`` pointing
-      to ``break_out_of_automation``; option key ``"2_disable_automation"`` pointing
-      to ``disable_advance_automation``. ``suggested_reply`` discloses that releasing
-      affects ALL ports on the automation.
+    - **Sub-path A — port in bitmask** (governing automation found whose bitmask covers
+      the requested port): option key ``"1_break_out"`` pointing to
+      ``break_out_of_automation``; option key ``"2_disable_automation"`` pointing to
+      ``disable_advance_automation``.  Speed is read from the matched port_group.
+      ``suggested_reply`` discloses that releasing affects ALL ports on the automation.
+    - **Sub-path B — port not in bitmask** (active automations exist but none has a
+      bitmask covering the requested port — controller-wide lock): controller-wide lock
+      message language; ``"1_break_out"`` is NOT offered because the port is not
+      explicitly governed by any automation's port group.
     - **All-disabled path** (API succeeded, automations non-empty, none active):
       option key ``"1_re_disable_to_clear"`` pointing to ``disable_advance_automation``.
       ``suggested_reply`` explains the port is stuck and offers force-release.
@@ -1419,10 +1453,7 @@ async def _build_advance_conflict_response(
     try:
         raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
         automations = _group_automations(raw)
-        governing = next(
-            (a for a in automations if a.get("enabled") or a.get("run_state")),
-            None,
-        )
+        governing = _find_governing_automation(automations, port)
         active_automations = [
             {"name": a["name"], "automation_id": a["automation_id"]}
             for a in automations if a.get("enabled") or a.get("run_state")
@@ -1443,13 +1474,14 @@ async def _build_advance_conflict_response(
         )
         api_call_failed = True
 
+    has_active = any(a.get("enabled") or a.get("run_state") for a in automations)
+
     if governing is not None:
-        # NORMAL PATH — at least one enabled/running automation found
+        # SUB-PATH A — an enabled/running automation whose bitmask covers this port
         auto_name = governing["name"]
         auto_id = governing["automation_id"]
-        current_auto_speed = (
-            governing["port_groups"][0]["on_speed"] if governing["port_groups"] else "?"
-        )
+        governing_pg = _find_governing_port_group(governing, port)
+        current_auto_speed = governing_pg.get("on_speed") if governing_pg is not None else "?"
         summary = (
             f"While '{auto_name}' automation is running, all ports on this controller"
             " are locked from manual control."
@@ -1495,8 +1527,8 @@ async def _build_advance_conflict_response(
             ),
             "tool": "disable_advance_automation",
             "instruction": (
-                f"Ask me to disable the '{auto_name}' automation — this will release all ports"
-                " it currently controls."
+                f"Ask me to disable the '{auto_name}' automation to release all ports"
+                " on this controller from automation control."
             ),
             "available": True,
         }
@@ -1525,6 +1557,50 @@ async def _build_advance_conflict_response(
             "status": "not_yet_implemented",
         }
 
+    elif not api_call_failed and has_active:
+        # SUB-PATH B — active automations exist, but none has a bitmask covering this port.
+        # The controller is locked at the API level; this port is not in any automation's
+        # port group, so break_out_of_automation is not applicable.
+        auto_name = None
+        auto_id = None
+        _b_name = active_automations[0]["name"] if active_automations else "an active automation"
+        summary = (
+            f"The '{_b_name}' automation is locking this controller from manual control."
+            " Your change requires resolving this conflict first."
+        )
+        human_summary = (
+            f"The '{_b_name}' ADVANCE automation is locking this controller."
+            " Manual control of all ports is blocked until the automation is paused."
+        )
+        suggested_reply = (
+            f"The '{_b_name}' automation has locked this controller, preventing manual port"
+            " changes. I can disable it to release the lock. Want me to do that?"
+        )
+        opt1 = {
+            "description": "Disable the active automation to release this controller.",
+            "tool": "disable_advance_automation",
+            "instruction": (
+                f"Ask me to list your automations for this controller to identify '{_b_name}',"
+                " then ask me to disable it to release the controller lock."
+            ),
+            "available": True,
+        }
+        opt2 = {
+            "available": False,
+            "status": (
+                "This port is not directly controlled by any active automation — use option 1 to"
+                " disable the automation locking the controller."
+            ),
+        }
+        opt1_key = "1_disable_automation"
+        options_dict = {
+            opt1_key: opt1,
+            "2_disable_automation": opt2,
+            "3_fork_automation": {
+                "available": False,
+                "status": "not_yet_implemented",
+            },
+        }
     elif not api_call_failed and len(automations) > 0:
         # ALL-DISABLED PATH — API succeeded but all automations have enabled=False / run_state=False
         auto_name = None
@@ -1546,8 +1622,8 @@ async def _build_advance_conflict_response(
             "description": "Force-release this port by re-applying the disable command.",
             "tool": "disable_advance_automation",
             "instruction": (
-                "Ask me to list your automations so we can identify which one is blocking this"
-                " port, then ask me to force-release it."
+                "Ask me to list your automations so I can find the one holding this port,"
+                " then ask me to disable it to force-release the port."
             ),
             "available": True,
         }
@@ -1584,8 +1660,8 @@ async def _build_advance_conflict_response(
             "description": "Find and disable the active automation, then apply your manual change.",
             "tool": "list_advance_automations",
             "instruction": (
-                "Ask me to list your automations so we can identify which one is blocking this"
-                " port, then ask me to disable it and force-release the port."
+                "Ask me to list your automations for this controller so I can identify"
+                " which one is active, then ask me to disable it."
             ),
             "available": True,
         }
@@ -1614,8 +1690,9 @@ async def _build_advance_conflict_response(
         "active_automations": active_automations,
         "co_governed_ports": [],
         "switching_guidance": (
-            "To regain manual control: ask me to disable any active automations, then apply"
-            " your change. To add this port to an automation instead, ask me to create a new one."
+            "To regain manual control: ask me to disable any active automations on this"
+            " controller, then apply your change. To add this port to an automation instead,"
+            " ask me to create or update an automation."
         ),
         "options": options_dict,
     }, indent=2)
@@ -1765,9 +1842,12 @@ async def get_port_settings(device_id: str, port: int) -> str:
             could not be retrieved."``
 
         ``current_speed`` reflects the live fan speed from the device.
-        ``automation_name``/``automation_id``/``automation_on_speed`` are populated
-        from the governing automation (or null if none active or secondary lookup
-        degrades). ``vpd_target_kpa`` is non-null only when VPD automation is active.
+        ``automation_name``/``automation_id`` are populated from the governing
+        automation (or null if none active or secondary lookup degrades).
+        ``automation_on_speed`` is read from the port group of the governing
+        automation whose ``grouptDevType`` bitmask covers this port (bitmask-matched);
+        null when no governing automation, no matching port group, or degraded.
+        ``vpd_target_kpa`` is non-null only when VPD automation is active.
         ``temp_range_c`` / ``humidity_range_pct`` are non-null only when those
         thresholds are enabled. ``schedule_window`` times are in device local time
         (not UTC). On failure returns ``{"error": "...", "detail": "..."}``.
@@ -1806,10 +1886,7 @@ async def get_port_settings(device_id: str, port: int) -> str:
             try:
                 raw_adv = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
                 adv_grouped = _group_automations(raw_adv)
-                governing = next(
-                    (a for a in adv_grouped if a.get("enabled") or a.get("run_state")),
-                    None,
-                )
+                governing = _find_governing_automation(adv_grouped, port)
             except ACInfinityAuthError:
                 # ACInfinityAuthError must precede Exception — auth must propagate, not degrade.
                 raise
@@ -1821,6 +1898,9 @@ async def get_port_settings(device_id: str, port: int) -> str:
                 )
                 degraded = True
 
+            governing_pg = (
+                _find_governing_port_group(governing, port) if governing is not None else None
+            )
             resp: dict = {
                 "device_id": device_id,
                 "port": port,
@@ -1829,9 +1909,7 @@ async def get_port_settings(device_id: str, port: int) -> str:
                 "automation_name": governing["name"] if governing else None,
                 "automation_id": governing["automation_id"] if governing else None,
                 "automation_on_speed": (
-                    governing["port_groups"][0]["on_speed"]
-                    if governing and governing["port_groups"]
-                    else None
+                    governing_pg.get("on_speed") if governing_pg is not None else None
                 ),
                 "current_speed": current_speed,
                 "speed_target": None,
@@ -1857,8 +1935,7 @@ async def get_port_settings(device_id: str, port: int) -> str:
                 )
             elif governing:
                 _target_speed = (
-                    governing["port_groups"][0]["on_speed"]
-                    if governing.get("port_groups") else "?"
+                    governing_pg.get("on_speed") if governing_pg is not None else "?"
                 )
                 resp["human_summary"] = (
                     f"Port is running under '{governing['name']}' automation"
@@ -3075,9 +3152,9 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
         ``begin_time``/``end_time`` as ``"HH:MM"`` or ``null``; optional
         ``schedule_note`` when scheduled mode has no time window configured),
         port_groups (with human-readable device_type label per group),
-        governed_ports (list of ports this automation controls, resolved from
-        devInfoListAll isOpenAutomation flags), port_resolution status
-        ("resolved", "multiple_automations_ambiguous", or "error"), and
+        governed_ports (list of ports this automation controls, decoded from
+        the automation's port_group bitmasks), port_resolution status
+        ("resolved" or "error"), and
         human_summary (adapts to continuous/scheduled/no-window variants).
         On failure returns ``{"error": "..."}``.
     """
@@ -3122,34 +3199,42 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
             for pg in port_groups
         ]
 
-        # Port resolution: identify which ports this automation governs.
+        # Port resolution: decode governed ports from the automation's port_group bitmasks.
+        # grouptDevType is a bitmask: Port N → bit (N-1). This approach correctly handles
+        # multiple simultaneous automations by attributing each port to the automation that
+        # explicitly claims it, rather than using the isOpenAutomation flag which becomes
+        # ambiguous when more than one automation is active (#149, #150, #152).
         governed_ports: list[dict] = []
         port_resolution: str = "resolved"
         try:
             ports = device.get("deviceInfo", {}).get("ports", [])
-            advance_ports = [
-                {
-                    "port": p["port"],
-                    "port_name": (
-                        (
-                            _sanitize_api_string(p["portName"], 64)
-                            if p.get("portName")
-                            else ("Port " + str(p["port"]))
-                        )
-                        + f" (Port {p['port']})"
-                    ),
-                }
-                for p in ports
-                if p.get("isOpenAutomation") == 1
-            ]
-            enabled_count = sum(1 for a in grouped if a.get("enabled") or a.get("run_state"))
-            if enabled_count <= 1:
-                governed_ports = advance_ports
-                port_resolution = "resolved"
-            else:
-                governed_ports = []
-                port_resolution = "multiple_automations_ambiguous"
-        except (KeyError, TypeError, AttributeError):
+            # Build a lookup from port number → port name from deviceInfo.
+            port_name_map: dict[int, str] = {}
+            for p in ports:
+                pnum = p.get("port")
+                if pnum is None:
+                    continue
+                raw_pname = p.get("portName")
+                label = (
+                    _sanitize_api_string(raw_pname, 64) if raw_pname else f"Port {pnum}"
+                )
+                port_name_map[int(pnum)] = label
+
+            # Decode port numbers from this automation's port_group bitmasks.
+            governed_port_nums: set[int] = set()
+            for pg in found.get("port_groups", []):
+                bitmask = int(pg.get("grp_dev_type") or 0)
+                for bit in range(8):
+                    if bitmask & (1 << bit):
+                        governed_port_nums.add(bit + 1)
+
+            for pnum in sorted(governed_port_nums):
+                port_label = port_name_map.get(pnum, f"Port {pnum}")
+                governed_ports.append({
+                    "port": pnum,
+                    "port_name": f"{port_label} (Port {pnum})",
+                })
+        except (KeyError, TypeError, AttributeError, ValueError):
             governed_ports = []
             port_resolution = "error"
 
@@ -3186,26 +3271,20 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
                     f"'{name}' runs continuously at speed {speed}, "
                     f"currently {state_str}."
                 )
-        elif port_resolution == "multiple_automations_ambiguous":
-            human_summary = (
-                f"'{name}' is configured across multiple ports at varying speeds. "
-                "Port assignment couldn't be determined — multiple automations are active "
-                "at the same time, and it's unclear which ports each one controls. "
-                f"Currently {state_str}."
-            )
         else:
             port_list_str = (
                 ", ".join(gp["port_name"] for gp in governed_ports)
                 if governed_ports
-                else "multiple ports"
+                else "multiple ports (port list could not be read)"
             )
             schedule_suffix = (
                 f" from {begin_str} to {end_str}{_tz_suffix}"
                 if is_scheduled and begin_str and end_str
                 else ""
             )
+            speed_phrase = " at varying speeds" if governed_ports else ""
             human_summary = (
-                f"'{name}' controls {port_list_str} at varying speeds.{schedule_suffix}"
+                f"'{name}' controls {port_list_str}{speed_phrase}.{schedule_suffix}"
                 f" Currently {state_str}."
             )
 

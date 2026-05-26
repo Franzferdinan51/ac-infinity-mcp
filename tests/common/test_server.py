@@ -2201,6 +2201,32 @@ async def test_get_port_activity_report_devtype18_custom_toggle_ghost_excluded(m
     )
 
 
+@pytest.mark.asyncio
+async def test_get_port_activity_report_devtype18_excluded_default_name_no_redundancy(mock_client):
+    """devType=18 excluded port with API-default name shows 'Port N', not 'Port N (Port N)'."""
+    device = _make_devtype18_device([
+        {"port": 1, "portName": "Port 1", "portsLoad": 0, "loadType": 0},
+    ])
+    mock_client.get_devices.return_value = [device]
+    readings = _make_devtype18_port_readings(1, "Port 1", speed=1, on_count=1, total=96)
+    mock_client.get_historical_data.return_value = [{}] * 96
+    idx = 0
+
+    def _side_effect(r, port_names=None):
+        nonlocal idx
+        val = readings[idx % len(readings)]
+        idx += 1
+        return val
+
+    mock_client.parse_history_record.side_effect = _side_effect
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_port_activity_report("C58ZA", 3)
+    data = json.loads(result)
+    assert data["ports_excluded_count"] == 1
+    assert "no activity detected" in data["human_summary"]
+    assert "Port 1 (Port 1)" not in data["human_summary"]
+
+
 async def test_get_port_activity_report_devtype18_custom_variable_speed_kept(mock_client):
     """#143: devType=18 custom-named port with avg_speed=5.0 (non-toggle) is kept by Rule G.
 
@@ -2852,6 +2878,38 @@ async def test_set_humidity_automation_action_unnamed_port_fallback(mock_client)
     assert "Port 3" in data["action"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "port_num,port_name_val,expected_action",
+    [
+        (7, "Port 7", "turn Port 7 on"),           # default name → no "(Port 7)" suffix
+        (7, "Exhaust", "turn Exhaust (Port 7) on"),  # custom name → include suffix
+        (8, "Port 7", "turn Port 7 (Port 8) on"),   # cross-port: "Port 7" is custom for port 8
+    ],
+)
+async def test_set_port_on_action_port_name_cases(
+    mock_client, port_num, port_name_val, expected_action
+):
+    """set_port_on action field handles default, custom, and cross-port names."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["deviceInfo"]["ports"].append(
+        {"port": port_num, "portName": port_name_val, "speak": 0, "portsLoad": 0,
+         "loadState": 0, "curMode": 1, "remainTime": None}
+    )
+    mock_client.get_devices.return_value = [device]
+    mock_client.set_port_mode.return_value = {
+        "payload": {"onSpead": 10, "modeType": 2, "devId": 12345},
+        "dry_run": True,
+        "controller_type": "legacy",
+        "sent": False,
+    }
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await set_port_on("C58ZA", port_num)
+    data = json.loads(result)
+    assert data["action"] == expected_action
+
+
 # ============ set_port_on ============
 
 MOCK_SET_PORT_ON_DRY = {
@@ -3085,7 +3143,7 @@ async def test_set_port_speed_returns_conflict_for_modeType_15(mock_client):
     assert data["conflict"] == "ADVANCE_AUTOMATION"
     assert "summary" in data
     assert "automation" in data["summary"].lower() and "controller" in data["summary"].lower()
-    assert data["target_port"] == "Port 4 (Port 4)"
+    assert data["target_port"] == "Port 4"
     assert "options" in data
     assert "1_break_out" in data["options"]
     assert "1_re_disable_to_clear" not in data["options"]
@@ -4335,6 +4393,37 @@ MOCK_HUMI_DRY = {
 }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_fn,call_args,mock_return",
+    [
+        (set_port_off, ("C58ZA", 7), MOCK_SET_PORT_OFF_DRY),
+        (set_port_speed, ("C58ZA", 7, 3), MOCK_SET_PORT_MODE_DRY),
+        (set_port_mode, ("C58ZA", 7, "ON"), MOCK_SET_PORT_MODE_DRY),
+        (set_vpd_automation, ("C58ZA", 7, 1.4), MOCK_VPD_DRY),
+        (set_temperature_automation, ("C58ZA", 7, 20.0, 28.0), MOCK_TEMP_DRY),
+        (set_humidity_automation, ("C58ZA", 7, 50.0, 70.0), MOCK_HUMI_DRY),
+    ],
+    ids=["off", "speed", "mode", "vpd", "temp", "humi"],
+)
+async def test_write_tool_action_default_name_no_redundancy(
+    mock_client, call_fn, call_args, mock_return
+):
+    """All write tools omit '(Port N)' suffix when portName equals the API default 'Port N'."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["deviceInfo"]["ports"].append(
+        {"port": 7, "portName": "Port 7", "speak": 0, "portsLoad": 0,
+         "loadState": 0, "curMode": 1, "remainTime": None}
+    )
+    mock_client.get_devices.return_value = [device]
+    mock_client.set_port_mode.return_value = mock_return
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await call_fn(*call_args)
+    data = json.loads(result)
+    assert "(Port 7)" not in data.get("action", "")
+
+
 async def test_set_humidity_automation_dry_run(mock_client):
     mock_client.set_port_mode.return_value = MOCK_HUMI_DRY
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
@@ -5354,13 +5443,13 @@ async def test_disable_advance_automation_dry_run(mock_client):
     assert data["to_restore"] == "Ask me to re-enable 'Moderate Airflow'."
     assert "adv_ids_to_toggle" not in data
     # "Moderate Airflow" governs ports 4, 5, 6 (grouptDevType 8 and 48).
-    # MOCK_DEVICE_LEGACY only has ports 1–2, so all three fall back to "Port N (Port N)".
+    # MOCK_DEVICE_LEGACY only has ports 1–2, so all three fall back to "Port N".
     assert isinstance(data["governed_ports"], list)
     assert len(data["governed_ports"]) == 3
     for entry in data["governed_ports"]:
         assert "port" in entry and isinstance(entry["port"], int)
         assert "port_name" in entry and isinstance(entry["port_name"], str)
-        assert f"(Port {entry['port']})" in entry["port_name"]
+        assert entry["port_name"] == f"Port {entry['port']}"
     assert [e["port"] for e in data["governed_ports"]] == [4, 5, 6]
     mock_client.disable_advance_automation.assert_not_called()
 
@@ -5459,6 +5548,26 @@ async def test_disable_advance_automation_invalid_id(mock_client):
         result = await disable_advance_automation("C58ZA", "xyz")
     data = json.loads(result)
     assert "error" in data
+
+
+@pytest.mark.asyncio
+async def test_disable_advance_automation_governed_ports_default_name_no_redundancy(mock_client):
+    """disable_advance_automation governed_ports uses plain 'Port N' for default-named ports."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["deviceInfo"]["ports"].append(
+        {"port": 4, "portName": "Port 4", "speak": 0, "portsLoad": 0,
+         "loadState": 0, "curMode": 15, "remainTime": None}
+    )
+    mock_client.get_devices.return_value = [device]
+    mock_client.get_advance_automations.return_value = MOCK_ADVANCE_AUTOMATIONS_LIST
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await disable_advance_automation("C58ZA", "1342758", dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    port4_entry = next((e for e in data["governed_ports"] if e["port"] == 4), None)
+    assert port4_entry is not None
+    assert port4_entry["port_name"] == "Port 4"
 
 
 # ============ create_advance_automation ============
@@ -5567,6 +5676,54 @@ async def test_break_out_not_advance_port(mock_client):
     assert "info" in data
     assert "not currently under automation" in data["info"]
     mock_client.get_advance_automations.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_break_out_not_advance_port_default_name_no_redundancy(mock_client):
+    """break_out_of_automation info message uses plain 'Port N' for default-named ports."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    # Append port 7 with default name — MOCK_DEVICE_LEGACY only has ports 1 and 2
+    device["deviceInfo"]["ports"].append(
+        {"port": 7, "portName": "Port 7", "speak": 0, "portsLoad": 0,
+         "loadState": 0, "curMode": 1, "remainTime": None}
+    )
+    mock_client.get_devices.return_value = [device]
+    mock_client.get_mode_settings.return_value = {"modeType": 3, "onSpead": 0}
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await break_out_of_automation("C58ZA", port=7, dry_run=True)
+    data = json.loads(result)
+    assert "info" in data
+    # Positive: correct message format
+    assert "Port 7 is not currently under automation control" in data["info"]
+    # Negative: no double-Port stuttering
+    assert "Port Port" not in data["info"]
+    assert "(Port" not in data["info"]
+
+
+@pytest.mark.asyncio
+async def test_break_out_co_port_sequence_default_name_no_redundancy(mock_client):
+    """break_out_of_automation sequence steps use 'Port N' for default-named co-ports."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    # Override port 2's portName to default "Port 2" (MOCK_DEVICE_LEGACY has "Exhaust Fan")
+    for p in device["deviceInfo"]["ports"]:
+        if p["port"] == 2:
+            p["portName"] = "Port 2"
+    mock_client.get_devices.return_value = [device]
+    mock_client.get_mode_settings.return_value = {"modeType": _ADVANCE_MODE_TYPE, "onSpead": 5}
+    mock_client.get_advance_automations.return_value = MOCK_ADVANCE_AUTOMATIONS_LIST
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await break_out_of_automation("C58ZA", port=1, dry_run=True)
+    data = json.loads(result)
+    assert data["dry_run"] is True
+    # Port 2 should appear as a co-port lock step
+    lock_steps = [s for s in data["sequence"] if "lock" in s["action"]]
+    assert len(lock_steps) >= 1
+    port2_step = next((s for s in lock_steps if "Port 2" in s["action"]), None)
+    assert port2_step is not None, "Expected a lock step for Port 2"
+    # Default name: no '(Port 2)' suffix in the action string
+    assert "(Port 2)" not in port2_step["action"]
 
 
 async def test_break_out_dry_run(mock_client):
@@ -6160,7 +6317,7 @@ async def test_set_port_speed_conflict_fires_before_get_mode_settings_on_advance
     data = json.loads(result)
     assert data["conflict"] == "ADVANCE_AUTOMATION"
     assert "0_update_speed" in data["options"]  # speed=5 was passed
-    assert data["target_port"] == "Port 4 (Port 4)"
+    assert data["target_port"] == "Port 4"
 
 
 @pytest.mark.asyncio
@@ -6655,7 +6812,7 @@ async def test_get_advance_automation_port_resolution_single_automation(mock_cli
     """Single-group automation: governed_ports decoded from bitmask.
 
     MOCK_ADVANCE_AUTOMATIONS_SINGLE has grouptDevType=4 (bit 2 = Port 3).
-    MOCK_DEVICE_LEGACY has no port 3, so the label falls back to 'Port 3 (Port 3)'.
+    MOCK_DEVICE_LEGACY has no port 3, so the label falls back to 'Port 3'.
     port_resolution is 'resolved'.
     """
     mock_client.get_advance_automations.return_value = MOCK_ADVANCE_AUTOMATIONS_SINGLE
@@ -6665,14 +6822,14 @@ async def test_get_advance_automation_port_resolution_single_automation(mock_cli
     assert data["port_resolution"] == "resolved"
     assert len(data["governed_ports"]) == 1
     assert data["governed_ports"][0]["port"] == 3
-    assert data["governed_ports"][0]["port_name"] == "Port 3 (Port 3)"
+    assert data["governed_ports"][0]["port_name"] == "Port 3"
 
 
 async def test_get_advance_automation_governed_ports_missing_port_name(mock_client):
-    """Port in bitmask with no portName falls back to 'Port N (Port N)' not '(unnamed)'.
+    """Port in bitmask with no portName falls back to 'Port N' not '(unnamed)'.
 
     MOCK_ADVANCE_AUTOMATIONS_LIST "Moderate Airflow" has grouptDevType=8 (Port 4).
-    We add port 4 to the device without a portName — the fallback label is 'Port 4 (Port 4)'.
+    We add port 4 to the device without a portName — the fallback label is 'Port 4'.
     """
     import copy
     device = copy.deepcopy(MOCK_DEVICE_LEGACY)
@@ -6688,9 +6845,9 @@ async def test_get_advance_automation_governed_ports_missing_port_name(mock_clie
     assert data["port_resolution"] == "resolved"
     port_nums = [gp["port"] for gp in data["governed_ports"]]
     assert 4 in port_nums
-    # Port 4 has no portName → label is 'Port 4 (Port 4)'
+    # Port 4 has no portName → label is 'Port 4'
     port4_entry = next(gp for gp in data["governed_ports"] if gp["port"] == 4)
-    assert port4_entry["port_name"] == "Port 4 (Port 4)"
+    assert port4_entry["port_name"] == "Port 4"
 
 
 async def test_get_advance_automation_port_resolution_multiple_automations_bitmask(mock_client):
@@ -6916,9 +7073,9 @@ async def test_get_advance_automation_bitmask_multi_automation(mock_client):
 
 
 async def test_get_advance_automation_bitmask_decode_fallback_port_name(mock_client):
-    """Port in bitmask but not in deviceInfo.ports → falls back to 'Port N (Port N)'."""
+    """Port in bitmask but not in deviceInfo.ports → falls back to 'Port N'."""
     # MOCK_DEVICE_LEGACY has only ports 1 and 2; Moderate Airflow covers 4, 5, 6.
-    # All three should fall back to 'Port N (Port N)'.
+    # All three should fall back to 'Port N'.
     mock_client.get_advance_automations.return_value = MOCK_ADVANCE_AUTOMATIONS_LIST
     with patch("ac_infinity_mcp.server.aci_client", mock_client):
         result = await get_advance_automation("C58ZA", "1342758")
@@ -6926,7 +7083,27 @@ async def test_get_advance_automation_bitmask_decode_fallback_port_name(mock_cli
     assert data["port_resolution"] == "resolved"
     for gp in data["governed_ports"]:
         pnum = gp["port"]
-        assert gp["port_name"] == f"Port {pnum} (Port {pnum})"
+        assert gp["port_name"] == f"Port {pnum}"
+
+
+@pytest.mark.asyncio
+async def test_get_advance_automation_governed_ports_default_name_no_redundancy(mock_client):
+    """governed_ports uses plain 'Port N' for API-default-named ports, not 'Port N (Port N)'."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["deviceInfo"]["ports"].append(
+        {"port": 3, "portName": "Port 3", "speak": 0, "portsLoad": 0,
+         "loadState": 0, "curMode": 1, "remainTime": None}
+    )
+    mock_client.get_devices.return_value = [device]
+    mock_client.get_advance_automations.return_value = MOCK_ADVANCE_AUTOMATIONS_SINGLE
+    with patch("ac_infinity_mcp.server.aci_client", mock_client):
+        result = await get_advance_automation("C58ZA", "999001")
+    data = json.loads(result)
+    assert data["port_resolution"] == "resolved"
+    assert len(data["governed_ports"]) == 1
+    assert data["governed_ports"][0]["port"] == 3
+    assert data["governed_ports"][0]["port_name"] == "Port 3"
 
 
 async def test_get_port_settings_advance_speed_from_matched_port_group(mock_client):

@@ -2115,8 +2115,13 @@ async def get_port_settings(device_id: str, port: int) -> str:
         (not UTC).
 
         When the port appears to have nothing connected (default-named ``"Port N"`` with zero load,
-        or a devType=18/22 controller), the response also includes a ``note`` field alerting the
-        grower. On failure returns ``{"error": "...", "detail": "..."}``.
+        or a devType=18/22 controller), the response includes a staleness-aware ``note`` field.
+        On the non-ADVANCE path, ``human_summary`` is overridden with a staleness statement
+        and ``note`` is set to a redirect hint, so the response doesn't contradict itself
+        (e.g. "Humidity automation: 60–100%") for a port with nothing connected.
+        On the ADVANCE path, ``human_summary`` is preserved (it already describes the
+        automation state) and only ``note`` is appended.
+        On failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
         if port < 1:
@@ -2223,11 +2228,15 @@ async def get_port_settings(device_id: str, port: int) -> str:
                 _ps_port_label = (
                     port_data.get("portName", f"Port {port}") if port_data else f"Port {port}"
                 )
-                empty_note = _empty_port_note(port, _ps_port_label)
+                _adv_stale_note = (
+                    f"{_ps_port_label} doesn't appear to have anything connected. "
+                    "Any settings shown may be stale from a previous configuration. "
+                    "If you meant a different port, let me know which one."
+                )
                 if "note" in resp:
-                    resp["note"] = resp["note"] + " " + empty_note
+                    resp["note"] = resp["note"] + " " + _adv_stale_note
                 else:
-                    resp["note"] = empty_note
+                    resp["note"] = _adv_stale_note
             return json.dumps(resp, indent=2)
 
         vpd_target = None
@@ -2327,7 +2336,11 @@ async def get_port_settings(device_id: str, port: int) -> str:
             _gps_port_label = (
                 port_data.get("portName", f"Port {port}") if port_data else f"Port {port}"
             )
-            non_adv_resp["note"] = _empty_port_note(port, _gps_port_label)
+            non_adv_resp["human_summary"] = (
+                f"{_gps_port_label} doesn't appear to have anything connected. "
+                "Any settings shown may be stale from a previous configuration."
+            )
+            non_adv_resp["note"] = "If you meant a different port, let me know which one."
         return json.dumps(non_adv_resp, indent=2)
 
     except ACInfinityAuthError as e:

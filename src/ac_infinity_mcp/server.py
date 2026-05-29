@@ -1987,7 +1987,7 @@ async def set_port_on(
         assert device is not None
 
         write_result = await asyncio.to_thread(
-            _client().set_port_mode, device, port, {"onSpead": 10}, dry_run
+            _client().set_port_mode, device, port, {"atType": 2, "onSpead": 10}, dry_run
         )
 
         if write_result.get("ai_plus_write_unsupported"):
@@ -2043,16 +2043,11 @@ async def set_port_off(
     port: int,
     dry_run: bool = True,
 ) -> str:
-    """Zero a port's speed (onSpead=0).
+    """Sets mode to OFF (atType=1) and zeros speed (onSpead=0).
 
-    Sends onSpead=0 only — the port's active automation mode (atType) is left
-    unchanged. If the port is in AUTO or VPD mode, the controller's automation
-    logic may re-engage the port when its trigger condition is next met. To
-    keep the port off until manually re-enabled, switch the mode to OFF first
-    via ``set_port_mode(device_id, port, mode="OFF")``.
-
-    Uses read-before-write. Defaults to dry_run=True — set dry_run=False to
-    write to the device.
+    Works for all device types including toggle hardware (heaters, lights,
+    on/off outlets). Uses read-before-write. Defaults to dry_run=True — set
+    dry_run=False to write to the device.
 
     Args:
         device_id: Device code from discover_devices (e.g. "C58ZA").
@@ -2080,7 +2075,7 @@ async def set_port_off(
         assert device is not None
 
         write_result = await asyncio.to_thread(
-            _client().set_port_mode, device, port, {"onSpead": 0}, dry_run
+            _client().set_port_mode, device, port, {"onSpead": 0, "atType": 1}, dry_run
         )
 
         if write_result.get("ai_plus_write_unsupported"):
@@ -3700,18 +3695,9 @@ async def break_out_of_automation(
         automation = _find_governing_automation(grouped, port)
 
         if automation is None:
-            if grouped:
-                has_active = any(g.get("enabled") or g.get("run_state") for g in grouped)
-                if not has_active:
-                    # All automations disabled (Quirk 19) — port stuck in disabled automation.
-                    return json.dumps({
-                        "error": (
-                            "Could not identify governing automation. "
-                            "No enabled or actively running automations found on this device."
-                        ),
-                    })
-            # Ghost state: either no automations at all, or active automations exist but none
-            # covers this port — modeType=15 flag is stale from a deleted automation.
+            # Ghost state: no active automation covers this port — modeType=15 flag is stale
+            # from a deleted or fully-disabled automation. Either way the port is not under
+            # active automation control, so the correct response is a no-op info message.
             _port_display = (
                 f"{port_name} (Port {port})" if port_name != f"Port {port}" else port_name
             )
@@ -3728,7 +3714,7 @@ async def break_out_of_automation(
 
         # Step 2: Identify co-governed ports from the governing automation's bitmasks.
         # Only ports in the same automation are locked — ports in other automations or
-        # empty/disconnected ports (portResistance==65535) are excluded.
+        # empty/disconnected ports (via _is_port_empty) are excluded.
         automation_port_nums: set[int] = set()
         for pg in automation.get("port_groups", []):
             bitmask = int(pg.get("grp_dev_type") or 0)
@@ -3742,7 +3728,7 @@ async def break_out_of_automation(
             p_num = p_data.get("port")
             if p_num not in automation_port_nums:
                 continue
-            if p_data.get("portResistance") == 65535:  # empty/disconnected — skip
+            if _is_port_empty(p_data, p_num, device):  # empty/disconnected — skip
                 continue
             raw_p_name = p_data.get("portName")
             p_name = _sanitize_api_string(raw_p_name, 64) if raw_p_name else f"Port {p_num}"
@@ -3868,7 +3854,7 @@ async def break_out_of_automation(
             except Exception as disable_exc:
                 logger.error(
                     "break_out_of_automation failed at disable step "
-                    "(device=%s auto=%s): %s", device_id, auto_name, disable_exc,
+                    "(device=%s): %s", device_id, disable_exc,
                 )
                 return json.dumps({
                     "error": "Failed to disable automation",
@@ -3876,7 +3862,33 @@ async def break_out_of_automation(
                     "detail": "see server logs",
                 })
 
-            # Step B: Lock co-governed ports to their current speeds.
+            # Step B: Wait briefly for the AC Infinity cloud to propagate the disable, then
+            # re-fetch device data. Two guards in _set_port_mode_inner check ADVANCE state:
+            # Guard 1 reads isOpenAutomation from devInfoListAll (the device dict we pass);
+            # Guard 2 reads modeType/isOpenAutomation from getdevModeSettingList (a fresh API
+            # call inside the write layer). Both return stale state immediately after the
+            # disable — the sleep allows both to settle before the co-port lock writes.
+            await asyncio.sleep(2.0)
+            _invalidate_device_cache()
+            device, err = await _get_device(device_id)
+            if err:
+                logger.error(
+                    "break_out_of_automation could not re-fetch device after disable "
+                    "(device=%s) — rollback: re-enabling automation", device_id,
+                )
+                try:
+                    await asyncio.to_thread(
+                        _client().enable_advance_automation, str(dev_id), adv_ids[0]
+                    )
+                except Exception:
+                    pass
+                return json.dumps({
+                    "error": "Automation disabled but re-fetch failed — automation re-enabled",
+                    "detail": "see server logs",
+                })
+            assert device is not None
+
+            # Step C: Lock co-governed ports to their current speeds.
             co_ports_locked: list[dict] = []
             failed_port = None
             for cp in co_ports:
@@ -3931,6 +3943,32 @@ async def break_out_of_automation(
                     ],
                 })
 
+            # Step D: Lock the target port to its automation-controlled speed so the grower
+            # sees no unexpected state change. The port is now under manual control; they
+            # can adjust from this baseline.
+            # Use the governing automation's on_speed (not ports_data["speak"]) because
+            # speak stores the last manually-set speed, not the automation-controlled speed.
+            governing_pg = _find_governing_port_group(automation, port)
+            target_speed = governing_pg.get("on_speed", 0) if governing_pg else 0
+            if target_speed > 0:
+                target_lock_updates: dict = {"atType": 2, "onSpead": target_speed}
+            else:
+                target_lock_updates = {"atType": 1, "onSpead": 0}
+            try:
+                await asyncio.to_thread(
+                    _client().set_port_mode, device, port, target_lock_updates, False
+                )
+            except Exception as tgt_exc:
+                logger.warning(
+                    "break_out_of_automation: could not lock target port %s to speed %s "
+                    "(device=%s): %s", port, target_speed, device_id, tgt_exc,
+                )
+                # Non-fatal: automation is disabled and port is free from automation control
+                # even if the baseline speed lock failed.
+
+        _target_speed_note = (
+            f" at speed {target_speed}" if target_speed > 0 else " (currently off)"
+        )
         return json.dumps({
             "action": f"release {_target_label} from '{auto_name}' automation",
             "dry_run": False,
@@ -3939,9 +3977,10 @@ async def break_out_of_automation(
             "co_ports_locked": co_ports_locked,
             "target_port": port,
             "target_port_freed": True,
+            "target_port_locked_to_speed": target_speed,
             "human_summary": (
-                f"Released {_target_label} from the '{auto_name}' automation. "
-                "You can now control it manually."
+                f"Released {_target_label} from the '{auto_name}' automation"
+                f"{_target_speed_note}. You can now control it manually."
             ),
             "sent": True,
         }, indent=2)

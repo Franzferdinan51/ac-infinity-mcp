@@ -1,5 +1,6 @@
 import asyncio
 import calendar
+import copy
 import dataclasses
 import json
 import logging
@@ -25,14 +26,26 @@ from ac_infinity_mcp.analytics import (
     detect_trends,
 )  # noqa: E402 (ruff isort: private names _ZERO_LOAD_DEV_TYPES/_filter_…/_parse_… sorted before public)
 from ac_infinity_mcp.automation import (
+    _RAIL_HUMI_HIGH,
+    _RAIL_HUMI_LOW,
+    _RAIL_TARGET_HUMI,
+    _RAIL_TARGET_TEMP_F,
+    _RAIL_TEMP_HIGH_F,
+    _RAIL_TEMP_LOW_F,
+    _RAIL_VPD_HIGH,
+    _RAIL_VPD_LOW,
     _build_advance_conflict_response,
+    _decode_rule,  # noqa: F401 — re-exported for test compatibility
     _find_governing_automation,
     _find_governing_port_group,
     _group_automations,
     _is_port_not_powered,  # noqa: F401 — re-exported for test compatibility
     _sanitize_api_string,
 )
-from ac_infinity_mcp.client import ACInfinityClient, build_add_groups_payload
+from ac_infinity_mcp.client import (
+    ACInfinityClient,
+    build_groups_payload,
+)
 from ac_infinity_mcp.formatting import (
     _effective_tz,
     _effective_unit,
@@ -191,6 +204,563 @@ def _validate_automation_id(automation_id: str) -> int | None:
     if _AUTOMATION_ID_RE.match(automation_id or ""):
         return int(automation_id)
     return None
+
+
+# ============ Automation Rule CRUD helpers (Issue #284) ============
+
+_RULE_MODES = ("off", "on", "cycle", "auto", "vpd")
+_CONTROL_STYLES = ("target", "trigger")
+
+# Day token set accepted by ``days``. Aliases expand to bitmasks (bit0=Mon … bit6=Sun).
+_DAY_TOKENS = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+}
+_DAY_ALIASES = {"all", "weekdays", "weekends"}
+
+# Sensor param ranges (upper bounds added per R7).
+_TEMP_F_MIN, _TEMP_F_MAX = 32, 212
+_HUMI_MIN, _HUMI_MAX = 0, 100
+_VPD_MIN, _VPD_MAX = 0.0, 9.9
+_TEMP_BUFFER_MAX = 180  # a sane °F delta upper bound
+_LEVEL_MIN, _LEVEL_MAX = 0, 10
+
+# °C rails the app pairs with the °F temperature rails (mirrors client.py; NOT derived).
+_RAIL_TEMP_HIGH_C = 90
+_RAIL_TEMP_LOW_C = 0
+
+# Which grower params are relevant to each mode. Any supplied param not in the
+# chosen mode's set is rejected (cross-mode param guard).
+_AUTO_SENSOR_FIELDS = {
+    "control_style", "temp_high_f", "temp_low_f", "humidity_high", "humidity_low",
+    "temp_target_f", "humidity_target",
+    "temp_buffer", "temp_transition", "humidity_buffer", "humidity_transition",
+}
+_VPD_SENSOR_FIELDS = {
+    "control_style", "vpd_target", "vpd_high", "vpd_low", "vpd_buffer", "vpd_transition",
+}
+_MODE_PARAM_FIELDS: dict[str, set[str]] = {
+    "off": set(),
+    "on": set(),
+    "cycle": {"cycle_on_minutes", "cycle_off_minutes"},
+    "auto": set(_AUTO_SENSOR_FIELDS),
+    "vpd": set(_VPD_SENSOR_FIELDS),
+}
+
+
+def _days_to_switchtime(days: list[str] | str | None, continuous: bool) -> int:
+    """Convert a ``days`` spec + ``continuous`` flag to the switchTime bitmask.
+
+    bit0=Mon … bit6=Sun; bit7 (128) = continuous (overrides days → 255 = 127|128).
+    ``days`` may be None (→ all 7 days), the string aliases "all"/"weekdays"/"weekends",
+    or a list of day-name tokens. Returns the integer switchTime value.
+    """
+    if continuous:
+        return 255
+    if days is None:
+        return 127  # default: every day scheduled
+    if isinstance(days, str):
+        alias = days.strip().lower()
+        if alias == "all":
+            return 127
+        if alias == "weekdays":
+            return 31  # Mon–Fri
+        if alias == "weekends":
+            return 96  # Sat | Sun = bit5 | bit6
+        # A single bare day token passed as a string.
+        if alias in _DAY_TOKENS:
+            return 1 << _DAY_TOKENS[alias]
+        return 127
+    mask = 0
+    for tok in days:
+        key = str(tok).strip().lower()
+        if key in _DAY_TOKENS:
+            mask |= 1 << _DAY_TOKENS[key]
+    return mask if mask else 127
+
+
+def _ports_bitmask(ports: list[int]) -> int:
+    """OR of 2**(p-1) for each port — the grouptDevType of a rule governing those ports."""
+    return sum(2 ** (p - 1) for p in ports)
+
+
+# Per-port target/setpoint capability (#288). devInfoListAll exposes a `modeTye` field per
+# port (note the API's typo): observed 15 = target-capable (UIS Pro+/AI firmware), 0 = legacy
+# with no target/setpoint support. It is PER-PORT — a devType=22 controller mixes 0 and 15
+# across its ports — so target must NEVER be gated by devType. A port that does not report
+# the field is treated as capable, so a device that omits it is never false-blocked.
+_MODETYE_NO_TARGET = 0
+
+
+def _ports_without_target_support(device: dict, ports: list[int]) -> list[int]:
+    """Return the subset of ``ports`` whose ``modeTye`` marks them as not target-capable."""
+    info_ports: dict[int, object] = {}
+    try:
+        for p in device.get("deviceInfo", {}).get("ports", []):
+            pn = p.get("port")
+            if pn is not None:
+                info_ports[int(pn)] = p.get("modeTye")
+    except (TypeError, ValueError, AttributeError):
+        return []
+    return [pt for pt in ports if info_ports.get(pt) == _MODETYE_NO_TARGET]
+
+
+def _target_capability_error(device: dict, ports: list[int]) -> str | None:
+    """Friendly error JSON if any governed port lacks target/setpoint support, else None.
+
+    Mirrors the AC Infinity app, which only offers a target/hold option on capable ports;
+    on a legacy port a target write renders as garbage rail triggers (#288).
+    """
+    bad = _ports_without_target_support(device, ports)
+    if not bad:
+        return None
+    labels = _ports_label(_build_port_name_map(device), bad)
+    return json.dumps({
+        "error": (
+            f"{labels} doesn't support target/hold mode on this controller —"
+            " use high/low thresholds (trigger) instead."
+        ),
+        "suggested_reply": (
+            f"{labels} can't hold a setpoint on this controller. I can set it to turn on"
+            " above or below a threshold instead — want me to do that?"
+        ),
+    })
+
+
+def _port_label_for(port_name_map: dict[int, str], port: int) -> str:
+    """Return 'Name (Port N)' or 'Port N' for a single port."""
+    raw = port_name_map.get(port, f"Port {port}")
+    return f"{raw} (Port {port})" if raw != f"Port {port}" else raw
+
+
+def _ports_label(port_name_map: dict[int, str], ports: list[int]) -> str:
+    """Comma-joined 'Name (Port N)' labels for a list of ports."""
+    return ", ".join(_port_label_for(port_name_map, p) for p in sorted(ports))
+
+
+# switchTime bit 7 (128) = continuous flag; mirrors automation._SWITCHTIME_CONTINUOUS_BIT.
+_SWITCHTIME_CONTINUOUS_BIT = 0x80
+
+
+def _rule_window_str(
+    begin_time: int | None,
+    end_time: int | None,
+    tz_label: str,
+    switch_time: int | None = None,
+) -> str:
+    """Format a rule window as 'HH:MM–HH:MM (tz)'. Falls back gracefully for sentinels.
+
+    When ``switch_time``'s continuous bit (0x80) is set the rule runs 24/7, so the window
+    reads "runs continuously" — agreeing with the ``control`` field instead of showing a
+    contradictory clock range. A degenerate zero-length window (begin==end) renders
+    "always active" rather than "00:00–00:00".
+    """
+    if switch_time is not None and switch_time & _SWITCHTIME_CONTINUOUS_BIT:
+        return "runs continuously"
+    begin_s = _format_schedule_time(begin_time)
+    end_s = _format_schedule_time(end_time)
+    if begin_s is None or end_s is None:
+        return "always active"
+    if begin_time == end_time:
+        return "always active"
+    return f"{begin_s}–{end_s} ({tz_label})"
+
+
+def _err(msg: str) -> str:
+    """Shorthand for a single-error JSON response string."""
+    return json.dumps({"error": msg})
+
+
+def _validate_rule_inputs(
+    mode: str,
+    *,
+    control_style: str | None = None,
+    min_level: int | None = None,
+    max_level: int | None = None,
+    temp_high_f: int | None = None,
+    temp_low_f: int | None = None,
+    humidity_high: int | None = None,
+    humidity_low: int | None = None,
+    temp_target_f: int | None = None,
+    humidity_target: int | None = None,
+    vpd_target: float | None = None,
+    vpd_high: float | None = None,
+    vpd_low: float | None = None,
+    temp_buffer: int | None = None,
+    temp_transition: int | None = None,
+    humidity_buffer: int | None = None,
+    humidity_transition: int | None = None,
+    vpd_buffer: float | None = None,
+    vpd_transition: float | None = None,
+    cycle_on_minutes: int | None = None,
+    cycle_off_minutes: int | None = None,
+    days: list[str] | str | None = None,
+    continuous: bool = False,
+    require_full: bool,
+) -> tuple[dict | None, str | None]:
+    """Validate compositional rule params; return (encoder_kwargs, error_json).
+
+    ``encoder_kwargs`` is a dict of validated, non-None values suitable for direct
+    splat into ``build_groups_payload`` (sensor params, min_level/max_level, switch_time,
+    cycle minutes, mode/control_style). ``require_full`` is True for add (all required
+    params for the mode must be present); for update missing params are allowed and simply
+    omitted (the caller overlays them onto the live rule). On failure returns
+    ``(None, error_json_string)``.
+    """
+    if mode not in _RULE_MODES:
+        return None, _err(f"mode must be one of: {', '.join(_RULE_MODES)}")
+
+    # Cross-mode param rejection: any non-None sensor/cycle param outside the mode's set.
+    supplied: dict[str, object] = {
+        "control_style": control_style,
+        "temp_high_f": temp_high_f, "temp_low_f": temp_low_f,
+        "humidity_high": humidity_high, "humidity_low": humidity_low,
+        "temp_target_f": temp_target_f, "humidity_target": humidity_target,
+        "vpd_target": vpd_target, "vpd_high": vpd_high, "vpd_low": vpd_low,
+        "temp_buffer": temp_buffer, "temp_transition": temp_transition,
+        "humidity_buffer": humidity_buffer, "humidity_transition": humidity_transition,
+        "vpd_buffer": vpd_buffer, "vpd_transition": vpd_transition,
+        "cycle_on_minutes": cycle_on_minutes, "cycle_off_minutes": cycle_off_minutes,
+    }
+    allowed = _MODE_PARAM_FIELDS[mode] | {"cycle_on_minutes", "cycle_off_minutes"} \
+        if mode == "cycle" else _MODE_PARAM_FIELDS[mode]
+    for field, value in supplied.items():
+        if value is not None and field not in allowed:
+            return None, _err(f"'{field}' does not apply to a {mode} rule and cannot be set.")
+
+    kwargs: dict = {"mode": mode}
+
+    # Speed range (shared across all modes that run a fan).
+    if min_level is not None:
+        if not _LEVEL_MIN <= min_level <= _LEVEL_MAX:
+            return None, _err("min_level must be 0–10")
+        kwargs["min_level"] = min_level
+    if max_level is not None:
+        if not _LEVEL_MIN <= max_level <= _LEVEL_MAX:
+            return None, _err("max_level must be 0–10")
+        kwargs["max_level"] = max_level
+    if min_level is not None and max_level is not None and min_level > max_level:
+        return None, _err("min_level must be less than or equal to max_level")
+
+    # Schedule (days → switchTime). continuous overrides days.
+    if days is not None and not isinstance(days, str):
+        if not days:
+            return None, _err(
+                "days can't be empty — give day names or 'all'/'weekdays'/'weekends'"
+            )
+        for tok in days:
+            if str(tok).strip().lower() not in _DAY_TOKENS:
+                return None, _err(
+                    "days must be day names (mon–sun) or 'all'/'weekdays'/'weekends'"
+                )
+    elif isinstance(days, str):
+        if days.strip().lower() not in (_DAY_ALIASES | set(_DAY_TOKENS)):
+            return None, _err(
+                "days must be day names (mon–sun) or 'all'/'weekdays'/'weekends'"
+            )
+    if days is not None or continuous:
+        kwargs["switch_time"] = _days_to_switchtime(days, continuous)
+
+    if mode in ("on", "off"):
+        return kwargs, None
+
+    if mode == "cycle":
+        if require_full and (cycle_on_minutes is None or cycle_off_minutes is None):
+            return None, _err("a cycle rule needs both an on-minutes and an off-minutes value")
+        for label, val in (("on", cycle_on_minutes), ("off", cycle_off_minutes)):
+            if val is not None and not 0 <= val <= 1439:
+                return None, _err(f"cycle {label}-minutes must be 0–1439")
+        if cycle_on_minutes is not None:
+            kwargs["cycle_on_minutes"] = cycle_on_minutes
+        if cycle_off_minutes is not None:
+            kwargs["cycle_off_minutes"] = cycle_off_minutes
+        return kwargs, None
+
+    # Auto / VPD share the control_style requirement.
+    if control_style is not None and control_style not in _CONTROL_STYLES:
+        return None, _err(f"control_style must be one of: {', '.join(_CONTROL_STYLES)}")
+    if require_full and control_style is None:
+        return None, _err(f"a {mode} rule needs control_style ('target' or 'trigger')")
+    if control_style is not None:
+        kwargs["control_style"] = control_style
+
+    if mode == "auto":
+        err = _validate_auto(
+            kwargs, control_style=control_style, require_full=require_full,
+            temp_high_f=temp_high_f, temp_low_f=temp_low_f,
+            humidity_high=humidity_high, humidity_low=humidity_low,
+            temp_target_f=temp_target_f, humidity_target=humidity_target,
+            temp_buffer=temp_buffer, temp_transition=temp_transition,
+            humidity_buffer=humidity_buffer, humidity_transition=humidity_transition,
+        )
+        if err:
+            return None, err
+        return kwargs, None
+
+    # mode == "vpd"
+    err = _validate_vpd(
+        kwargs, control_style=control_style, require_full=require_full,
+        vpd_target=vpd_target, vpd_high=vpd_high, vpd_low=vpd_low,
+        vpd_buffer=vpd_buffer, vpd_transition=vpd_transition,
+    )
+    if err:
+        return None, err
+    return kwargs, None
+
+
+def _validate_auto(
+    kwargs: dict,
+    *,
+    control_style: str | None,
+    require_full: bool,
+    temp_high_f: int | None,
+    temp_low_f: int | None,
+    humidity_high: int | None,
+    humidity_low: int | None,
+    temp_target_f: int | None,
+    humidity_target: int | None,
+    temp_buffer: int | None,
+    temp_transition: int | None,
+    humidity_buffer: int | None,
+    humidity_transition: int | None,
+) -> str | None:
+    """Validate Auto-mode sensor params, populating ``kwargs`` in place. Returns err or None."""
+    # #291: a temperature setpoint ("hold temp at X") is not supported by the AC Infinity app
+    # in Auto mode — it renders as thresholds, and no app-made rule ever sets one (targetTempF
+    # is always the rail). The encoder path was inferred without ground truth and is wrong.
+    # Reject with a redirect; humidity target and VPD target are supported and unaffected.
+    if temp_target_f is not None:
+        return _err(
+            "Holding a temperature setpoint isn't supported — use temperature high/low"
+            " thresholds (a trigger), or a VPD target, instead."
+        )
+    is_trigger_param = any(
+        v is not None for v in (temp_high_f, temp_low_f, humidity_high, humidity_low)
+    )
+    is_target_param = temp_target_f is not None or humidity_target is not None
+    # Mutual exclusion per sensor: temperature.
+    if temp_target_f is not None and (temp_high_f is not None or temp_low_f is not None):
+        return _err(
+            "For temperature you asked me to both hold a target and trigger on a"
+            " threshold — pick one."
+        )
+    if humidity_target is not None and (humidity_high is not None or humidity_low is not None):
+        return _err(
+            "For humidity you asked me to both hold a target and trigger on a"
+            " threshold — pick one."
+        )
+    if control_style == "trigger" and is_target_param:
+        return _err("a trigger rule cannot take a target value — set thresholds instead")
+    if control_style == "target" and is_trigger_param:
+        return _err("a target rule cannot take threshold values — set a target instead")
+    if require_full and control_style == "trigger" and not is_trigger_param:
+        return _err("a trigger rule needs at least one temperature or humidity threshold")
+    if require_full and control_style == "target" and not is_target_param:
+        return _err("a target rule needs a temperature or humidity target")
+
+    for label, val in (("temp_high_f", temp_high_f), ("temp_low_f", temp_low_f),
+                       ("temp_target_f", temp_target_f)):
+        if val is not None and not _TEMP_F_MIN <= val <= _TEMP_F_MAX:
+            return _err(f"{label} must be {_TEMP_F_MIN}–{_TEMP_F_MAX} °F")
+    if temp_low_f is not None and temp_high_f is not None and temp_low_f >= temp_high_f:
+        return _err("temp_low_f must be less than temp_high_f")
+    for label, val in (("humidity_high", humidity_high), ("humidity_low", humidity_low),
+                       ("humidity_target", humidity_target)):
+        if val is not None and not _HUMI_MIN <= val <= _HUMI_MAX:
+            return _err(f"{label} must be {_HUMI_MIN}–{_HUMI_MAX}%")
+    if humidity_low is not None and humidity_high is not None and humidity_low >= humidity_high:
+        return _err("humidity_low must be less than humidity_high")
+
+    # A trigger threshold sitting on its inactive rail decodes back as "no rule set" — reject
+    # it so the write is never silently lossy (a trigger above 100% RH / below freezing / at
+    # the temp ceiling can never fire anyway).
+    if temp_high_f is not None and temp_high_f >= _RAIL_TEMP_HIGH_F:
+        return _err(f"temp_high_f must be below {_RAIL_TEMP_HIGH_F}°F to trigger")
+    if temp_low_f is not None and temp_low_f <= _RAIL_TEMP_LOW_F:
+        return _err(f"temp_low_f must be above {_RAIL_TEMP_LOW_F}°F to trigger")
+    if humidity_high is not None and humidity_high >= _RAIL_HUMI_HIGH:
+        return _err(f"humidity_high must be below {_RAIL_HUMI_HIGH}% to trigger")
+    if humidity_low is not None and humidity_low <= _RAIL_HUMI_LOW:
+        return _err(f"humidity_low must be above {_RAIL_HUMI_LOW}% to trigger")
+    # A target sitting on its inactive rail decodes back as "no rule set" too (same lossy
+    # round-trip as the triggers above). VPD targets have no rail, so only temp/humidity here.
+    if temp_target_f is not None and temp_target_f <= _RAIL_TARGET_TEMP_F:
+        return _err(f"temp_target_f must be above {_RAIL_TARGET_TEMP_F}°F to hold")
+    if humidity_target is not None and humidity_target <= _RAIL_TARGET_HUMI:
+        return _err(f"humidity_target must be above {_RAIL_TARGET_HUMI}% to hold")
+
+    # Buffer XOR transition per sensor.
+    if temp_buffer is not None and temp_transition is not None:
+        return _err("set either a temperature buffer or a transition, not both")
+    if humidity_buffer is not None and humidity_transition is not None:
+        return _err("set either a humidity buffer or a transition, not both")
+    for label, val, hi in (
+        ("temp_buffer", temp_buffer, _TEMP_BUFFER_MAX),
+        ("temp_transition", temp_transition, _TEMP_BUFFER_MAX),
+        ("humidity_buffer", humidity_buffer, _HUMI_MAX),
+        ("humidity_transition", humidity_transition, _HUMI_MAX),
+    ):
+        if val is not None and not 0 <= val <= hi:
+            return _err(f"{label} must be 0–{hi}")
+
+    for name, val in (
+        ("temp_high_f", temp_high_f), ("temp_low_f", temp_low_f),
+        ("humidity_high", humidity_high), ("humidity_low", humidity_low),
+        ("temp_target_f", temp_target_f), ("humidity_target", humidity_target),
+        ("temp_buffer", temp_buffer), ("temp_transition", temp_transition),
+        ("humidity_buffer", humidity_buffer), ("humidity_transition", humidity_transition),
+    ):
+        if val is not None:
+            kwargs[name] = val
+    return None
+
+
+def _validate_vpd(
+    kwargs: dict,
+    *,
+    control_style: str | None,
+    require_full: bool,
+    vpd_target: float | None,
+    vpd_high: float | None,
+    vpd_low: float | None,
+    vpd_buffer: float | None,
+    vpd_transition: float | None,
+) -> str | None:
+    """Validate VPD-mode sensor params, populating ``kwargs`` in place. Returns err or None."""
+    is_trigger_param = vpd_high is not None or vpd_low is not None
+    is_target_param = vpd_target is not None
+    if is_target_param and is_trigger_param:
+        return _err(
+            "For VPD you asked me to both hold a target and trigger on a threshold — pick one."
+        )
+    if control_style == "trigger" and is_target_param:
+        return _err("a VPD trigger rule cannot take a target — set vpd_high / vpd_low instead")
+    if control_style == "target" and is_trigger_param:
+        return _err("a VPD target rule cannot take thresholds — set vpd_target instead")
+    if require_full and control_style == "trigger" and not is_trigger_param:
+        return _err("a VPD trigger rule needs vpd_high and/or vpd_low")
+    if require_full and control_style == "target" and not is_target_param:
+        return _err("a VPD target rule needs vpd_target")
+
+    for label, val in (("vpd_target", vpd_target), ("vpd_high", vpd_high),
+                       ("vpd_low", vpd_low)):
+        if val is not None and not _VPD_MIN <= val <= _VPD_MAX:
+            return _err(f"{label} must be {_VPD_MIN}–{_VPD_MAX} kPa")
+    if vpd_low is not None and vpd_high is not None and vpd_low >= vpd_high:
+        return _err("vpd_low must be less than vpd_high")
+    # A VPD trigger on its inactive rail (highVpd≥99 i.e. ≥9.9 kPa, or lowVpd≤0) decodes back
+    # as "no rule set" — reject the lossy write. VPD rails are stored ×10.
+    if vpd_high is not None and round(vpd_high * 10) >= _RAIL_VPD_HIGH:
+        return _err(f"vpd_high must be below {_RAIL_VPD_HIGH / 10:g} kPa to trigger")
+    if vpd_low is not None and round(vpd_low * 10) <= _RAIL_VPD_LOW:
+        return _err(f"vpd_low must be above {_RAIL_VPD_LOW / 10:g} kPa to trigger")
+    if vpd_buffer is not None and vpd_transition is not None:
+        return _err("set either a VPD buffer or a transition, not both")
+    for label, val in (("vpd_buffer", vpd_buffer), ("vpd_transition", vpd_transition)):
+        if val is not None and not _VPD_MIN <= val <= _VPD_MAX:
+            return _err(f"{label} must be {_VPD_MIN}–{_VPD_MAX} kPa")
+
+    for name, val in (
+        ("vpd_target", vpd_target), ("vpd_high", vpd_high), ("vpd_low", vpd_low),
+        ("vpd_buffer", vpd_buffer), ("vpd_transition", vpd_transition),
+    ):
+        if val is not None:
+            kwargs[name] = val
+    return None
+
+
+def _resolve_rule(
+    raw_entries: list[dict],
+    program_name: str,
+    ports: list[int],
+    begin_time: int | None,
+    end_time: int | None,
+    port_name_map: dict[int, str],
+    tz_label: str,
+) -> tuple[dict | None, list[dict], list[dict], str | None]:
+    """Resolve a single rule within one program by name + port bitmask + window.
+
+    Returns ``(match, disambiguation, program_rules, error_json)``:
+    - ``match`` is the raw getGroups entry when exactly one matches, else None.
+    - ``disambiguation`` is the user-facing rule list (no advId) when >1 match.
+    - ``program_rules`` is the user-facing list of all rules in the program (for the
+      0-match error).
+    - ``error_json`` is set (and the others empty) when the program does not exist.
+
+    Match key: ``advName == program_name AND grouptDevType == bitmask(ports)``, plus
+    ``beginTime``/``endTime`` when the caller supplied a window (exact equality).
+    """
+    bitmask = _ports_bitmask(ports)
+    clean_target = _sanitize_api_string(program_name, 64)
+
+    program_entries = [
+        e for e in raw_entries
+        if _sanitize_api_string(e.get("advName") or "", 64) == clean_target
+    ]
+
+    def _rule_view(e: dict) -> dict:
+        decoded = _decode_rule(e)
+        _bm = int(e.get("grouptDevType") or 0)
+        _ports = [bit + 1 for bit in range(8) if _bm & (1 << bit)]
+        return {
+            "ports": _ports_label(port_name_map, _ports) if _ports else "Unknown",
+            "control": decoded["control"],
+            "window": _rule_window_str(
+                e.get("beginTime"), e.get("endTime"), tz_label, e.get("switchTime")
+            ),
+            "running": bool(e.get("runState", 0)),
+        }
+
+    program_rules = [_rule_view(e) for e in program_entries]
+
+    if not program_entries:
+        return None, [], [], None  # caller decides program-not-found vs empty
+
+    # A program is a shared (groupNums, sortType) SLOT. If the name maps to more than one
+    # slot, editing/deleting "a rule in it" is ambiguous — we could mutate the wrong
+    # program. Refuse and ask the user to make the names unique (mirrors add_automation_rule).
+    slots = {(e.get("groupNums"), e.get("sortType")) for e in program_entries}
+    if len(slots) > 1:
+        ambiguous = json.dumps({
+            "error": (
+                f"More than one program named '{clean_target}'."
+                " Rename them so they're unique, then try again."
+            ),
+            "suggested_reply": (
+                f"There's more than one program called '{clean_target}', so I can't tell"
+                " which one you mean. Rename them to be unique and we'll try again."
+            ),
+        })
+        return None, [], program_rules, ambiguous
+
+    matches = [
+        e for e in program_entries
+        if int(e.get("grouptDevType") or 0) == bitmask
+        and (begin_time is None or e.get("beginTime") == begin_time)
+        and (end_time is None or e.get("endTime") == end_time)
+    ]
+
+    if len(matches) == 1:
+        return matches[0], [], program_rules, None
+    if len(matches) > 1:
+        return None, [_rule_view(e) for e in matches], program_rules, None
+    return None, [], program_rules, None
+
+
+def _build_port_name_map(device: dict) -> dict[int, str]:
+    """Map port number → base name (no '(Port N)' suffix), sanitized."""
+    port_name_map: dict[int, str] = {}
+    try:
+        for _p in device.get("deviceInfo", {}).get("ports", []):
+            _pnum = _p.get("port")
+            if _pnum is None:
+                continue
+            _raw = _p.get("portName")
+            port_name_map[int(_pnum)] = (
+                _sanitize_api_string(_raw, 64) if _raw else f"Port {_pnum}"
+            )
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return port_name_map
 
 
 # ============ MCP Tools ============
@@ -2191,6 +2761,10 @@ async def set_vpd_automation(
         dry_run: If True (default), returns the payload that would be sent
             without writing.
 
+    This is a target/hold write, so the port must support setpoints. A port that
+    does not report target capability is rejected with guidance to use high/low
+    thresholds instead.
+
     Returns:
         JSON with action, device_id, port, target_vpd_kpa, dry_run,
         controller_type, sent, and payload (when dry_run=True).
@@ -2206,6 +2780,12 @@ async def set_vpd_automation(
         if err:
             return err
         assert device is not None
+
+        # #288: VPD automation here is a target/hold (vpdSettingMode=1). Gate on the port's
+        # modeTye capability — a target on a legacy port renders as garbage rail triggers.
+        cap_err = _target_capability_error(device, [port])
+        if cap_err:
+            return cap_err
 
         updates = {
             "atType": 8,  # VPD mode
@@ -2773,6 +3353,12 @@ async def apply_grow_stage_template(
         return err
     assert device is not None
 
+    # #288: the grow-stage template sets a VPD target (vpdSettingMode=1). Gate on the port's
+    # modeTye capability so a legacy port doesn't get a garbage rail-trigger rule.
+    cap_err = _target_capability_error(device, [port])
+    if cap_err:
+        return cap_err
+
     # Single atomic write: VPD mode active, temp/humidity thresholds stored on the
     # controller for fallback if the user later switches to AUTO mode. Earlier
     # versions issued three separate writes; the temp and humidity writes carried
@@ -3085,6 +3671,30 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
             "timezone": _tz_label,
         }
 
+        # Per-rule read parity: one entry per port_group, using the same _decode_rule
+        # control wording and window-with-timezone shape the write tools emit. _mode is
+        # underscore-prefixed = internal/round-trip only; Claude reads control + window.
+        rules_out = []
+        for pg in port_groups:
+            _bm = int(pg.get("grp_dev_type") or 0)
+            _pg_ports = [bit + 1 for bit in range(8) if _bm & (1 << bit)]
+            _rule = pg.get("rule") or {}
+            rules_out.append({
+                "ports": (
+                    _ports_label({p: port_name_map.get(p, f"Port {p}") for p in _pg_ports},
+                                 _pg_ports)
+                    if _pg_ports else "Unknown"
+                ),
+                "control": _rule.get("control", "unknown rule type"),
+                "speed": pg.get("on_speed"),
+                "window": _rule_window_str(
+                    pg.get("begin_time"), pg.get("end_time"), _tz_label,
+                    pg.get("switch_time"),
+                ),
+                "running": pg.get("run_state", False),
+                "_mode": _rule.get("mode", "unknown"),
+            })
+
         return json.dumps({
             "device_id": device_id,
             "automation_id": found["automation_id"],
@@ -3095,6 +3705,7 @@ async def get_advance_automation(device_id: str, automation_id: str) -> str:
             "port_groups": port_groups_out,
             "governed_ports": governed_ports,
             "port_resolution": port_resolution,
+            "rules": rules_out,
             "human_summary": human_summary,
         }, indent=2)
 
@@ -3355,8 +3966,21 @@ async def create_advance_automation(
     on_speed: int,
     port: int,
     off_speed: int = 0,
-    begin_time: int = 0,
-    end_time: int = 1439,
+    begin_time: int | None = None,
+    end_time: int | None = None,
+    mode: str = "on",
+    control_style: str | None = None,
+    temp_high_f: int | None = None,
+    temp_low_f: int | None = None,
+    humidity_high: int | None = None,
+    humidity_low: int | None = None,
+    temp_target_f: int | None = None,
+    humidity_target: int | None = None,
+    vpd_target: float | None = None,
+    vpd_high: float | None = None,
+    vpd_low: float | None = None,
+    cycle_on_minutes: int | None = None,
+    cycle_off_minutes: int | None = None,
     dry_run: bool = True,
 ) -> str:
     """Create a new Advance Automation on a device.
@@ -3375,12 +3999,27 @@ async def create_advance_automation(
         name: Automation name (max 64 chars, control chars stripped).
         on_speed: Fan speed when automation is active (1–10).
         port: 1-based port number the automation should control (1–8).
-        off_speed: Not used — On mode relies on the port's own minimum speed setting.
-            Parameter accepted for compatibility but not sent to the device.
-        begin_time: Schedule start in minutes since midnight (0–1439, or 255=always active).
-            Default: 0 (midnight). Use 255 for "always active" (runs 00:00–23:59 every day).
-        end_time: Schedule end in minutes since midnight (0–1439, or 255=always active).
-            Default: 1439 (23:59). Use 255 for "always active".
+        off_speed: Minimum fan level when inactive (0–10). Default 0.
+        begin_time: Schedule start in minutes since midnight (0–1439). Omit (with end_time)
+            for a continuous 24/7 automation — the app's default toggle.
+        end_time: Schedule end in minutes since midnight (0–1439). Omit (with begin_time)
+            for a continuous 24/7 automation.
+        mode: Behavior of the first rule — on (default), off, cycle, auto, vpd.
+        control_style: "target" or "trigger" (required for auto and vpd). Inference:
+            "hold/keep/maintain at X" -> target; "above/below/turn on at" -> trigger.
+        temp_high_f: Turn on above this °F (auto trigger).
+        temp_low_f: Turn on below this °F (auto trigger).
+        humidity_high: Turn on above this % (auto trigger).
+        humidity_low: Turn on below this % (auto trigger).
+        temp_target_f: NOT SUPPORTED — holding a temperature setpoint isn't offered by the
+            AC Infinity app and renders as thresholds; this is rejected. Use temperature
+            high/low thresholds (a trigger), or a VPD target, instead.
+        humidity_target: Hold this % (auto target).
+        vpd_target: Hold this kPa (vpd target).
+        vpd_high: Turn on above this kPa (vpd trigger).
+        vpd_low: Turn on below this kPa (vpd trigger).
+        cycle_on_minutes: Minutes on (for mode="cycle").
+        cycle_off_minutes: Minutes off (for mode="cycle").
         dry_run: If True (default), previews the automation without sending it.
             Set to False to create the automation on the device.
 
@@ -3408,15 +4047,33 @@ async def create_advance_automation(
             return json.dumps({"error": "on_speed must be 1–10"})
         if not 0 <= off_speed <= 10:
             return json.dumps({"error": "off_speed must be 0–10"})
+        # Optional per-mode behavior for the first rule (default mode="on" = unchanged path).
+        # max_level=on_speed preserves the legacy On-mode byte-identity (onSpeed=on_speed).
+        rule_kwargs, _rule_err = _validate_rule_inputs(
+            mode,
+            control_style=control_style, min_level=off_speed, max_level=on_speed,
+            temp_high_f=temp_high_f, temp_low_f=temp_low_f,
+            humidity_high=humidity_high, humidity_low=humidity_low,
+            temp_target_f=temp_target_f, humidity_target=humidity_target,
+            vpd_target=vpd_target, vpd_high=vpd_high, vpd_low=vpd_low,
+            cycle_on_minutes=cycle_on_minutes, cycle_off_minutes=cycle_off_minutes,
+            require_full=mode not in ("on", "off"),
+        )
+        if _rule_err:
+            return _rule_err
+        assert rule_kwargs is not None
+        # #287: with no schedule given at all, default to the continuous 24/7 toggle (what the
+        # app does) rather than a 00:00–23:59 window. An explicit window is honored as-is.
+        create_continuous = begin_time is None and end_time is None
+        begin_time = 0 if begin_time is None else begin_time
+        end_time = 1439 if end_time is None else end_time
         if not (0 <= begin_time <= 1439 or begin_time == _SCHEDULE_ALWAYS_ACTIVE):
             return json.dumps({"error": "begin_time must be 0–1439 or 255 (no schedule)"})
         if not (0 <= end_time <= 1439 or end_time == _SCHEDULE_ALWAYS_ACTIVE):
             return json.dumps({"error": "end_time must be 0–1439 or 255 (no schedule)"})
-        if (begin_time != _SCHEDULE_ALWAYS_ACTIVE and end_time != _SCHEDULE_ALWAYS_ACTIVE
-                and begin_time > end_time):
-            return json.dumps(
-                {"error": "begin_time must be <= end_time (or both 255 for no schedule)"}
-            )
+        # Wrap-around windows (begin > end, e.g. lights-on 09:00→03:00) are VALID and
+        # required for the two-window pattern — the controller and add_automation_rule both
+        # permit them. Do NOT reject begin > end here (kept consistent with add_automation_rule).
         if (begin_time == _SCHEDULE_ALWAYS_ACTIVE) != (end_time == _SCHEDULE_ALWAYS_ACTIVE):
             return json.dumps({
                 "error": (
@@ -3473,10 +4130,25 @@ async def create_advance_automation(
         raw_port_nm = port_obj.get("portName")
         port_name = _sanitize_api_string(raw_port_nm, 64) if raw_port_nm else f"Port {port}"
 
+        # #288: a target/hold rule on a port that doesn't support target mode renders as
+        # garbage rail triggers. Gate on the port's modeTye capability (mirrors the app).
+        if control_style == "target":
+            cap_err = _target_capability_error(device, [port])
+            if cap_err:
+                return cap_err
+
         port_settings = await asyncio.to_thread(_client().get_mode_settings, str(dev_id), port)
         min_speed = int(port_settings.get("offSpead", 0))
 
-        schedule_summary = _format_schedule_summary(begin_time, end_time)
+        disp_begin: str | None
+        disp_end: str | None
+        if create_continuous:
+            schedule_summary = "Runs continuously (24/7)"
+            disp_begin = disp_end = "continuous"
+        else:
+            schedule_summary = _format_schedule_summary(begin_time, end_time)
+            disp_begin = _format_schedule_time(begin_time)
+            disp_end = _format_schedule_time(end_time)
 
         if dry_run:
             return json.dumps({
@@ -3486,8 +4158,8 @@ async def create_advance_automation(
                 "port_name": port_name,
                 "on_speed": on_speed,
                 "min_speed": min_speed,
-                "begin_time": _format_schedule_time(begin_time),
-                "end_time": _format_schedule_time(end_time),
+                "begin_time": disp_begin,
+                "end_time": disp_end,
                 "schedule_summary": schedule_summary,
                 "dry_run": True,
                 "sent": False,
@@ -3497,14 +4169,21 @@ async def create_advance_automation(
                 ),
             })
 
-        # Live path: build full addGroups payload via client helper
-        payload = build_add_groups_payload(
+        # Live path: build full addGroups payload via client helper. mode="on" reproduces
+        # the original single-port On-mode payload byte-for-byte (on_speed passed directly).
+        # #287: continuous → switch_time 255 (the 24/7 toggle), else the default day schedule.
+        build_extra = {k: v for k, v in rule_kwargs.items() if k not in ("min_level", "max_level")}
+        if create_continuous:
+            build_extra["switch_time"] = _days_to_switchtime(None, True)
+        payload = build_groups_payload(
             dev_id=str(dev_id),
-            port=port,
+            ports=[port],
             clean_name=clean_name,
-            on_speed=on_speed,
             begin_time=begin_time,
             end_time=end_time,
+            on_speed=on_speed,
+            min_level=off_speed,
+            **build_extra,
         )
 
         result = await asyncio.to_thread(_client().create_advance_automation, str(dev_id), payload)
@@ -3643,6 +4322,918 @@ async def delete_advance_automation(
         return json.dumps({"error": str(e)})
     except Exception as e:
         logger.error("Unexpected error in delete_advance_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+def _validate_rule_ports(
+    ports: list[int], device: dict, device_id: str
+) -> str | None:
+    """Validate every port in ``ports`` exists on the device. Returns error_json or None."""
+    if not ports:
+        return json.dumps({"error": "ports must list at least one port number"})
+    ports_list = device.get("deviceInfo", {}).get("ports", [])
+    valid_ports = {p.get("port") for p in ports_list if p.get("port") is not None}
+    for p in ports:
+        if not isinstance(p, int) or p < 1 or p > 8:
+            return json.dumps({"error": f"Port {p} is invalid — ports are numbered 1–8"})
+        if p not in valid_ports:
+            available = [
+                {
+                    "port": pp.get("port"),
+                    "name": (
+                        _sanitize_api_string(pp.get("portName"), 64)
+                        if pp.get("portName")
+                        else f"Port {pp.get('port')}"
+                    ),
+                }
+                for pp in ports_list
+                if pp.get("port") is not None
+            ]
+            return json.dumps({
+                "error": f"Port {p} not found on device {device_id}",
+                "available_ports": available,
+                "suggested_reply": (
+                    f"Port {p} isn't in use on this device. Let me show you what's connected."
+                ),
+            })
+    return None
+
+
+# Friendly write-failure messages, mapped from contained-substring detection on a locally
+# held copy of the upstream string (R6 — never echo the upstream text to the client).
+_OVERLAP_UPSTREAM_MARKER = "Adv exist"
+# Anchored to the "{context} API error {code}: {msg}" client format so a bare "100001"
+# appearing elsewhere in the message (e.g. inside a sanitized name) can't false-positive.
+_WEDGED_DELETE_UPSTREAM_MARKER = "error 100001"
+_OVERLAP_FRIENDLY = (
+    "A rule already covers those ports during that window — pick a different time"
+    " or update the existing rule."
+)
+_WEDGED_FRIENDLY = (
+    "The controller was busy and may or may not have applied that change. Before trying"
+    " again, ask me to list the program's rules so we can see whether it took — retrying"
+    " blindly can apply it twice. If it didn't take and the controller stays busy, restart"
+    " the controller."
+)
+
+
+def _map_write_failure(exc: Exception) -> str | None:
+    """Return a self-authored friendly message for a recognized write failure, else None.
+
+    Detection is by contained-substring on a locally-held copy of the upstream string; the
+    upstream text itself is NEVER surfaced to the client (logged at ERROR by the caller).
+    """
+    local = str(exc)
+    if _OVERLAP_UPSTREAM_MARKER in local:
+        return _OVERLAP_FRIENDLY
+    if _WEDGED_DELETE_UPSTREAM_MARKER in local:
+        return _WEDGED_FRIENDLY
+    return None
+
+
+@mcp_server.tool()
+async def add_automation_rule(
+    device_id: str,
+    program_name: str,
+    ports: list[int],
+    mode: str,
+    control_style: str | None = None,
+    min_level: int = 0,
+    max_level: int = 10,
+    temp_high_f: int | None = None,
+    temp_low_f: int | None = None,
+    humidity_high: int | None = None,
+    humidity_low: int | None = None,
+    temp_target_f: int | None = None,
+    humidity_target: int | None = None,
+    vpd_target: float | None = None,
+    vpd_high: float | None = None,
+    vpd_low: float | None = None,
+    temp_buffer: int | None = None,
+    temp_transition: int | None = None,
+    humidity_buffer: int | None = None,
+    humidity_transition: int | None = None,
+    vpd_buffer: float | None = None,
+    vpd_transition: float | None = None,
+    cycle_on_minutes: int | None = None,
+    cycle_off_minutes: int | None = None,
+    begin_time: int | None = None,
+    end_time: int | None = None,
+    days: list[str] | str | None = None,
+    continuous: bool = False,
+    dry_run: bool = True,
+) -> str:
+    """Add one rule to an existing Advance Automation program.
+
+    A program is a named automation (e.g. "Seedling"); a rule is one schedule window +
+    behavior for one or more ports inside that program. This appends a new rule. I'll
+    preview the rule before sending it.
+
+    Behavior is chosen with ``mode``:
+    - ``off``: keep the port(s) off during the window.
+    - ``on``: run the port(s) between ``min_level`` and ``max_level``.
+    - ``cycle``: alternate on/off using ``cycle_on_minutes`` / ``cycle_off_minutes``.
+    - ``auto``: respond to temperature and/or humidity. Needs ``control_style``:
+      - ``target`` — hold a setpoint (``humidity_target``, or ``temp_target_f`` where the
+        device supports it).
+      - ``trigger`` — turn on at thresholds (``temp_high_f``/``temp_low_f`` and/or
+        ``humidity_high``/``humidity_low``).
+    - ``vpd``: respond to VPD. Needs ``control_style``: ``target`` (``vpd_target``) or
+      ``trigger`` (``vpd_high``/``vpd_low``).
+
+    Control-style inference (from how the user phrases it): "hold/keep/maintain at X" →
+    target; "above/below/when it rises|drops/turn on at" → trigger.
+
+    Example (target): to keep humidity at 65%, use mode='auto', control_style='target',
+    humidity_target=65.
+
+    Buffer vs transition (per sensor, choose at most one each): a buffer is a deadband; a
+    transition ramps speed across the band. Set ``temp_buffer`` OR ``temp_transition``, etc.
+
+    The schedule window (``begin_time``/``end_time``, minutes since midnight) may wrap past
+    midnight. ``days`` accepts day names (mon–sun), "all", "weekdays", or "weekends".
+    ``continuous=True`` runs 24/7 (ignores the window).
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        program_name: The name of the existing program to add the rule to.
+        ports: One or more 1-based port numbers this rule controls.
+        mode: One of off, on, cycle, auto, vpd.
+        control_style: "target" or "trigger" (required for auto and vpd).
+        min_level: Minimum fan level when the rule is inactive (0–10). Default 0.
+        max_level: Maximum/active fan level (0–10). Default 10.
+        temp_high_f: Turn on above this °F (auto trigger).
+        temp_low_f: Turn on below this °F (auto trigger).
+        humidity_high: Turn on above this % (auto trigger).
+        humidity_low: Turn on below this % (auto trigger).
+        temp_target_f: NOT SUPPORTED — holding a temperature setpoint isn't offered by the
+            AC Infinity app and renders as thresholds; this is rejected. Use temperature
+            high/low thresholds (a trigger), or a VPD target, instead.
+        humidity_target: Hold this % (auto target).
+        vpd_target: Hold this kPa (vpd target).
+        vpd_high: Turn on above this kPa (vpd trigger).
+        vpd_low: Turn on below this kPa (vpd trigger).
+        temp_buffer: Temperature deadband °F (auto). Mutually exclusive with temp_transition.
+        temp_transition: Temperature ramp band °F (auto).
+        humidity_buffer: Humidity deadband % (auto). Mutually exclusive with the transition.
+        humidity_transition: Humidity ramp band % (auto).
+        vpd_buffer: VPD deadband kPa (vpd). Mutually exclusive with vpd_transition.
+        vpd_transition: VPD ramp band kPa (vpd).
+        cycle_on_minutes: Minutes on, for a cycle rule.
+        cycle_off_minutes: Minutes off, for a cycle rule.
+        begin_time: Window start, minutes since midnight (0–1439). Omit for a 24/7 rule.
+        end_time: Window end, minutes since midnight (0–1439). Omit for a 24/7 rule.
+        days: Day names, "all", "weekdays", or "weekends". Default all days.
+        continuous: Run 24/7 (ignores the window). Default False.
+        dry_run: If True (default), previews the rule without sending it.
+
+    Returns:
+        JSON with action, program_name, the new rule (ports, control, window), and
+        sent/preview status. On failure returns ``{"error": "..."}``.
+    """
+    try:
+        # #287: with no schedule given at all, default to continuous 24/7 (the app's default
+        # toggle) rather than a 00:00–23:59 scheduled window. An explicit window or days, or
+        # continuous=True, is honored as-is.
+        if begin_time is None and end_time is None and days is None and not continuous:
+            continuous = True
+        begin_time = 0 if begin_time is None else begin_time
+        end_time = 1439 if end_time is None else end_time
+        for label, val in (("begin_time", begin_time), ("end_time", end_time)):
+            if not 0 <= val <= 1439:
+                return json.dumps({"error": f"{label} must be 0–1439 (minutes since midnight)"})
+
+        kwargs, err = _validate_rule_inputs(
+            mode, control_style=control_style, min_level=min_level, max_level=max_level,
+            temp_high_f=temp_high_f, temp_low_f=temp_low_f,
+            humidity_high=humidity_high, humidity_low=humidity_low,
+            temp_target_f=temp_target_f, humidity_target=humidity_target,
+            vpd_target=vpd_target, vpd_high=vpd_high, vpd_low=vpd_low,
+            temp_buffer=temp_buffer, temp_transition=temp_transition,
+            humidity_buffer=humidity_buffer, humidity_transition=humidity_transition,
+            vpd_buffer=vpd_buffer, vpd_transition=vpd_transition,
+            cycle_on_minutes=cycle_on_minutes, cycle_off_minutes=cycle_off_minutes,
+            days=days, continuous=continuous, require_full=True,
+        )
+        if err:
+            return err
+        assert kwargs is not None
+
+        device, derr = await _get_device(device_id, for_write=True)
+        if derr:
+            return derr
+        assert device is not None
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        perr = _validate_rule_ports(ports, device, device_id)
+        if perr:
+            return perr
+
+        # #288: gate target/hold on the governed ports' modeTye capability.
+        if control_style == "target":
+            cap_err = _target_capability_error(device, ports)
+            if cap_err:
+                return cap_err
+
+        port_name_map = _build_port_name_map(device)
+        tz_label = device.get("zoneId") or "device-local time"
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        clean_program = _sanitize_api_string(program_name, 64)
+        program_entries = [
+            e for e in raw
+            if _sanitize_api_string(e.get("advName") or "", 64) == clean_program
+        ]
+        if not program_entries:
+            names = sorted({
+                _sanitize_api_string(e.get("advName") or "", 64) for e in raw
+            })
+            return json.dumps({
+                "error": f"No program named '{clean_program}' on device {device_id}",
+                "existing_programs": names,
+                "suggested_reply": (
+                    f"I don't see a program called '{clean_program}'."
+                    f" Existing programs: {', '.join(names) if names else 'none'}."
+                ),
+            })
+
+        # A program is a shared (groupNums, sortType) SLOT; its rules carry sequential
+        # subNumber. Append = isFlag=0 + the target slot + next subNumber (existing max + 1).
+        slots = {
+            (e.get("groupNums"), e.get("sortType")) for e in program_entries
+        }
+        if len(slots) > 1:
+            return json.dumps({
+                "error": (
+                    f"More than one program named '{clean_program}' on device {device_id}."
+                    " Rename them so they're unique, then add the rule to the one you want."
+                ),
+                "suggested_reply": (
+                    f"There's more than one program called '{clean_program}', so I can't tell"
+                    " which to add to. Rename them to be unique and we'll try again."
+                ),
+            })
+        group_nums, sort_type = next(iter(slots))
+        next_sub = max((e.get("subNumber") or 0) for e in program_entries) + 1
+        payload = build_groups_payload(
+            dev_id=str(dev_id), ports=ports, clean_name=clean_program,
+            begin_time=begin_time, end_time=end_time,
+            is_flag=0, group_nums=group_nums, sort_type=sort_type, sub_number=next_sub,
+            **kwargs,
+        )
+        decoded = _decode_rule(payload)
+        rule_view = {
+            "ports": _ports_label(port_name_map, ports),
+            "control": decoded["control"],
+            "window": _rule_window_str(
+                begin_time, end_time, tz_label, payload.get("switchTime")
+            ),
+            "_mode": decoded["mode"],
+        }
+
+        if dry_run:
+            return json.dumps({
+                "action": f"add rule to '{clean_program}'",
+                "program_name": clean_program,
+                "rule": rule_view,
+                "dry_run": True,
+                "sent": False,
+                "note": "Preview only — nothing sent yet. Confirm to add this rule.",
+            })
+
+        try:
+            await asyncio.to_thread(_client().create_advance_automation, str(dev_id), payload)
+        except ACInfinityAPIError as e:
+            friendly = _map_write_failure(e)
+            if friendly is not None:
+                logger.error("add_automation_rule write failed (%s): %s", device_id, e)
+                return json.dumps({"error": friendly})
+            raise
+        return json.dumps({
+            "action": f"add rule to '{clean_program}'",
+            "program_name": clean_program,
+            "rule": rule_view,
+            "dry_run": False,
+            "sent": True,
+            "human_summary": (
+                f"Added a rule on {_ports_label(port_name_map, ports)}"
+                f" ({decoded['control']}) for"
+                f" {_rule_window_str(begin_time, end_time, tz_label, payload.get('switchTime'))}."
+            ),
+        })
+
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in add_automation_rule: %s", e)
+        return json.dumps({"error": _AUTH_ERROR_MSG, "detail": "see server logs"})
+    except ACInfinityAPIError as e:
+        logger.error("API error in add_automation_rule: %s", e)
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in add_automation_rule (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in add_automation_rule: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+# Per-mode payload field sets — the enumerated keys the update overlay copies from a
+# rebuilt signature onto the live body (R6: only the enumerated per-mode field set is
+# overlaid; never a wholesale spread of caller input).
+_AUTO_SIGNATURE_KEYS = (
+    "currentMode", "setSelect", "settingMode",
+    "autoLowTempF", "autoHighTempF", "autoLowTempC", "autoHighTempC",
+    "autoLowTempSwitch", "autoHighTempSwitch",
+    "autoLowHumi", "autoHighHumi", "autoLowHumiSwitch", "autoHighHumiSwitch",
+    "targetHumi", "targetTempF", "targetTSwitch", "targetHumiSwitch", "targetVpdSwitch",
+    "highVpd", "lowVpd", "highVpdSwitch", "lowVpdSwitch", "targetVpd",
+    # Buffer/transition: included so a mode-change rebuild applies newly-supplied values
+    # AND clears any stale value carried over from the prior mode (rebuilt default = 0).
+    "temperatureFBuff", "temperatureFTrans", "humidityBuff", "humidityTrans",
+    "vpdBuff", "vpdTrans",
+)
+_VPD_SIGNATURE_KEYS = (
+    "currentMode", "setSelect", "settingMode",
+    "targetVpd", "targetVpdSwitch", "highVpd", "lowVpd", "highVpdSwitch", "lowVpdSwitch",
+    "vpdBuff", "vpdTrans", "temperatureFBuff", "temperatureFTrans",
+    "humidityBuff", "humidityTrans",
+)
+_CYCLE_SIGNATURE_KEYS = ("currentMode", "cycleOn", "cycleOff")
+_ON_OFF_SIGNATURE_KEYS = ("currentMode",)
+
+
+def _signature_keys_for(mode: str) -> tuple[str, ...]:
+    if mode == "auto":
+        return _AUTO_SIGNATURE_KEYS
+    if mode == "vpd":
+        return _VPD_SIGNATURE_KEYS
+    if mode == "cycle":
+        return _CYCLE_SIGNATURE_KEYS
+    return _ON_OFF_SIGNATURE_KEYS
+
+
+def _overlay_same_mode(
+    body: dict,
+    mode: str,
+    *,
+    temp_high_f: int | None,
+    temp_low_f: int | None,
+    humidity_high: int | None,
+    humidity_low: int | None,
+    temp_target_f: int | None,
+    humidity_target: int | None,
+    vpd_target: float | None,
+    vpd_high: float | None,
+    vpd_low: float | None,
+    temp_buffer: int | None,
+    temp_transition: int | None,
+    humidity_buffer: int | None,
+    humidity_transition: int | None,
+    vpd_buffer: float | None,
+    vpd_transition: float | None,
+    cycle_on_minutes: int | None,
+    cycle_off_minutes: int | None,
+    control_style: str | None,
+) -> None:
+    """Overlay only the changed sensor/cycle fields onto a same-mode rule body in place.
+
+    Setting a trigger threshold activates its switch (=1); the unused threshold is left
+    untouched. Setting a target writes its value (the live body already carries the
+    target settingMode/rail shape from the captured signature).
+    """
+    if mode == "cycle":
+        # cycleOn/cycleOff are stored in SECONDS (minutes × 60); see build_groups_payload.
+        if cycle_on_minutes is not None:
+            body["cycleOn"] = cycle_on_minutes * 60
+        if cycle_off_minutes is not None:
+            body["cycleOff"] = cycle_off_minutes * 60
+        return
+
+    if mode == "auto":
+        if temp_high_f is not None:
+            body["autoHighTempF"] = temp_high_f
+            body["autoHighTempC"] = _RAIL_TEMP_HIGH_C
+            body["autoHighTempSwitch"] = 1
+        if temp_low_f is not None:
+            body["autoLowTempF"] = temp_low_f
+            body["autoLowTempC"] = _RAIL_TEMP_LOW_C
+            body["autoLowTempSwitch"] = 1
+        if humidity_high is not None:
+            body["autoHighHumi"] = humidity_high
+            body["autoHighHumiSwitch"] = 1
+        if humidity_low is not None:
+            body["autoLowHumi"] = humidity_low
+            body["autoLowHumiSwitch"] = 1
+        if temp_target_f is not None:
+            body["targetTempF"] = temp_target_f
+        if humidity_target is not None:
+            body["targetHumi"] = humidity_target
+        if temp_buffer is not None:
+            body["temperatureFBuff"] = temp_buffer
+        if temp_transition is not None:
+            body["temperatureFTrans"] = temp_transition
+        if humidity_buffer is not None:
+            body["humidityBuff"] = humidity_buffer
+        if humidity_transition is not None:
+            body["humidityTrans"] = humidity_transition
+        return
+
+    if mode == "vpd":
+        if vpd_target is not None:
+            # VPD-target mirrors the setpoint into BOTH targetVpd and highVpd (the app's
+            # signature; see _apply_vpd / #288). The same-mode overlay must mirror too, or the
+            # rule ends up with targetVpd != highVpd — a shape no app rule ever has.
+            tgt = round(vpd_target * 10)
+            body["targetVpd"] = tgt
+            body["highVpd"] = tgt
+            body["highVpdSwitch"] = 1
+            body["lowVpd"] = 0
+            body["lowVpdSwitch"] = 0
+        if vpd_high is not None:
+            body["highVpd"] = round(vpd_high * 10)
+            body["highVpdSwitch"] = 1
+        if vpd_low is not None:
+            body["lowVpd"] = round(vpd_low * 10)
+            body["lowVpdSwitch"] = 1
+        if vpd_buffer is not None:
+            body["vpdBuff"] = round(vpd_buffer * 10)
+        if vpd_transition is not None:
+            body["vpdTrans"] = round(vpd_transition * 10)
+
+
+@mcp_server.tool()
+async def update_automation_rule(
+    device_id: str,
+    program_name: str,
+    ports: list[int],
+    begin_time: int | None = None,
+    end_time: int | None = None,
+    mode: str | None = None,
+    control_style: str | None = None,
+    min_level: int | None = None,
+    max_level: int | None = None,
+    temp_high_f: int | None = None,
+    temp_low_f: int | None = None,
+    humidity_high: int | None = None,
+    humidity_low: int | None = None,
+    temp_target_f: int | None = None,
+    humidity_target: int | None = None,
+    vpd_target: float | None = None,
+    vpd_high: float | None = None,
+    vpd_low: float | None = None,
+    temp_buffer: int | None = None,
+    temp_transition: int | None = None,
+    humidity_buffer: int | None = None,
+    humidity_transition: int | None = None,
+    vpd_buffer: float | None = None,
+    vpd_transition: float | None = None,
+    cycle_on_minutes: int | None = None,
+    cycle_off_minutes: int | None = None,
+    new_begin_time: int | None = None,
+    new_end_time: int | None = None,
+    days: list[str] | str | None = None,
+    continuous: bool | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Edit one existing rule inside an Advance Automation program.
+
+    The rule is identified by ``program_name`` plus the ``ports`` it controls, and
+    optionally the window (``begin_time``/``end_time``) when more than one rule on those
+    ports exists. Only the fields you supply are changed; everything else is preserved.
+    I'll preview the change before sending it.
+
+    To change the rule's behavior type, set ``mode`` (off, on, cycle, auto, vpd) plus the
+    matching params (and ``control_style`` for auto/vpd). To change just the schedule
+    window, set ``new_begin_time`` / ``new_end_time``. To change speed range, set
+    ``min_level`` / ``max_level``.
+
+    Control-style inference: "hold/keep/maintain at X" → target; "above/below/when it
+    rises|drops/turn on at" → trigger.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        program_name: The program the rule belongs to.
+        ports: The port number(s) the target rule controls (used to find the rule).
+        begin_time: Window-start selector to disambiguate when >1 rule matches.
+        end_time: Window-end selector to disambiguate.
+        mode: New behavior type (off, on, cycle, auto, vpd). Omit to keep.
+        control_style: "target" or "trigger" (when changing mode to auto/vpd).
+        min_level: New minimum fan level (0–10).
+        max_level: New maximum/active fan level (0–10).
+        temp_high_f / temp_low_f: New temperature thresholds °F (auto trigger).
+        humidity_high / humidity_low: New humidity thresholds % (auto trigger).
+        humidity_target: New auto humidity target setpoint.
+        temp_target_f: NOT SUPPORTED (rejected) — use temperature thresholds or a VPD target.
+        vpd_target / vpd_high / vpd_low: New VPD target or thresholds (kPa).
+        temp_buffer / temp_transition / humidity_buffer / humidity_transition: New
+            buffer/transition bands (auto; buffer XOR transition per sensor).
+        vpd_buffer / vpd_transition: New VPD buffer/transition band kPa (vpd; XOR).
+        cycle_on_minutes / cycle_off_minutes: New cycle on/off minutes.
+        new_begin_time: New window start (0–1439).
+        new_end_time: New window end (0–1439).
+        days: New day spec (day names, "all", "weekdays", "weekends").
+        continuous: True runs the rule 24/7 (ignores the window); False stops it running
+            24/7, keeping the existing day pattern. Omit to leave the schedule unchanged.
+        dry_run: If True (default), previews the change without sending it.
+
+    Returns:
+        JSON with action, program_name, the updated rule, and sent/preview status. When
+        more than one rule matches, returns a disambiguation list (by window) and asks
+        which to edit. On failure returns ``{"error": "..."}``.
+    """
+    try:
+        for label, val in (("new_begin_time", new_begin_time), ("new_end_time", new_end_time)):
+            if val is not None and not 0 <= val <= 1439:
+                return json.dumps({"error": f"{label} must be 0–1439 (minutes since midnight)"})
+
+        # Detect a no-op update: no change fields supplied at all.
+        change_fields = [
+            mode, control_style, min_level, max_level, temp_high_f, temp_low_f,
+            humidity_high, humidity_low, temp_target_f, humidity_target,
+            vpd_target, vpd_high, vpd_low, temp_buffer, temp_transition,
+            humidity_buffer, humidity_transition, vpd_buffer, vpd_transition,
+            cycle_on_minutes, cycle_off_minutes,
+            new_begin_time, new_end_time, days,
+        ]
+        # `continuous` is bool | None here, so an explicit False ("stop running 24/7") is a
+        # real change, distinct from the None default. Only None counts as "not supplied".
+        if all(f is None for f in change_fields) and continuous is None:
+            return json.dumps({
+                "error": "Nothing to change — supply at least one field to update."
+            })
+
+        device, derr = await _get_device(device_id, for_write=True)
+        if derr:
+            return derr
+        assert device is not None
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        perr = _validate_rule_ports(ports, device, device_id)
+        if perr:
+            return perr
+
+        port_name_map = _build_port_name_map(device)
+        tz_label = device.get("zoneId") or "device-local time"
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        match, disambig, program_rules, ambiguous_program = _resolve_rule(
+            raw, program_name, ports, begin_time, end_time, port_name_map, tz_label
+        )
+        clean_program = _sanitize_api_string(program_name, 64)
+
+        if not program_rules:
+            names = sorted({
+                _sanitize_api_string(e.get("advName") or "", 64) for e in raw
+            })
+            return json.dumps({
+                "error": f"No program named '{clean_program}' on device {device_id}",
+                "existing_programs": names,
+            })
+        if ambiguous_program is not None:
+            return ambiguous_program
+        if len(disambig) > 0:
+            return json.dumps({
+                "error": "More than one rule matches — pick which window to edit.",
+                "program_name": clean_program,
+                "matching_rules": disambig,
+                "suggested_reply": (
+                    "There's more than one rule on those ports."
+                    " Which window should I edit?"
+                ),
+            })
+        if match is None:
+            return json.dumps({
+                "error": f"No matching rule in '{clean_program}' for those ports.",
+                "program_name": clean_program,
+                "existing_rules": program_rules,
+            })
+
+        # Determine effective mode for validation: explicit mode, else the rule's current mode.
+        current_decoded = _decode_rule(match)
+        effective_mode = mode if mode is not None else current_decoded["mode"]
+
+        # Same-mode edit (mode/control_style both omitted): resolve the rule's effective style
+        # from the live body (settingMode==1 → target, else trigger) so the target↔trigger
+        # mutual-exclusion guards run against it — supplying a target on a trigger rule (or a
+        # threshold on a target rule) is rejected with the friendly mutually-exclusive message.
+        effective_style = control_style
+        if (
+            mode is None
+            and control_style is None
+            and effective_mode in ("auto", "vpd")
+        ):
+            effective_style = "target" if match.get("settingMode") == 1 else "trigger"
+
+        # #288: gate target/hold on the governed ports' modeTye capability.
+        if effective_style == "target":
+            cap_err = _target_capability_error(device, ports)
+            if cap_err:
+                return cap_err
+
+        kwargs, verr = _validate_rule_inputs(
+            effective_mode, control_style=effective_style,
+            min_level=min_level, max_level=max_level,
+            temp_high_f=temp_high_f, temp_low_f=temp_low_f,
+            humidity_high=humidity_high, humidity_low=humidity_low,
+            temp_target_f=temp_target_f, humidity_target=humidity_target,
+            vpd_target=vpd_target, vpd_high=vpd_high, vpd_low=vpd_low,
+            temp_buffer=temp_buffer, temp_transition=temp_transition,
+            humidity_buffer=humidity_buffer, humidity_transition=humidity_transition,
+            vpd_buffer=vpd_buffer, vpd_transition=vpd_transition,
+            cycle_on_minutes=cycle_on_minutes, cycle_off_minutes=cycle_off_minutes,
+            days=days, continuous=bool(continuous),
+            require_full=mode is not None,
+        )
+        if verr:
+            return verr
+        assert kwargs is not None
+
+        # Turn OFF continuous: _validate only emits switch_time for days or continuous=True,
+        # so an explicit continuous=False (with no days) clears the continuous bit on the
+        # live schedule while preserving its day pattern (e.g. 255 → 127, not a reset to all).
+        if continuous is False and days is None and "switch_time" not in kwargs:
+            kwargs["switch_time"] = (
+                int(match.get("switchTime") or 127) & ~_SWITCHTIME_CONTINUOUS_BIT
+            )
+
+        # Read-before-write: start from the live rule body, overlay only changed fields.
+        body = copy.deepcopy(match)
+        if min_level is not None:
+            body["offSpeed"] = min_level
+        if max_level is not None:
+            body["onSpeed"] = max_level
+        # One-sided speed update must not invert the rule: cross-check against the live body,
+        # since _validate's min<=max check only fires when BOTH levels are supplied at once.
+        # Only when a level was actually supplied — never block an unrelated edit on a rule
+        # whose live speeds were already inverted by some other writer.
+        if (min_level is not None or max_level is not None) and (
+            int(body.get("offSpeed") or 0) > int(body.get("onSpeed") or 0)
+        ):
+            return json.dumps({
+                "error": "The minimum speed can't be higher than the maximum speed."
+            })
+        if new_begin_time is not None:
+            body["beginTime"] = new_begin_time
+        if new_end_time is not None:
+            body["endTime"] = new_end_time
+        if "switch_time" in kwargs:
+            body["switchTime"] = kwargs["switch_time"]
+
+        if mode is not None:
+            # Mode change: rebuild the full per-mode signature so no stale off-mode field
+            # remains active, then overlay only the enumerated per-mode signature keys.
+            build_kwargs = {k: v for k, v in kwargs.items() if k != "switch_time"}
+            rebuilt = build_groups_payload(
+                dev_id=str(dev_id), ports=ports,
+                clean_name=body.get("advName") or clean_program,
+                begin_time=body.get("beginTime", 0),
+                end_time=body.get("endTime", 1439),
+                min_level=body.get("offSpeed", 0),
+                max_level=body.get("onSpeed", 0),
+                **{k: v for k, v in build_kwargs.items()
+                   if k not in ("mode", "min_level", "max_level")},
+                mode=mode,
+            )
+            for key in _signature_keys_for(mode):
+                body[key] = rebuilt[key]
+        else:
+            # Same-mode edit: overlay only the changed sensor/cycle fields in place.
+            _overlay_same_mode(
+                body, effective_mode,
+                temp_high_f=temp_high_f, temp_low_f=temp_low_f,
+                humidity_high=humidity_high, humidity_low=humidity_low,
+                temp_target_f=temp_target_f, humidity_target=humidity_target,
+                vpd_target=vpd_target, vpd_high=vpd_high, vpd_low=vpd_low,
+                temp_buffer=temp_buffer, temp_transition=temp_transition,
+                humidity_buffer=humidity_buffer, humidity_transition=humidity_transition,
+                vpd_buffer=vpd_buffer, vpd_transition=vpd_transition,
+                cycle_on_minutes=cycle_on_minutes, cycle_off_minutes=cycle_off_minutes,
+                control_style=control_style,
+            )
+
+        new_decoded = _decode_rule(body)
+        rule_view = {
+            "ports": _ports_label(port_name_map, ports),
+            "control": new_decoded["control"],
+            "speed": body.get("onSpeed"),
+            "window": _rule_window_str(
+                body.get("beginTime"), body.get("endTime"), tz_label, body.get("switchTime")
+            ),
+            "_mode": new_decoded["mode"],
+        }
+
+        if dry_run:
+            return json.dumps({
+                "action": f"update rule in '{clean_program}'",
+                "program_name": clean_program,
+                "rule": rule_view,
+                "dry_run": True,
+                "sent": False,
+                "note": "Preview only — nothing sent yet. Confirm to update this rule.",
+            })
+
+        # Stale-advId guard: re-resolve from a fresh getGroups at write time.
+        raw_now = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        match_now, _d, _r, _e = _resolve_rule(
+            raw_now, program_name, ports, begin_time, end_time, port_name_map, tz_label
+        )
+        if match_now is None:
+            return json.dumps({
+                "error": (
+                    f"The rule in '{clean_program}' changed or was removed before I could"
+                    " update it. Ask me to list the program's rules and try again."
+                ),
+            })
+        body["advId"] = match_now.get("advId")
+        try:
+            await asyncio.to_thread(_client().update_advance_automation, str(dev_id), body)
+        except ACInfinityAPIError as e:
+            friendly = _map_write_failure(e)
+            if friendly is not None:
+                logger.error("update_automation_rule write failed (%s): %s", device_id, e)
+                return json.dumps({"error": friendly})
+            raise
+        _window_str = _rule_window_str(
+            body.get("beginTime"), body.get("endTime"), tz_label, body.get("switchTime")
+        )
+        return json.dumps({
+            "action": f"update rule in '{clean_program}'",
+            "program_name": clean_program,
+            "rule": rule_view,
+            "dry_run": False,
+            "sent": True,
+            "human_summary": (
+                f"Updated the rule on {_ports_label(port_name_map, ports)}"
+                f" ({new_decoded['control']}) for {_window_str}."
+            ),
+        })
+
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in update_automation_rule: %s", e)
+        return json.dumps({"error": _AUTH_ERROR_MSG, "detail": "see server logs"})
+    except ACInfinityAPIError as e:
+        logger.error("API error in update_automation_rule: %s", e)
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in update_automation_rule (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in update_automation_rule: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def delete_automation_rule(
+    device_id: str,
+    program_name: str,
+    ports: list[int],
+    begin_time: int | None = None,
+    end_time: int | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Remove one rule from an Advance Automation program.
+
+    The rule is identified by ``program_name`` plus the ``ports`` it controls, and
+    optionally the window (``begin_time``/``end_time``) when more than one rule on those
+    ports exists. This removes only that single rule — the rest of the program is left
+    in place. I'll preview which rule will be removed before deleting it.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        program_name: The program the rule belongs to.
+        ports: The port number(s) the target rule controls (used to find the rule).
+        begin_time: Window-start selector to disambiguate when more than one rule matches.
+        end_time: Window-end selector to disambiguate.
+        dry_run: If True (default), previews the deletion without performing it.
+
+    Returns:
+        JSON with action, program_name, the removed rule, and sent/preview status.
+        When more than one rule matches, returns a disambiguation list (by window).
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        device, derr = await _get_device(device_id, for_write=True)
+        if derr:
+            return derr
+        assert device is not None
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        perr = _validate_rule_ports(ports, device, device_id)
+        if perr:
+            return perr
+
+        port_name_map = _build_port_name_map(device)
+        tz_label = device.get("zoneId") or "device-local time"
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        match, disambig, program_rules, ambiguous_program = _resolve_rule(
+            raw, program_name, ports, begin_time, end_time, port_name_map, tz_label
+        )
+        clean_program = _sanitize_api_string(program_name, 64)
+
+        if not program_rules:
+            names = sorted({
+                _sanitize_api_string(e.get("advName") or "", 64) for e in raw
+            })
+            return json.dumps({
+                "error": f"No program named '{clean_program}' on device {device_id}",
+                "existing_programs": names,
+            })
+        if ambiguous_program is not None:
+            return ambiguous_program
+        if len(disambig) > 0:
+            return json.dumps({
+                "error": "More than one rule matches — pick which window to remove.",
+                "program_name": clean_program,
+                "matching_rules": disambig,
+                "suggested_reply": (
+                    "There's more than one rule on those ports."
+                    " Which window should I remove?"
+                ),
+            })
+        if match is None:
+            return json.dumps({
+                "error": f"No matching rule in '{clean_program}' for those ports.",
+                "program_name": clean_program,
+                "existing_rules": program_rules,
+            })
+
+        decoded = _decode_rule(match)
+        rule_view = {
+            "ports": _ports_label(port_name_map, ports),
+            "control": decoded["control"],
+            "window": _rule_window_str(
+                match.get("beginTime"), match.get("endTime"), tz_label, match.get("switchTime")
+            ),
+            "_mode": decoded["mode"],
+        }
+
+        if dry_run:
+            return json.dumps({
+                "action": f"remove rule from '{clean_program}'",
+                "program_name": clean_program,
+                "rule": rule_view,
+                "dry_run": True,
+                "sent": False,
+                "note": "Preview only — nothing removed yet. Confirm to remove this rule.",
+            })
+
+        # Stale-advId guard: re-resolve from a fresh getGroups at write time.
+        raw_now = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        match_now, _d, _r, _e = _resolve_rule(
+            raw_now, program_name, ports, begin_time, end_time, port_name_map, tz_label
+        )
+        if match_now is None:
+            return json.dumps({
+                "error": (
+                    f"The rule in '{clean_program}' changed or was removed before I could"
+                    " remove it. Ask me to list the program's rules and try again."
+                ),
+            })
+        try:
+            # whole_program=False → delByid isflag=0 removes ONLY this rule, not the
+            # whole program slot (isflag=1 would nuke every rule in the program).
+            await asyncio.to_thread(
+                _client().delete_advance_automation, str(dev_id),
+                int(match_now["advId"]), whole_program=False,
+            )
+        except ACInfinityAPIError as e:
+            friendly = _map_write_failure(e)
+            if friendly is not None:
+                logger.error("delete_automation_rule write failed (%s): %s", device_id, e)
+                return json.dumps({"error": friendly})
+            raise
+        return json.dumps({
+            "action": f"remove rule from '{clean_program}'",
+            "program_name": clean_program,
+            "rule": rule_view,
+            "dry_run": False,
+            "sent": True,
+            "human_summary": (
+                f"Removed the rule on {_ports_label(port_name_map, ports)} from"
+                f" '{clean_program}'."
+            ),
+        })
+
+    except ACInfinityAuthError as e:
+        logger.warning("Auth error in delete_automation_rule: %s", e)
+        return json.dumps({"error": _AUTH_ERROR_MSG, "detail": "see server logs"})
+    except ACInfinityAPIError as e:
+        logger.error("API error in delete_automation_rule: %s", e)
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except ACInfinityDeviceError as e:
+        logger.warning("Device error in delete_automation_rule (%s): %s", device_id, e)
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.error("Unexpected error in delete_automation_rule: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
 
 

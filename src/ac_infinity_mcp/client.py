@@ -103,36 +103,127 @@ _SCHEDULE_ALWAYS_ACTIVE: int = 255
 _SESSION_EXPIRED_API_CODES: frozenset[int] = frozenset({10003})
 
 
-def build_add_groups_payload(
+# ============ Rail sentinels (Issue #284) ============
+# A trigger/target parked at its rail means "inactive" — the app stores the rail value
+# (not the derived/real value) for the unit/family that is not in use. The encoder writes
+# these rails explicitly; the decoder treats a value AT its rail as "not a clause".
+_RAIL_TEMP_HIGH_F = 194
+_RAIL_TEMP_HIGH_C = 90  # the °C the app pairs with the 194°F high rail (a fixed rail, NOT derived)
+_RAIL_TEMP_LOW_F = 32
+_RAIL_TEMP_LOW_C = 0
+_RAIL_HUMI_HIGH = 100
+_RAIL_HUMI_LOW = 0
+_RAIL_VPD_HIGH = 99
+_RAIL_VPD_LOW = 0
+
+# currentMode values for the Groups (Advance Automation) API. Single mode pick, matches
+# the app's Advance Automation screen: Off/On/Auto/VPD/Cycle = 2/1/4/6/3.
+# NOTE: this is a DIFFERENT enum from the legacy per-port `atType` (getdevModeSettingList):
+# atType OFF=1, ON=2, AUTO=3, TIMER=4/5, CYCLE=6, SCHEDULE=7, VPD=8. Do not conflate the two.
+_MODE_ON = 1
+_MODE_OFF = 2
+_MODE_CYCLE = 3
+_MODE_AUTO = 4
+_MODE_VPD = 6
+
+
+def build_groups_payload(
     dev_id: str,
-    port: int,
+    ports: list[int],
     clean_name: str,
-    on_speed: int,
     begin_time: int,
     end_time: int,
+    *,
+    mode: str = "on",
+    control_style: str | None = None,
+    on_speed: int | None = None,
+    min_level: int = 0,
+    max_level: int = 10,
+    temp_high_f: int | None = None,
+    temp_low_f: int | None = None,
+    humidity_high: int | None = None,
+    humidity_low: int | None = None,
+    temp_target_f: int | None = None,
+    humidity_target: int | None = None,
+    vpd_target: float | None = None,
+    vpd_high: float | None = None,
+    vpd_low: float | None = None,
+    temp_buffer: int | None = None,
+    temp_transition: int | None = None,
+    humidity_buffer: int | None = None,
+    humidity_transition: int | None = None,
+    vpd_buffer: float | None = None,
+    vpd_transition: float | None = None,
+    cycle_on_minutes: int | None = None,
+    cycle_off_minutes: int | None = None,
+    switch_time: int = 127,
+    sub_number: int = 0,
+    is_flag: int = 1,
+    group_nums: int | None = None,
+    sort_type: int | None = None,
+    adv_id: int | None = None,
 ) -> dict[str, Any]:
-    """Build the addGroups API payload for create_advance_automation."""
-    grp_dev_type = 2 ** (port - 1)
-    return {
-        # devId NOT included here — _create_advance_automation_inner injects it.
+    """Build the addGroups / updateGroupsById payload for one Advance Automation rule.
+
+    Compositional surface (Issue #284, byte-grounded in the user's real rules + capture
+    program "0624"). ``ports`` is a list of 1-based port numbers governed by this single
+    rule; the grouptDevType bitmask is ``sum(2**(p-1) for p in ports)``.
+
+    ``mode`` is the single mode pick: ``off`` (currentMode=2), ``on`` (1), ``cycle`` (3),
+    ``auto`` (4), ``vpd`` (6). Auto and VPD additionally take a ``control_style``:
+    ``target`` (settingMode=1) or ``trigger`` (settingMode=0).
+
+    Speed range: ``max_level`` → ``onSpeed``, ``min_level`` → ``offSpeed``. (``on_speed``
+    is a legacy alias for the On-mode max; when given and ``max_level`` is its default it
+    sets onSpeed directly to preserve the original create byte-identity.)
+
+    Sensor targets/triggers are explicitly assigned per field; inactive families are parked
+    at their rail (°C parked at rail, NOT derived). Buffer → ``*Buff``, transition →
+    ``*Trans`` (the two are mutually exclusive per sensor — validated upstream). ``switch_time``
+    bits 0–6 = days (bit0=Mon … bit6=Sun), bit 7 = continuous.
+
+    A *program* is a shared ``(groupNums, sortType)`` slot whose rules carry sequential
+    ``subNumber``. ``addGroups`` is gated by ``is_flag`` (Issue #284, iOS-app capture):
+    ``is_flag=1`` → NEW program (server assigns a fresh slot, ``subNumber=0`` — sent
+    ``group_nums``/``sort_type`` are ignored); ``is_flag=0`` → APPEND (server HONORS the
+    sent ``group_nums`` + ``sort_type`` = the target program's slot, and
+    ``subNumber``/``subNumberSort`` = existing max + 1, so the rule joins that program).
+    The defaults (``is_flag=1``, no slot, ``sub_number=0``) reproduce the original
+    new-program output byte-for-byte.
+
+    NO ``{**base, **caller}`` spread — every field is assigned explicitly so an unknown
+    caller param can never reach the payload. ``adv_id`` is included only on the update path.
+    """
+    grp_dev_type = sum(2 ** (p - 1) for p in ports)
+
+    # Resolve the On/Cycle speed: legacy On-mode create passes on_speed; the rule family
+    # passes max_level/min_level. on_speed (when set) takes precedence for the On byte path.
+    resolved_on_speed = on_speed if on_speed is not None else max_level
+    resolved_off_speed = min_level
+
+    payload: dict[str, Any] = {
+        # devId NOT included here — the inner method injects it.
         # advCode NOT included — absent from addGroups live capture (unlike addAlarms).
         # isFlag (capital F) confirmed for addGroups;
         # isflag (lowercase) for updateGroupsIsOn/delByid.
         "advName": clean_name,
-        "currentMode": 1,
+        "currentMode": _MODE_ON,
         "isOn": 1,
-        "onSpeed": on_speed,
+        "onSpeed": resolved_on_speed,
         # On mode has no user-settable min; port's own min setting is used.
-        "offSpeed": 0,
+        "offSpeed": resolved_off_speed,
         # Map "always active" sentinel to a valid full-day range.
         "beginTime": 0 if begin_time == _SCHEDULE_ALWAYS_ACTIVE else begin_time,
         "endTime": 1439 if end_time == _SCHEDULE_ALWAYS_ACTIVE else end_time,
-        "groupNums": 9,
-        "sortType": 9,
-        "subNumber": 0,
-        "subNumberSort": 0,
+        # groupNums/sortType define the program SLOT. On a NEW program (isFlag=1) the
+        # server assigns the slot and ignores these; on APPEND (isFlag=0) the caller passes
+        # the target program's slot so the rule joins it (Issue #284).
+        "groupNums": 9 if group_nums is None else group_nums,
+        "sortType": 9 if sort_type is None else sort_type,
+        "subNumber": sub_number,
+        "subNumberSort": sub_number,
         "isDel": 0,
-        "isFlag": 1,
+        "isFlag": is_flag,
         "returnData": 1,
         "templateType": 0,
         "grouptDevType": grp_dev_type,
@@ -158,9 +249,9 @@ def build_add_groups_payload(
         "cycleOff": 0,
         "onTime": 0,
         "onTimeSwitch": 0,
-        # 127 = binary 01111111 = all 7 days bitmask. 255 has bit 7 set which
-        # causes the app to ignore the schedule and treat it as Continuous.
-        "switchTime": 127,
+        # bits 0-6 = days (bit0=Mon), bit 7 = continuous. 127 = all 7 days scheduled;
+        # 255 (= 127 | 128) sets bit 7 → app treats the rule as Continuous 24/7.
+        "switchTime": switch_time,
         "dualZoneSwitch": 1,
         "photocellSwitch": 0,
         "isOpenDoseTime": 0,
@@ -196,6 +287,238 @@ def build_add_groups_payload(
         "remarkLangKey": "",
     }
 
+    if mode == "on":
+        # Base dict is the verified On-mode signature — leave as-is.
+        pass
+    elif mode == "off":
+        payload["currentMode"] = _MODE_OFF
+    elif mode == "cycle":
+        payload["currentMode"] = _MODE_CYCLE
+        # cycleOn/cycleOff are stored in SECONDS on the controller (the app shows
+        # minutes = seconds/60; verified live: cycleOn=30 rendered as "0 min").
+        payload["cycleOn"] = int(cycle_on_minutes or 0) * 60
+        payload["cycleOff"] = int(cycle_off_minutes or 0) * 60
+    elif mode == "auto":
+        _apply_auto(
+            payload,
+            control_style=control_style,
+            temp_high_f=temp_high_f, temp_low_f=temp_low_f,
+            humidity_high=humidity_high, humidity_low=humidity_low,
+            temp_target_f=temp_target_f, humidity_target=humidity_target,
+        )
+    elif mode == "vpd":
+        _apply_vpd(
+            payload,
+            control_style=control_style,
+            vpd_target=vpd_target, vpd_high=vpd_high, vpd_low=vpd_low,
+        )
+
+    # Buffer / transition (per sensor). Buffer and transition are mutually exclusive per
+    # sensor (validated upstream); whichever is set lands in its dedicated field.
+    if temp_buffer is not None:
+        payload["temperatureFBuff"] = int(temp_buffer)
+    if temp_transition is not None:
+        payload["temperatureFTrans"] = int(temp_transition)
+    if humidity_buffer is not None:
+        payload["humidityBuff"] = int(humidity_buffer)
+    if humidity_transition is not None:
+        payload["humidityTrans"] = int(humidity_transition)
+    if vpd_buffer is not None:
+        payload["vpdBuff"] = round(float(vpd_buffer) * 10)
+    if vpd_transition is not None:
+        payload["vpdTrans"] = round(float(vpd_transition) * 10)
+
+    if adv_id is not None:
+        payload["advId"] = adv_id
+    return payload
+
+
+def _apply_auto(
+    payload: dict[str, Any],
+    *,
+    control_style: str | None,
+    temp_high_f: int | None,
+    temp_low_f: int | None,
+    humidity_high: int | None,
+    humidity_low: int | None,
+    temp_target_f: int | None,
+    humidity_target: int | None,
+) -> None:
+    """Apply the currentMode=4 (Auto) signature in place.
+
+    Trigger sub-mode (settingMode=0, setSelect=1): each named threshold sets its value +
+    switch=1; the opposite/unused threshold is parked at its rail with switch=0. Target
+    sub-mode (settingMode=1, setSelect=0): rails for the trigger families with switches=1,
+    real values in targetHumi / targetTempF.
+    """
+    payload["currentMode"] = _MODE_AUTO
+
+    # VPD family is inert in Auto mode — the app zeroes it (value 0, switch 0) for BOTH
+    # target and trigger sub-modes (verified live against app-made Auto rules). The old code
+    # parked it at the 99 rail with switches=1, which the app rendered as phantom VPD high/low
+    # triggers on an Auto rule (#288 root cause).
+    payload["highVpd"] = 0
+    payload["highVpdSwitch"] = 0
+    payload["lowVpd"] = 0
+    payload["lowVpdSwitch"] = 0
+    payload["targetVpd"] = 0
+    payload["targetVpdSwitch"] = 0
+
+    if control_style == "target":
+        # Auto-target: settingMode=1, setSelect=0. Trigger families parked at rails with
+        # switches=1; the held setpoint goes in targetHumi / targetTempF. Both target
+        # switches stay 1 (captured signature); the unused sensor sits at its rail.
+        payload["settingMode"] = 1
+        payload["setSelect"] = 0
+        payload["autoHighTempF"] = _RAIL_TEMP_HIGH_F
+        payload["autoHighTempC"] = _RAIL_TEMP_HIGH_C
+        payload["autoLowTempF"] = _RAIL_TEMP_LOW_F
+        payload["autoLowTempC"] = _RAIL_TEMP_LOW_C
+        payload["autoHighTempSwitch"] = 1
+        payload["autoLowTempSwitch"] = 1
+        payload["autoHighHumi"] = _RAIL_HUMI_HIGH
+        payload["autoLowHumi"] = _RAIL_HUMI_LOW
+        payload["autoHighHumiSwitch"] = 1
+        payload["autoLowHumiSwitch"] = 1
+        payload["targetTempF"] = (
+            int(temp_target_f) if temp_target_f is not None else _RAIL_TEMP_LOW_F
+        )
+        payload["targetHumi"] = int(humidity_target) if humidity_target is not None else 0
+        payload["targetTSwitch"] = 1
+        payload["targetHumiSwitch"] = 1
+    else:
+        # Auto-trigger: settingMode=0, setSelect=1. Named thresholds active; unused
+        # families parked at rails with switch=0.
+        payload["settingMode"] = 0
+        payload["setSelect"] = 1
+
+        if temp_high_f is not None:
+            payload["autoHighTempF"] = int(temp_high_f)
+            payload["autoHighTempC"] = _RAIL_TEMP_HIGH_C
+            payload["autoHighTempSwitch"] = 1
+        else:
+            payload["autoHighTempF"] = _RAIL_TEMP_HIGH_F
+            payload["autoHighTempC"] = _RAIL_TEMP_HIGH_C
+            payload["autoHighTempSwitch"] = 0
+        if temp_low_f is not None:
+            payload["autoLowTempF"] = int(temp_low_f)
+            payload["autoLowTempC"] = _RAIL_TEMP_LOW_C
+            payload["autoLowTempSwitch"] = 1
+        else:
+            payload["autoLowTempF"] = _RAIL_TEMP_LOW_F
+            payload["autoLowTempC"] = _RAIL_TEMP_LOW_C
+            payload["autoLowTempSwitch"] = 0
+
+        if humidity_high is not None:
+            payload["autoHighHumi"] = int(humidity_high)
+            payload["autoHighHumiSwitch"] = 1
+        else:
+            payload["autoHighHumi"] = _RAIL_HUMI_HIGH
+            payload["autoHighHumiSwitch"] = 0
+        if humidity_low is not None:
+            payload["autoLowHumi"] = int(humidity_low)
+            payload["autoLowHumiSwitch"] = 1
+        else:
+            payload["autoLowHumi"] = _RAIL_HUMI_LOW
+            payload["autoLowHumiSwitch"] = 0
+
+        # Target family parked at rails with switches=1 (captured Auto-trigger signature).
+        payload["targetTempF"] = _RAIL_TEMP_LOW_F
+        payload["targetTSwitch"] = 1
+        payload["targetHumiSwitch"] = 1
+        payload["targetHumi"] = 0
+
+
+def _apply_vpd(
+    payload: dict[str, Any],
+    *,
+    control_style: str | None,
+    vpd_target: float | None,
+    vpd_high: float | None,
+    vpd_low: float | None,
+) -> None:
+    """Apply the currentMode=6 (VPD) signature in place.
+
+    The auto temp/humidity families and the temp/humidity target families are INERT in VPD
+    mode — the app zeroes them (values at 0/32 rails, all switches 0). The old code left them
+    at the base defaults (90/110 with switches=1), which the app rendered as phantom triggers
+    on a VPD rule (#288 — verified live against the app's Clone Transplant VPD-target rule).
+
+    Target (settingMode=1): the app mirrors the setpoint into both targetVpd and highVpd
+    (highVpdSwitch=1) and leaves lowVpd=0 with lowVpdSwitch=0. Trigger (settingMode=0):
+    highVpd/lowVpd = kpa*10 with switch=1; the unused direction parked at its rail/switch=0.
+    """
+    payload["currentMode"] = _MODE_VPD
+
+    # Zero the auto + temp/humidity-target families (inert in VPD mode; see docstring / #288).
+    payload["autoHighHumi"] = 0
+    payload["autoLowHumi"] = 0
+    payload["autoHighHumiSwitch"] = 0
+    payload["autoLowHumiSwitch"] = 0
+    payload["autoHighTempF"] = _RAIL_TEMP_LOW_F
+    payload["autoLowTempF"] = _RAIL_TEMP_LOW_F
+    payload["autoHighTempC"] = 0
+    payload["autoLowTempC"] = 0
+    payload["autoHighTempSwitch"] = 0
+    payload["autoLowTempSwitch"] = 0
+    payload["targetHumi"] = 0
+    payload["targetHumiSwitch"] = 0
+    payload["targetTempF"] = _RAIL_TEMP_LOW_F
+    payload["targetTSwitch"] = 0
+
+    if control_style == "trigger":
+        payload["settingMode"] = 0
+        payload["setSelect"] = 0
+        payload["targetVpd"] = 0
+        payload["targetVpdSwitch"] = 0
+        if vpd_high is not None:
+            payload["highVpd"] = round(float(vpd_high) * 10)
+            payload["highVpdSwitch"] = 1
+        else:
+            payload["highVpd"] = _RAIL_VPD_HIGH
+            payload["highVpdSwitch"] = 0
+        if vpd_low is not None:
+            payload["lowVpd"] = round(float(vpd_low) * 10)
+            payload["lowVpdSwitch"] = 1
+        else:
+            payload["lowVpd"] = _RAIL_VPD_LOW
+            payload["lowVpdSwitch"] = 0
+    else:
+        # VPD-target: mirror the setpoint into targetVpd + highVpd; lowVpd off (captured sig).
+        payload["settingMode"] = 1
+        payload["setSelect"] = 0
+        tgt = round(float(vpd_target) * 10) if vpd_target is not None else 0
+        payload["targetVpd"] = tgt
+        payload["targetVpdSwitch"] = 1
+        payload["highVpd"] = tgt
+        payload["highVpdSwitch"] = 1
+        payload["lowVpd"] = 0
+        payload["lowVpdSwitch"] = 0
+
+
+def build_add_groups_payload(
+    dev_id: str,
+    port: int,
+    clean_name: str,
+    on_speed: int,
+    begin_time: int,
+    end_time: int,
+) -> dict[str, Any]:
+    """Build the addGroups API payload for create_advance_automation (On mode, one port).
+
+    Thin shim over ``build_groups_payload`` for the original single-port On-mode create
+    path; output is byte-identical to the pre-refactor builder (golden-payload regression).
+    """
+    return build_groups_payload(
+        dev_id=dev_id,
+        ports=[port],
+        clean_name=clean_name,
+        begin_time=begin_time,
+        end_time=end_time,
+        mode="on",
+        on_speed=on_speed,
+    )
+
 
 class ACInfinityClient:
     """Client for AC Infinity cloud API"""
@@ -214,6 +537,7 @@ class ACInfinityClient:
     V2_GET_GROUPS_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/getGroups"
     V2_ADD_GROUPS_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/addGroups"
     V2_UPDATE_GROUPS_IS_ON_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/updateGroupsIsOn"
+    V2_UPDATE_GROUPS_BY_ID_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/updateGroupsById"
     V2_DEL_BY_ID_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/delByid"
 
     def __init__(self, email: str, password: str):
@@ -1065,18 +1389,21 @@ class ACInfinityClient:
         logger.info("Created automation for devId=%s, advId=%s", dev_id, data.get("advId"))
         return data
 
-    def delete_advance_automation(self, dev_id: str, adv_id: int) -> dict:
-        """Delete an advance automation group entry (with transparent 401 refresh).
+    def update_advance_automation(self, dev_id: str, payload: dict) -> dict:
+        """Edit an existing advance automation rule in place (with transparent 401 refresh).
 
         Args:
             dev_id: Numeric device ID string.
-            adv_id: Automation entry ID to delete.
+            payload: Complete form payload for updateGroupsById. Must include the target
+                rule's ``advId`` (server edits in place by advId) plus the full rule body.
+                The caller is responsible for constructing the complete payload from the
+                rule's current getGroups body (read-before-write — Quirk 13).
 
         Returns:
-            API response dict.
+            API response data dict.
         """
         return self._call_with_token_refresh(
-            self._delete_advance_automation_inner, dev_id, adv_id
+            self._update_advance_automation_inner, dev_id, payload
         )
 
     @retry(
@@ -1085,8 +1412,72 @@ class ACInfinityClient:
         retry=retry_if_exception_type(requests.exceptions.ConnectionError),
         reraise=True,
     )
-    def _delete_advance_automation_inner(self, dev_id: str, adv_id: int) -> dict:
-        """POST /api/version=2.0/dev/delByid — deletes automation entry."""
+    def _update_advance_automation_inner(self, dev_id: str, payload: dict) -> dict:
+        """POST /api/version=2.0/dev/updateGroupsById — edits a rule in place by advId."""
+        if not self.token:
+            raise ACInfinityAuthError("Not authenticated — call authenticate() first")
+
+        form_data = {**payload, "devId": dev_id}
+
+        self._enforce_write_rate_limit()
+        try:
+            resp = self.session.post(
+                self.V2_UPDATE_GROUPS_BY_ID_ENDPOINT,
+                data=form_data,
+                headers=self._v2_headers(),
+                timeout=10,
+            )
+        finally:
+            self._mark_write_completed()
+        resp.raise_for_status()
+
+        result = resp.json()
+        if result.get("code") != 200:
+            error_msg = result.get("msg", "Unknown error")
+            code = result.get("code")
+            logger.error("Failed to update automation (devId=%s): %s", dev_id, error_msg)
+            self._raise_for_api_code(
+                code, error_msg, "UpdateAutomation", session_refreshable=False
+            )
+
+        data = result.get("data") or {}
+        logger.info("Updated automation for devId=%s, advId=%s", dev_id, payload.get("advId"))
+        return data
+
+    def delete_advance_automation(
+        self, dev_id: str, adv_id: int, *, whole_program: bool = True
+    ) -> dict:
+        """Delete via delByid (with transparent 401 refresh).
+
+        The ``isflag`` field on delByid selects the scope (verified live):
+        ``isflag=1`` deletes the ENTIRE program (the whole groupNums/sortType slot —
+        all its rules); ``isflag=0`` deletes only the single rule identified by ``adv_id``.
+
+        Args:
+            dev_id: Numeric device ID string.
+            adv_id: Automation entry (rule) ID to delete.
+            whole_program: True (default) → delete the whole program (isflag=1), used by
+                the delete-whole-automation tool. False → delete only this one rule
+                (isflag=0), used by delete_automation_rule on multi-rule programs.
+
+        Returns:
+            API response dict.
+        """
+        return self._call_with_token_refresh(
+            self._delete_advance_automation_inner, dev_id, adv_id, whole_program
+        )
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(requests.exceptions.ConnectionError),
+        reraise=True,
+    )
+    def _delete_advance_automation_inner(
+        self, dev_id: str, adv_id: int, whole_program: bool = True
+    ) -> dict:
+        """POST /api/version=2.0/dev/delByid — isflag=1 deletes the whole program slot,
+        isflag=0 deletes only this rule."""
         if not self.token:
             raise ACInfinityAuthError("Not authenticated — call authenticate() first")
 
@@ -1094,7 +1485,7 @@ class ACInfinityClient:
         try:
             resp = self.session.post(
                 self.V2_DEL_BY_ID_ENDPOINT,
-                data={"advId": adv_id, "isDel": 1, "isflag": 1},
+                data={"advId": adv_id, "isDel": 1, "isflag": 1 if whole_program else 0},
                 headers=self._v2_headers(),
                 timeout=10,
             )

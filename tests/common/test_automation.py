@@ -1,10 +1,12 @@
 """Unit tests for automation.py pure helpers and _build_advance_conflict_response."""
 
+import copy
 import json
 from unittest.mock import MagicMock
 
 from ac_infinity_mcp.automation import (
     _build_advance_conflict_response,
+    _decode_rule,
     _find_governing_automation,
     _find_governing_port_group,
     _group_automations,
@@ -12,6 +14,12 @@ from ac_infinity_mcp.automation import (
     _sanitize_api_string,
 )
 from ac_infinity_mcp.schema import ACInfinityAPIError, ACInfinityAuthError
+from tests.fixtures.advance_automation_fixtures import (
+    MOCK_RULE_HUMIDITY_SETPOINT,
+    MOCK_RULE_TEMPERATURE_TRIGGER,
+    MOCK_RULE_VPD,
+    MOCK_TWO_WINDOW_PROGRAM,
+)
 
 # ============ _sanitize_api_string ============
 
@@ -102,6 +110,150 @@ def test_group_automations_different_names_separate_groups_insertion_order():
     # Insertion order preserved
     assert result[0]["name"] == "Alpha"
     assert result[1]["name"] == "Beta"
+
+
+# ============ _decode_rule (Issue #284) ============
+
+
+def test_decode_rule_off_mode():
+    assert _decode_rule({"currentMode": 2}) == {
+        "mode": "off", "control": "off", "direction": None,
+    }
+
+
+def test_decode_rule_on_mode():
+    decoded = _decode_rule({"currentMode": 1, "onSpeed": 7, "offSpeed": 0})
+    assert decoded["mode"] == "on"
+    assert decoded["direction"] is None
+    assert "runs at set speed" in decoded["control"]
+
+
+def test_decode_rule_cycle_mode():
+    # cycleOn/cycleOff are SECONDS on the device; decoder shows minutes = seconds/60.
+    decoded = _decode_rule({"currentMode": 3, "cycleOn": 3600, "cycleOff": 7200,
+                            "onSpeed": 5, "offSpeed": 0})
+    assert decoded["mode"] == "cycle"
+    assert "cycle 60 min on / 120 min off" in decoded["control"]
+
+
+def test_decode_rule_vpd_target_div10():
+    """Live VPD-target rule (targetVpd=9, currentMode=6) decodes to 0.9 kPa despite the
+    rail VPD-trigger family (highVpd=99 / switch=1)."""
+    decoded = _decode_rule(copy.deepcopy(MOCK_RULE_VPD))
+    assert decoded["mode"] == "vpd"
+    assert "VPD: hold at 0.9 kPa" in decoded["control"]
+    assert decoded["direction"] is None
+
+
+def test_decode_rule_auto_target_humidity_wins_over_rail_triggers():
+    """currentMode=4 + settingMode=1 + targetHumi>0 decodes as a humidity hold; the
+    rail-parked trigger families (switches=1) are correctly ignored (rail-sentinel rule)."""
+    decoded = _decode_rule(copy.deepcopy(MOCK_RULE_HUMIDITY_SETPOINT))
+    assert decoded["mode"] == "auto"
+    assert "humidity: hold at 65%" in decoded["control"]
+    # The rail-parked temperature trigger must NOT produce a clause.
+    assert "temperature: on" not in decoded["control"]
+    assert decoded["direction"] is None
+
+
+def test_decode_rule_auto_trigger_on_below_rail_aware():
+    """autoLowTempF=76 + switch=1 is active; autoHighTempF=194 (rail) is NOT. Decodes to a
+    single on-below temperature trigger clause."""
+    decoded = _decode_rule(copy.deepcopy(MOCK_RULE_TEMPERATURE_TRIGGER))
+    assert decoded["mode"] == "auto"
+    assert decoded["direction"] == "on_below"
+    assert "temperature: on below 76°F" in decoded["control"]
+
+
+def test_decode_rule_auto_trigger_on_above_single_sensor():
+    """Mirror of the on_below test: high active, low parked at its rail → on_above."""
+    entry = copy.deepcopy(MOCK_RULE_TEMPERATURE_TRIGGER)
+    entry["autoHighTempF"] = 85
+    entry["autoHighTempSwitch"] = 1
+    entry["autoLowTempF"] = 32        # park the low trigger at its rail (inactive)
+    decoded = _decode_rule(entry)
+    assert decoded["direction"] == "on_above"
+    assert "temperature: on above 85°F" in decoded["control"]
+
+
+def test_decode_rule_auto_no_rule_set_fallback():
+    """currentMode=4 with every trigger parked at its rail → graceful 'no rule set'."""
+    entry = copy.deepcopy(MOCK_RULE_TEMPERATURE_TRIGGER)
+    entry["settingMode"] = 0
+    entry["autoHighTempF"] = 194
+    entry["autoLowTempF"] = 32
+    entry["autoHighHumi"] = 100
+    entry["autoLowHumi"] = 0
+    decoded = _decode_rule(entry)
+    assert decoded["mode"] == "auto"
+    assert "auto (no rule set)" in decoded["control"]
+
+
+def test_decode_rule_vpd_no_rule_set_fallback():
+    """currentMode=6 trigger style with both VPD rails parked → graceful 'no rule set'."""
+    entry = copy.deepcopy(MOCK_RULE_VPD)
+    entry["settingMode"] = 0
+    entry["highVpd"] = 99
+    entry["lowVpd"] = 0
+    decoded = _decode_rule(entry)
+    assert decoded["mode"] == "vpd"
+    assert "VPD (no rule set)" in decoded["control"]
+
+
+def test_decode_rule_unknown_mode():
+    decoded = _decode_rule({"currentMode": 99})
+    assert decoded["mode"] == "unknown"
+
+
+# ============ _group_automations per-rule decode (Issue #284) ============
+
+
+def test_group_automations_two_window_per_rule_decode():
+    """A 2-entry same-advName program with different windows + modes decodes into two
+    distinct per-rule descriptions (the pattern that collapsed before #284)."""
+    grouped = _group_automations(copy.deepcopy(MOCK_TWO_WINDOW_PROGRAM))
+    assert len(grouped) == 1
+    pgs = grouped[0]["port_groups"]
+    assert len(pgs) == 2
+    # First entry: VPD lights-on window 540–180, running.
+    assert pgs[0]["begin_time"] == 540
+    assert pgs[0]["end_time"] == 180
+    assert pgs[0]["run_state"] is True
+    assert pgs[0]["rule"]["mode"] == "vpd"
+    assert "VPD: hold at 0.9 kPa" in pgs[0]["rule"]["control"]
+    # Second entry: auto-target humidity lights-off window 180–540, not running.
+    assert pgs[1]["begin_time"] == 180
+    assert pgs[1]["end_time"] == 540
+    assert pgs[1]["run_state"] is False
+    assert pgs[1]["rule"]["mode"] == "auto"
+    assert "humidity: hold at 65%" in pgs[1]["rule"]["control"]
+
+
+def test_group_automations_additive_keys_do_not_disturb_program_or_old_per_element_keys():
+    """Non-breaking-change guard (Python Rev-2 MINOR): program-level keys and the original
+    per-element keys (adv_id, on_speed, grp_dev_type) are unchanged; new keys are additive."""
+    raw = [{"advId": 100, "advName": "Night Cycle", "isOn": 1, "onSpeed": 5,
+            "grouptDevType": 1, "runState": 1, "beginTime": 0, "endTime": 1439,
+            "currentMode": 1, "onTimeSwitch": 0}]
+    grouped = _group_automations(copy.deepcopy(raw))[0]
+    # Program-level keys unchanged.
+    assert grouped["automation_id"] == 100
+    assert grouped["name"] == "Night Cycle"
+    assert grouped["enabled"] is True
+    assert grouped["adv_ids"] == [100]
+    assert grouped["begin_time"] == 0
+    assert grouped["end_time"] == 1439
+    assert grouped["run_state"] is True
+    assert grouped["on_time_switch"] == 0
+    # Original per-element keys unchanged.
+    pg = grouped["port_groups"][0]
+    assert pg["adv_id"] == 100
+    assert pg["on_speed"] == 5
+    assert pg["grp_dev_type"] == 1
+    # New keys present (additive only).
+    assert pg["begin_time"] == 0
+    assert pg["current_mode"] == 1
+    assert pg["rule"]["mode"] == "on"
 
 
 # ============ _find_governing_automation ============
@@ -302,3 +454,24 @@ async def test_build_conflict_auth_error_returns_error():
     assert "error" in data
     assert "conflict" not in data
     assert "Authentication failed" in data["error"]
+
+
+# ============ _decode_rule defensive coercion (buffer/transition) ============
+
+
+def test_decode_rule_string_valued_buffer_transition_no_raise():
+    """A string-valued buffer/transition field must not raise in _decode_rule —
+    it runs for every rule via _group_automations (legacy conflict-detection hot path).
+    The VPD /10 path would TypeError on a raw string without coercion."""
+    entry = {
+        "advName": "X", "advId": 1, "grouptDevType": 1, "currentMode": 6,
+        "settingMode": 1, "targetVpd": 12, "onSpeed": 5, "offSpeed": 1,
+        "beginTime": 540, "endTime": 1020, "switchTime": 127,
+        # string-valued (defensive): must coerce, not crash
+        "vpdBuff": "3", "temperatureFBuff": "2", "humidityTrans": "4",
+    }
+    decoded = _decode_rule(entry)  # must not raise
+    assert decoded["mode"] == "vpd"
+    assert "VPD buffer 0.3 kPa" in decoded["control"]
+    assert "temperature buffer 2°F" in decoded["control"]
+    assert "humidity transition 4%" in decoded["control"]

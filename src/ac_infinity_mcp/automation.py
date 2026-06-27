@@ -34,6 +34,249 @@ def _sanitize_api_string(value: str | None, max_len: int = 64) -> str:
     return cleaned if cleaned else "(unnamed)"
 
 
+# Rail sentinels (Issue #284): a value AT its rail means "inactive" even when the paired
+# switch is 1. The app parks the unused unit/family at its rail. Mirrors client.py rails.
+_RAIL_TEMP_HIGH_F = 194
+_RAIL_TEMP_LOW_F = 32
+_RAIL_HUMI_HIGH = 100
+_RAIL_HUMI_LOW = 0
+_RAIL_VPD_HIGH = 99
+_RAIL_VPD_LOW = 0
+_RAIL_TARGET_TEMP_F = 32
+_RAIL_TARGET_HUMI = 0
+_RAIL_TARGET_VPD = 0
+
+# switchTime bit 7 (128) = continuous flag; bits 0–6 = days (bit0=Mon … bit6=Sun).
+_SWITCHTIME_CONTINUOUS_BIT = 0x80
+_SWITCHTIME_ALL_DAYS = 127
+_SWITCHTIME_WEEKDAYS = 31  # Mon–Fri
+_DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _fmt_hhmm(minutes: int | None) -> str:
+    """Format minutes-since-midnight as HH:MM (clamped to a valid clock value)."""
+    m = int(minutes or 0) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _decode_schedule(entry: dict) -> str | None:
+    """Return a human-readable schedule modifier, or None when no window applies.
+
+    ``switchTime`` bit 7 set (e.g. 255) → "runs continuously" (window suppressed). Else
+    decode the day bitmask (127→"every day", 31→"Mon–Fri", otherwise named days) and append
+    the HH:MM–HH:MM window.
+    """
+    switch_time = int(entry.get("switchTime") or 0)
+    if switch_time & _SWITCHTIME_CONTINUOUS_BIT:
+        return "runs continuously"
+
+    begin = entry.get("beginTime")
+    end = entry.get("endTime")
+    days_mask = switch_time & 0x7F
+    if days_mask == _SWITCHTIME_ALL_DAYS:
+        day_str = "every day"
+    elif days_mask == _SWITCHTIME_WEEKDAYS:
+        day_str = "Mon–Fri"
+    elif days_mask == 0:
+        day_str = None
+    else:
+        day_str = ", ".join(_DAY_ABBR[i] for i in range(7) if days_mask & (1 << i))
+
+    if begin is None and end is None and day_str is None:
+        return None
+    window = f"{_fmt_hhmm(begin)}–{_fmt_hhmm(end)}"
+    return f"{day_str} {window}" if day_str else window
+
+
+def _decode_modifiers(entry: dict) -> list[str]:
+    """Return speed-range + buffer/transition modifier phrases for the control string."""
+    mods: list[str] = []
+    min_level = int(entry.get("offSpeed") or 0)
+    max_level = int(entry.get("onSpeed") or 0)
+    if entry.get("currentMode") == 1:
+        # On mode runs at a single speed (the port's own min is used when inactive); there
+        # is no user-settable min, so render just the active speed, not a range.
+        mods.append(f"speed {max_level}")
+    else:
+        min_render = "0 (off)" if min_level == 0 else str(min_level)
+        mods.append(f"speed {min_render}–{max_level}")
+
+    # Coerce each value once (the API returns ints, but stay defensive against a
+    # string-valued field so a display modifier can never raise — _decode_modifiers
+    # runs for every rule via _group_automations, which feeds legacy conflict detection).
+    temp_buff = int(entry.get("temperatureFBuff") or 0)
+    temp_trans = int(entry.get("temperatureFTrans") or 0)
+    humi_buff = int(entry.get("humidityBuff") or 0)
+    humi_trans = int(entry.get("humidityTrans") or 0)
+    vpd_buff = int(entry.get("vpdBuff") or 0)
+    vpd_trans = int(entry.get("vpdTrans") or 0)
+    if temp_buff > 0:
+        mods.append(f"temperature buffer {temp_buff}°F")
+    if temp_trans > 0:
+        mods.append(f"temperature transition {temp_trans}°F")
+    if humi_buff > 0:
+        mods.append(f"humidity buffer {humi_buff}%")
+    if humi_trans > 0:
+        mods.append(f"humidity transition {humi_trans}%")
+    if vpd_buff > 0:
+        mods.append(f"VPD buffer {vpd_buff / 10:g} kPa")
+    if vpd_trans > 0:
+        mods.append(f"VPD transition {vpd_trans / 10:g} kPa")
+    return mods
+
+
+def _decode_auto_clauses(entry: dict) -> tuple[list[str], str | None]:
+    """Collect sensor-labeled clauses for a currentMode=4 (Auto) rule. Returns (clauses, dir).
+
+    Target sub-mode (settingMode==1): collect every non-rail target. Trigger sub-mode:
+    collect every active threshold (switch==1 AND value non-rail). ``direction`` is reported
+    for a single-sensor trigger (back-compat with the trigger round-trip tests).
+    """
+    clauses: list[str] = []
+    direction: str | None = None
+
+    if entry.get("settingMode") == 1:
+        temp_t = entry.get("targetTempF")
+        if temp_t is not None and int(temp_t) != _RAIL_TARGET_TEMP_F:
+            clauses.append(f"temperature: hold at {int(temp_t)}°F")
+        humi_t = entry.get("targetHumi")
+        if humi_t is not None and int(humi_t) != _RAIL_TARGET_HUMI:
+            clauses.append(f"humidity: hold at {int(humi_t)}%")
+        return clauses, direction
+
+    # Trigger sub-mode.
+    temp_high = (
+        entry.get("autoHighTempSwitch") == 1
+        and int(entry.get("autoHighTempF") or 0) < _RAIL_TEMP_HIGH_F
+    )
+    temp_low = (
+        entry.get("autoLowTempSwitch") == 1
+        and int(entry.get("autoLowTempF") or 0) > _RAIL_TEMP_LOW_F
+    )
+    if temp_high or temp_low:
+        clause, direction = _trigger_clause(
+            "temperature", "°F",
+            high=temp_high, low=temp_low,
+            high_value=int(entry.get("autoHighTempF") or 0),
+            low_value=int(entry.get("autoLowTempF") or 0),
+        )
+        clauses.append(clause)
+
+    humi_high = (
+        entry.get("autoHighHumiSwitch") == 1
+        and int(entry.get("autoHighHumi") or 0) < _RAIL_HUMI_HIGH
+    )
+    humi_low = (
+        entry.get("autoLowHumiSwitch") == 1
+        and int(entry.get("autoLowHumi") or 0) > _RAIL_HUMI_LOW
+    )
+    if humi_high or humi_low:
+        clause, humi_dir = _trigger_clause(
+            "humidity", "%",
+            high=humi_high, low=humi_low,
+            high_value=int(entry.get("autoHighHumi") or 0),
+            low_value=int(entry.get("autoLowHumi") or 0),
+        )
+        clauses.append(clause)
+        # Single-sensor trigger: surface the direction; multi-sensor leaves it None.
+        direction = humi_dir if not (temp_high or temp_low) else None
+
+    return clauses, direction
+
+
+def _trigger_clause(
+    sensor: str, unit: str, *, high: bool, low: bool, high_value: int, low_value: int
+) -> tuple[str, str]:
+    """Build one sensor-labeled trigger clause + its direction."""
+    if high and low:
+        return (
+            f"{sensor}: on above {high_value}{unit} or below {low_value}{unit}",
+            "both",
+        )
+    if high:
+        return f"{sensor}: on above {high_value}{unit}", "on_above"
+    return f"{sensor}: on below {low_value}{unit}", "on_below"
+
+
+def _decode_vpd_clauses(entry: dict) -> tuple[list[str], str | None]:
+    """Collect VPD clauses for a currentMode=6 rule. Returns (clauses, direction)."""
+    if entry.get("settingMode") == 1:
+        kpa = int(entry.get("targetVpd") or 0) / 10
+        return [f"VPD: hold at {kpa:g} kPa"], None
+
+    high = (
+        entry.get("highVpdSwitch") == 1
+        and int(entry.get("highVpd") or 0) < _RAIL_VPD_HIGH
+    )
+    low = (
+        entry.get("lowVpdSwitch") == 1
+        and int(entry.get("lowVpd") or 0) > _RAIL_VPD_LOW
+    )
+    high_kpa = int(entry.get("highVpd") or 0) / 10
+    low_kpa = int(entry.get("lowVpd") or 0) / 10
+    if high and low:
+        return [f"VPD: on above {high_kpa:g} or below {low_kpa:g} kPa"], "both"
+    if high:
+        return [f"VPD: on above {high_kpa:g} kPa"], "on_above"
+    if low:
+        return [f"VPD: on below {low_kpa:g} kPa"], "on_below"
+    return [], None
+
+
+def _decode_rule(entry: dict) -> dict:
+    """Decode a raw getGroups entry into a grower-readable rule description.
+
+    Returns ``{"mode": <off|on|cycle|auto|vpd>, "control": <plain string>,
+    "direction": <on_below|on_above|both|None>}``. This is the single source of truth for
+    read-back and the exact mirror of ``build_groups_payload``'s encoder.
+
+    Additive multi-clause: for Auto/VPD every active (non-rail) target or trigger across all
+    sensors is collected into a sensor-labeled clause, joined by "; ", then speed-range and
+    schedule and buffer/transition modifiers are appended. A value AT its rail is NEVER a
+    clause, so a Target rule's rail-parked triggers (switches=1) are correctly ignored.
+    """
+    # Groups (Advance Automation) currentMode: Off/On/Auto/VPD/Cycle = 2/1/4/6/3. This is a
+    # DIFFERENT enum from the legacy per-port `atType` (getdevModeSettingList): atType OFF=1,
+    # ON=2, AUTO=3, TIMER=4/5, CYCLE=6, SCHEDULE=7, VPD=8. Do not conflate the two. Any
+    # currentMode not in {1,2,3,4,6} decodes gracefully to "unknown" (no KeyError/crash) so a
+    # future firmware value (e.g. 5 or 7) can't break read-back.
+    current_mode = entry.get("currentMode")
+
+    if current_mode == 2:
+        return {"mode": "off", "control": "off", "direction": None}
+
+    if current_mode == 1:
+        clauses: list[str] = ["runs at set speed"]
+        direction: str | None = None
+        mode = "on"
+    elif current_mode == 3:
+        # cycleOn/cycleOff are stored in SECONDS; the app shows minutes = seconds/60.
+        on_min = int(entry.get("cycleOn") or 0) // 60
+        off_min = int(entry.get("cycleOff") or 0) // 60
+        clauses = [f"cycle {on_min} min on / {off_min} min off"]
+        direction = None
+        mode = "cycle"
+    elif current_mode == 4:
+        clauses, direction = _decode_auto_clauses(entry)
+        if not clauses:
+            clauses = ["auto (no rule set)"]
+        mode = "auto"
+    elif current_mode == 6:
+        clauses, direction = _decode_vpd_clauses(entry)
+        if not clauses:
+            clauses = ["VPD (no rule set)"]
+        mode = "vpd"
+    else:
+        return {"mode": "unknown", "control": "unrecognized rule", "direction": None}
+
+    parts = list(clauses)
+    parts.extend(_decode_modifiers(entry))
+    schedule = _decode_schedule(entry)
+    if schedule:
+        parts.append(schedule)
+    return {"mode": mode, "control": "; ".join(parts), "direction": direction}
+
+
 def _group_automations(raw_entries: list[dict]) -> list[dict]:
     """Group flat getGroups entries by advName into user-visible automations.
 
@@ -63,6 +306,14 @@ def _group_automations(raw_entries: list[dict]) -> list[dict]:
                     "adv_id": e.get("advId"),
                     "on_speed": e.get("onSpeed", 0),
                     "grp_dev_type": e.get("grouptDevType", 0),
+                    # Per-rule fields (additive — program-level keys read by the 4
+                    # consumers stay above; these are for the per-rule read/CRUD path).
+                    "begin_time": e.get("beginTime"),
+                    "end_time": e.get("endTime"),
+                    "switch_time": e.get("switchTime"),
+                    "run_state": bool(e.get("runState", 0)),
+                    "current_mode": e.get("currentMode"),
+                    "rule": _decode_rule(e),
                 }
                 for e in entries
             ],

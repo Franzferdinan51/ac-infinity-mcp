@@ -336,6 +336,33 @@ def _ports_label(port_name_map: dict[int, str], ports: list[int]) -> str:
     return ", ".join(_port_label_for(port_name_map, p) for p in sorted(ports))
 
 
+# Units that read naturally attached to the number (matching the existing prose, e.g.
+# "75°F"): no space between the value and the unit. Everything else (ppm, ppt, µS/cm,
+# mS/cm) takes a single space ("793 ppm"). Empty unit renders with neither.
+_ATTACHED_UNITS: frozenset[str] = frozenset({"%", "°C", "°F"})
+
+
+def _format_sensor_clause(external_sensors: list[dict]) -> str:
+    """Grower-readable prose clause for external sensor readings, e.g.
+    "External sensors — CO2: 793 ppm, pH: 6.5, Light: 100.0%" (no leading space or
+    trailing period — the call site owns sentence punctuation). Returns "" when there
+    are no external sensors so the summary stays byte-identical to the pre-sensor
+    output. The composed clause is sanitized (matching the other API-derived prose on
+    these lines); the empty case short-circuits before sanitizing so it never becomes
+    the "(unnamed)" placeholder."""
+    if not external_sensors:
+        return ""
+    parts = []
+    for s in external_sensors:
+        label = s.get("sensor_type_label", "")
+        value = s.get("value")
+        unit = s.get("unit", "")
+        sep = "" if (not unit or unit in _ATTACHED_UNITS) else " "
+        parts.append(f"{label}: {value}{sep}{unit}")
+    clause = "External sensors — " + ", ".join(parts)
+    return _sanitize_api_string(clause, 512)
+
+
 # switchTime bit 7 (128) = continuous flag; mirrors automation._SWITCHTIME_CONTINUOUS_BIT.
 _SWITCHTIME_CONTINUOUS_BIT = 0x80
 
@@ -870,14 +897,21 @@ async def get_device_reading(device_id: str) -> str:
                 {"port": 1, "name": "Inline Fan", "speed": 5},
                 {"port": 2, "name": "Port 2", "speed": 0, "plug_status": "not powered"}
               ],
-              "external_sensors": []
+              "external_sensors": [
+                {"sensor_id": "9.11", "sensor_type": 11,
+                 "sensor_type_label": "CO2", "value": 793, "unit": "ppm"}
+              ]
             }
 
         Temperature and timestamp use the device's own unit preference and timezone
         (from ``deviceInfo.unit`` and ``zoneId`` in the API response). Devices
         without a configured timezone fall back to UTC.
         ``external_sensors`` excludes phantom entries (API-reported sensor slots
-        with no physical hardware connected — see API Quirk 20).
+        with no physical hardware connected — see API Quirk 20). Each entry carries a
+        Title-Case ``sensor_type_label`` and a ``unit`` derived from ``sensor_type``
+        (empty string for unitless pH and Water Level). EC readings carry their probe's
+        unit (µS/cm or mS/cm); 1 mS/cm = 1000 µS/cm — do not compare bare numbers across
+        probes.
         ``plug_status`` is only present on a port entry when no current is detected,
         the port is not running (speed 0 and no load), **and the port still has its
         default name** (``"Port N"``). Custom-named ports are assumed to have a device
@@ -902,6 +936,7 @@ async def get_device_reading(device_id: str) -> str:
         _vpd = parsed.get("vpd")
         _ts = _utc_iso_to_local(parsed.get("timestamp"), tz)
         _safe_name = _sanitize_api_string(parsed.get("device_name"), 64) or "Device"
+        _sensor_clause = _format_sensor_clause(parsed.get("external_sensors", []))
         output = {
             "device_id": device_id,
             "device_name": parsed.get("device_name"),
@@ -914,7 +949,8 @@ async def get_device_reading(device_id: str) -> str:
             "external_sensors": parsed.get("external_sensors", []),
             "human_summary": (
                 f"{_safe_name}: {_temp_val}{_unit_lbl}, {_humid}% RH, VPD {_vpd} kPa. "
-                f"Reading from {_ts}."
+                + (f"{_sensor_clause}. " if _sensor_clause else "")
+                + f"Reading from {_ts}."
             ),
         }
 
@@ -1267,7 +1303,11 @@ async def get_all_device_readings() -> str:
         ``loadState == 0`` AND ``speak == 0`` condition as ``get_device_reading``,
         and only on default-named ``"Port N"`` ports); omitted otherwise.
         ``external_sensors`` excludes phantom entries (API-reported sensor slots
-        with no physical hardware connected — see API Quirk 20).
+        with no physical hardware connected — see API Quirk 20). Each entry carries a
+        Title-Case ``sensor_type_label`` and a ``unit`` derived from ``sensor_type``
+        (empty string for unitless pH and Water Level). EC readings carry their probe's
+        unit (µS/cm or mS/cm); 1 mS/cm = 1000 µS/cm — do not compare bare numbers across
+        probes.
         On auth/API failure returns ``{"error": "...", "detail": "..."}``.
     """
     try:
@@ -1309,12 +1349,15 @@ async def get_all_device_readings() -> str:
             )
             _all_summary = f"| Device | Temp | Humidity | VPD |\n|---|---|---|---|\n{_rows}"
         elif _ok:
-            _all_parts = [
-                f"{_sanitize_api_string(r.get('device_name'), 64) or 'Unknown'}: "
-                f"{r.get('temperature')}{r.get('unit')}, {r.get('humidity')}% RH, "
-                f"VPD {r.get('vpd')} kPa"
-                for r in _ok
-            ]
+            _all_parts = []
+            for r in _ok:
+                _base = (
+                    f"{_sanitize_api_string(r.get('device_name'), 64) or 'Unknown'}: "
+                    f"{r.get('temperature')}{r.get('unit')}, {r.get('humidity')}% RH, "
+                    f"VPD {r.get('vpd')} kPa"
+                )
+                _sc = _format_sensor_clause(r.get("external_sensors", []))
+                _all_parts.append(f"{_base}. {_sc}" if _sc else _base)
             _all_summary = ". ".join(_all_parts) + "."
         else:
             _all_summary = "No readings available."

@@ -452,36 +452,73 @@ async def _build_advance_conflict_response(
         auto_id = governing["automation_id"]
         governing_pg = _find_governing_port_group(governing, port)
         current_auto_speed = governing_pg.get("on_speed") if governing_pg is not None else "?"
+        # Detect toggle (on/off) hardware from the port's loadType in devInfoListAll.
+        _port_entry = next(
+            (p for p in (device or {}).get("deviceInfo", {}).get("ports", [])
+             if p.get("port") == port),
+            None,
+        )
+        _is_toggle = _port_entry is not None and _port_entry.get("loadType") in (4, 128)
         summary = (
             f"While '{auto_name}' automation is running, all ports on this controller"
             " are locked from manual control."
             " Your change requires resolving this conflict first."
         )
-        human_summary = (
-            f"'{auto_name}' is actively controlling this port at target speed {current_auto_speed}."
-            " Changing its speed by hand repeatedly can throw off the pattern the controller is"
-            " learning for your grow, so I've left it on automation. To make manual adjustments,"
-            " you need to resolve this automation conflict first."
-        )
-        if requested_speed is not None:
-            suggested_reply = (
-                f"'{auto_name}' automation is controlling this port right now"
-                f" (target speed: {current_auto_speed})."
-                f" The easiest fix is to update the automation to run at speed {requested_speed}"
-                " instead — the automation stays active, just at the new speed."
-                f" Alternatively, I can release {port_display} from the automation"
-                f" so you can control it manually — but that will also release all other ports"
-                f" currently on '{auto_name}'."
-                " What would you prefer?"
+        if _is_toggle:
+            # Toggle hardware: use "on" language, not "speed".
+            human_summary = (
+                f"'{auto_name}' is actively controlling this port (target: on)."
+                " Changing its state by hand repeatedly can throw off the pattern the controller"
+                " is learning for your grow, so I've left it on automation."
+                " To make manual adjustments, you need to resolve this automation conflict first."
             )
         else:
-            suggested_reply = (
-                f"'{auto_name}' automation is controlling this port right now"
-                f" (target speed: {current_auto_speed}). I can release this port from the"
-                f" automation — but note this will also release all other ports currently on"
-                f" '{auto_name}'. Alternatively, I could update the automation's speed settings"
-                " instead. What would you prefer?"
+            human_summary = (
+                f"'{auto_name}' is actively controlling this port"
+                f" at target speed {current_auto_speed}."
+                " Changing its speed by hand repeatedly can throw off the pattern the"
+                " controller is learning for your grow, so I've left it on automation."
+                " To make manual adjustments, you need to resolve this automation conflict first."
             )
+        if requested_speed is not None:
+            if _is_toggle:
+                suggested_reply = (
+                    f"'{auto_name}' automation is controlling this port right now (target: on)."
+                    " The easiest fix is to update the automation to target on instead —"
+                    " the automation stays active, just with the new target."
+                    f" Alternatively, I can release {port_display} from the automation"
+                    f" so you can control it manually — but that will also release all other ports"
+                    f" currently on '{auto_name}'."
+                    " What would you prefer?"
+                )
+            else:
+                suggested_reply = (
+                    f"'{auto_name}' automation is controlling this port right now"
+                    f" (target speed: {current_auto_speed})."
+                    " The easiest fix is to update the automation to run at a different speed"
+                    f" instead — the automation stays active, just at the new speed."
+                    f" Alternatively, I can release {port_display} from the automation"
+                    f" so you can control it manually — but that will also release all other ports"
+                    f" currently on '{auto_name}'."
+                    " What would you prefer?"
+                )
+        else:
+            if _is_toggle:
+                suggested_reply = (
+                    f"'{auto_name}' automation is controlling this port right now (target: on)."
+                    f" I can release {port_display} from the automation so you can control it"
+                    f" manually — but note this will also release all other ports currently on"
+                    f" '{auto_name}'. Alternatively, I could update the automation's target"
+                    " instead. What would you prefer?"
+                )
+            else:
+                suggested_reply = (
+                    f"'{auto_name}' automation is controlling this port right now"
+                    f" (target speed: {current_auto_speed}). I can release this port from the"
+                    f" automation — but note this will also release all other ports currently on"
+                    f" '{auto_name}'. Alternatively, I could update the automation's speed"
+                    " settings instead. What would you prefer?"
+                )
         opt1: dict = {
             "description": (
                 f"Release {port_display} from '{auto_name}' to regain manual control."
@@ -510,18 +547,30 @@ async def _build_advance_conflict_response(
         # set_port_on / set_port_off pass requested_speed=None → no speed option.
         options_dict: dict = {}
         if requested_speed is not None:
-            options_dict["0_update_speed"] = {
-                "description": (
-                    f"Change the '{auto_name}' automation's target speed from"
-                    f" {current_auto_speed} to {requested_speed},"
-                    " keeping the automation active."
-                ),
-                "instruction": (
-                    f"Ask me to update the '{auto_name}' automation to run at"
-                    f" speed {requested_speed} instead."
-                ),
-                "available": True,
-            }
+            if _is_toggle:
+                options_dict["0_update_speed"] = {
+                    "description": (
+                        f"Change the '{auto_name}' automation's target to on,"
+                        " keeping the automation active."
+                    ),
+                    "instruction": (
+                        f"Ask me to update the '{auto_name}' automation to target on instead."
+                    ),
+                    "available": True,
+                }
+            else:
+                options_dict["0_update_speed"] = {
+                    "description": (
+                        f"Change the '{auto_name}' automation's target speed from"
+                        f" {current_auto_speed} to {requested_speed},"
+                        " keeping the automation active."
+                    ),
+                    "instruction": (
+                        f"Ask me to update the '{auto_name}' automation to run at"
+                        f" speed {requested_speed} instead."
+                    ),
+                    "available": True,
+                }
         options_dict[opt1_key] = opt1
         options_dict["2_disable_automation"] = opt2
         options_dict["3_fork_automation"] = {

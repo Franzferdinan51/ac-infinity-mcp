@@ -11,6 +11,7 @@ import time
 import weakref
 from datetime import UTC, datetime, timedelta
 
+import requests
 from mcp.server.fastmcp import FastMCP
 
 from ac_infinity_mcp.analytics import (
@@ -71,6 +72,7 @@ from ac_infinity_mcp.ports import (
 from ac_infinity_mcp.schema import (
     _ADVANCE_MODE_TYPE,
     _AUTH_ERROR_MSG,
+    _WRITE_TIMEOUT_MSG,
     ACInfinityAdvanceConflictError,
     ACInfinityAPIError,
     ACInfinityAuthError,
@@ -362,6 +364,117 @@ def _format_sensor_clause(external_sensors: list[dict]) -> str:
         parts.append(f"{label}: {value}{sep}{unit}")
     clause = "External sensors — " + ", ".join(parts)
     return _sanitize_api_string(clause, 512)
+
+
+def _interpret_reading(
+    temp_val: float,
+    unit_lbl: str,
+    humidity: float,
+    vpd: float,
+) -> dict[str, str | dict[str, str]]:
+    """Assess current readings against veg-stage targets and return an interpret block.
+
+    Returns a dict with:
+      - interpret: plain-English sentence (e.g. "VPD is in range for veg.
+        Temperature is slightly warm — consider improving airflow.")
+      - status: overall status "OK", "WARNING", or "CRITICAL"
+      - metrics: dict of per-metric status (vpd, temperature, humidity)
+
+    Uses veg-stage targets (the most common grow stage) as the default reference.
+    Temperature is interpreted in the same unit as shown in the reading.
+    """
+    # Veg targets (default grow stage)
+    veg_targets = STAGE_TARGETS["veg"]
+    vpd_low, vpd_high = veg_targets["vpd"]
+    temp_low_c, temp_high_c = veg_targets["temp_c"]
+    hum_low, hum_high = veg_targets["humidity"]
+
+    # Convert temp targets to the display unit
+    if unit_lbl == "°F":
+        temp_low = _to_preferred_temp(temp_low_c, "°F")
+        temp_high = _to_preferred_temp(temp_high_c, "°F")
+    else:
+        temp_low = temp_low_c
+        temp_high = temp_high_c
+
+    # Assess each metric
+    def _metric_status(value: float, lo: float, hi: float) -> str:
+        if lo <= value <= hi:
+            return "OK"
+        if value < lo:
+            return "LOW"
+        return "HIGH"
+
+    vpd_status = _metric_status(vpd, vpd_low, vpd_high)
+    temp_status = _metric_status(temp_val, temp_low, temp_high)
+    hum_status = _metric_status(humidity, hum_low, hum_high)
+
+    # Overall status
+    critical_count = sum(1 for s in [vpd_status, temp_status, hum_status] if s != "OK")
+    if critical_count == 0:
+        overall_status = "OK"
+    elif critical_count == 1:
+        overall_status = "WARNING"
+    else:
+        overall_status = "CRITICAL"
+
+    # Per-metric details
+    metrics: dict[str, str] = {
+        "vpd": vpd_status,
+        "temperature": temp_status,
+        "humidity": hum_status,
+    }
+
+    # Build the interpret sentence
+    parts: list[str] = []
+
+    # VPD assessment
+    if vpd_status == "OK":
+        parts.append(f"VPD {vpd} kPa is in range for veg.")
+    elif vpd_status == "LOW":
+        parts.append(
+            f"VPD {vpd} kPa is below veg range ({vpd_low}–{vpd_high} kPa) "
+            "— humidity may be too high or temperature too low."
+        )
+    else:
+        parts.append(
+            f"VPD {vpd} kPa is above veg range ({vpd_low}–{vpd_high} kPa) "
+            "— humidity may be too low or temperature too high."
+        )
+
+    # Temperature
+    if temp_status == "OK":
+        parts.append("Temperature is in range.")
+    elif temp_status == "LOW":
+        parts.append(
+            f"Temperature ({temp_val}{unit_lbl}) is below range "
+            f"({temp_low:.0f}–{temp_high:.0f}{unit_lbl}) — consider raising it."
+        )
+    else:
+        parts.append(
+            f"Temperature ({temp_val}{unit_lbl}) is above range "
+            f"({temp_low:.0f}–{temp_high:.0f}{unit_lbl}) — improve airflow or cooling."
+        )
+
+    # Humidity
+    if hum_status == "OK":
+        parts.append("Humidity is in range.")
+    elif hum_status == "LOW":
+        parts.append(
+            f"Humidity ({humidity:.0f}%) is below range "
+            f"({hum_low:.0f}–{hum_high:.0f}%) — consider adding moisture."
+        )
+    else:
+        parts.append(
+            f"Humidity ({humidity:.0f}%) is above range "
+            f"({hum_low:.0f}–{hum_high:.0f}%) — consider more airflow."
+        )
+
+    return {
+        "interpret": " ".join(parts),
+        "status": overall_status,
+        "metrics": metrics,
+    }
 
 
 # switchTime bit 7 (128) = continuous flag; mirrors automation._SWITCHTIME_CONTINUOUS_BIT.
@@ -933,11 +1046,12 @@ async def get_device_reading(device_id: str) -> str:
 
         _temp_val = _to_preferred_temp(parsed.get("temperature_c", 0.0), unit)
         _unit_lbl = _unit_label(unit)
-        _humid = parsed.get("humidity")
-        _vpd = parsed.get("vpd")
+        _humid = parsed.get("humidity") or 0.0
+        _vpd = parsed.get("vpd") or 0.0
         _ts = _utc_iso_to_local(parsed.get("timestamp"), tz)
         _safe_name = _sanitize_api_string(parsed.get("device_name"), 64) or "Device"
         _sensor_clause = _format_sensor_clause(parsed.get("external_sensors", []))
+        _interpret = _interpret_reading(_temp_val, _unit_lbl, _humid, _vpd)
         output = {
             "device_id": device_id,
             "device_name": parsed.get("device_name"),
@@ -948,6 +1062,7 @@ async def get_device_reading(device_id: str) -> str:
             "timestamp": _ts,
             "ports": parsed.get("ports", []),
             "external_sensors": parsed.get("external_sensors", []),
+            "interpret": _interpret,
             "human_summary": (
                 f"{_safe_name}: {_temp_val}{_unit_lbl}, {_humid}% RH, VPD {_vpd} kPa. "
                 + (f"{_sensor_clause}. " if _sensor_clause else "")
@@ -2101,15 +2216,32 @@ async def get_port_status(device_id: str, port: int) -> str:
             f"{_ps_raw_name} (Port {port})" if _ps_raw_name != f"Port {port}" else f"Port {port}"
         )
         _ps_power = port_data.get("speak", 0)
-        if mode_str == "Automation" and automation_name:
-            _ps_summary = (
-                f"{_ps_label} is running under '{automation_name}' automation "
-                f"at speed {_ps_power}."
-            )
-        elif _ps_power == 0:
-            _ps_summary = f"{_ps_label} is {mode_str} (speed 0)."
+        # loadType from devInfoListAll: 0=variable-speed fan, 4=on/off outlet, 128=on/off adaptor.
+        _ps_is_toggle = port_data.get("loadType") in (4, 128)
+
+        if _ps_is_toggle:
+            # On/off toggle device: use "on"/"off" language, not "speed".
+            _ps_power_str = "on" if _ps_power > 0 else "off"
+            if mode_str == "Automation" and automation_name:
+                _ps_summary = (
+                    f"{_ps_label} is running under '{automation_name}' automation "
+                    f"({_ps_power_str})."
+                )
+            elif _ps_power == 0:
+                _ps_summary = f"{_ps_label} is {mode_str} (off)."
+            else:
+                _ps_summary = f"{_ps_label} is {mode_str} (on)."
         else:
-            _ps_summary = f"{_ps_label} is {mode_str} at speed {_ps_power}."
+            # Variable-speed device: use "speed" language.
+            if mode_str == "Automation" and automation_name:
+                _ps_summary = (
+                    f"{_ps_label} is running under '{automation_name}' automation "
+                    f"at speed {_ps_power}."
+                )
+            elif _ps_power == 0:
+                _ps_summary = f"{_ps_label} is {mode_str} (speed 0)."
+            else:
+                _ps_summary = f"{_ps_label} is {mode_str} at speed {_ps_power}."
 
         result: dict = {
             "device_id": device_id,
@@ -2125,9 +2257,10 @@ async def get_port_status(device_id: str, port: int) -> str:
             result["remain_time_seconds"] = remain
         if not port_data.get("loadState", 0) and not _ps_power and _ps_raw_name == f"Port {port}":
             result["plug_status"] = "not powered"
+        # Issue #187: empty-port advisory leads the response, not buried at the bottom.
         if _is_port_empty(port_data, port, device):
             _port_label_s = _ps_raw_name
-            result["advisory"] = _empty_port_advisory(_port_label_s)
+            result["alert"] = _empty_port_advisory(_port_label_s)
         result["human_summary"] = _ps_summary
         return json.dumps(result, indent=2)
 
@@ -2301,11 +2434,20 @@ async def get_port_settings(device_id: str, port: int) -> str:
                 _target_speed = (
                     governing_pg.get("on_speed") if governing_pg is not None else "?"
                 )
-                resp["human_summary"] = (
-                    f"Port is running under '{governing['name']}' automation"
-                    f" (target speed: {_target_speed}, current live speed: {current_speed})."
-                    " The automation is active."
-                )
+                # Check if this is a toggle device so we use "on" instead of "speed" in prose.
+                _is_toggle = port_data is not None and port_data.get("loadType") in (4, 128)
+                if _is_toggle:
+                    resp["human_summary"] = (
+                        f"Port is running under '{governing['name']}' automation"
+                        f" (target: on, current state: {'on' if current_speed > 0 else 'off'})."
+                        " The automation is active."
+                    )
+                else:
+                    resp["human_summary"] = (
+                        f"Port is running under '{governing['name']}' automation"
+                        f" (target speed: {_target_speed}, current live speed: {current_speed})."
+                        " The automation is active."
+                    )
             else:
                 resp["human_summary"] = (
                     "Port is in automation mode, but all automations are disabled."
@@ -2532,13 +2674,18 @@ async def set_port_speed(
 
         response: dict = {
             "action": f"set {port_label} speed to {speed}",
+        }
+        # Issue #187: empty-port advisory leads the response, not buried at the bottom.
+        if _is_port_empty(port_data, port, device):
+            response["alert"] = _empty_port_advisory(port_label)
+        response.update({
             "device_id": device_id,
             "port": port,
             "speed": speed,
             "dry_run": write_result["dry_run"],
             "controller_type": write_result["controller_type"],
             "sent": write_result["sent"],
-        }
+        })
         if write_result["dry_run"]:
             response["payload"] = write_result["payload"]
 
@@ -2549,9 +2696,6 @@ async def set_port_speed(
                 "will not run until the mode is changed to ON. "
                 "To activate it, ask me to switch this port to ON mode."
             )
-
-        if _is_port_empty(port_data, port, device):
-            response["advisory"] = _empty_port_advisory(port_label)
 
         return json.dumps(response, indent=2)
 
@@ -2573,6 +2717,12 @@ async def set_port_speed(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_speed (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in set_port_speed (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in set_port_speed: %s", e, exc_info=True)
         return json.dumps({
@@ -2628,17 +2778,19 @@ async def set_port_on(
 
         response: dict = {
             "action": f"turn {port_label} on",
+        }
+        # Issue #187: empty-port advisory leads the response, not buried at the bottom.
+        if _is_port_empty(port_data, port, device):
+            response["alert"] = _empty_port_advisory(port_label)
+        response.update({
             "device_id": device_id,
             "port": port,
             "dry_run": write_result["dry_run"],
             "controller_type": write_result["controller_type"],
             "sent": write_result["sent"],
-        }
+        })
         if write_result["dry_run"]:
             response["payload"] = write_result["payload"]
-
-        if _is_port_empty(port_data, port, device):
-            response["advisory"] = _empty_port_advisory(port_label)
 
         return json.dumps(response, indent=2)
 
@@ -2660,6 +2812,12 @@ async def set_port_on(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_on (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in set_port_on (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in set_port_on: %s", e, exc_info=True)
         return json.dumps({
@@ -2716,17 +2874,19 @@ async def set_port_off(
 
         response: dict = {
             "action": f"turn {port_label} off",
+        }
+        # Issue #187: empty-port advisory leads the response, not buried at the bottom.
+        if _is_port_empty(port_data, port, device):
+            response["alert"] = _empty_port_advisory(port_label)
+        response.update({
             "device_id": device_id,
             "port": port,
             "dry_run": write_result["dry_run"],
             "controller_type": write_result["controller_type"],
             "sent": write_result["sent"],
-        }
+        })
         if write_result["dry_run"]:
             response["payload"] = write_result["payload"]
-
-        if _is_port_empty(port_data, port, device):
-            response["advisory"] = _empty_port_advisory(port_label)
 
         return json.dumps(response, indent=2)
 
@@ -2748,6 +2908,12 @@ async def set_port_off(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_off (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in set_port_off (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in set_port_off: %s", e, exc_info=True)
         return json.dumps({
@@ -2880,6 +3046,12 @@ async def set_vpd_automation(
             device_id, port, e,
         )
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in set_vpd_automation (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in set_vpd_automation: %s", e, exc_info=True)
         return json.dumps({
@@ -3028,6 +3200,15 @@ async def set_temperature_automation(
             device_id, port, e,
         )
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning(
+            "Timeout in set_temperature_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in set_temperature_automation: %s", e, exc_info=True)
         return json.dumps({
@@ -3139,6 +3320,15 @@ async def set_humidity_automation(
             device_id, port, e,
         )
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning(
+            "Timeout in set_humidity_automation (device=%s port=%s): %s",
+            device_id, port, e,
+        )
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in set_humidity_automation: %s", e, exc_info=True)
         return json.dumps({
@@ -3300,6 +3490,12 @@ async def set_port_mode(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in set_port_mode (device=%s port=%s): %s", device_id, port, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in set_port_mode (device=%s port=%s): %s", device_id, port, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in set_port_mode: %s", e, exc_info=True)
         return json.dumps({
@@ -3445,6 +3641,12 @@ async def apply_grow_stage_template(
             device_id, port, stage, e,
         )
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in apply_grow_stage_template (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in apply_grow_stage_template: %s", e, exc_info=True)
         return json.dumps({
@@ -3852,6 +4054,12 @@ async def enable_advance_automation(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in enable_advance_automation (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in enable_advance_automation (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in enable_advance_automation: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
@@ -3990,6 +4198,12 @@ async def disable_advance_automation(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in disable_advance_automation (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in disable_advance_automation (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in disable_advance_automation: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
@@ -4300,6 +4514,12 @@ async def create_advance_automation(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in create_advance_automation (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in create_advance_automation (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in create_advance_automation: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
@@ -4399,6 +4619,12 @@ async def delete_advance_automation(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in delete_advance_automation (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in delete_advance_automation (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in delete_advance_automation: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
@@ -4718,6 +4944,12 @@ async def add_automation_rule(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in add_automation_rule (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in add_automation_rule (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in add_automation_rule: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
@@ -5163,6 +5395,12 @@ async def update_automation_rule(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in update_automation_rule (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in update_automation_rule (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in update_automation_rule: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
@@ -5313,6 +5551,12 @@ async def delete_automation_rule(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in delete_automation_rule (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in delete_automation_rule (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in delete_automation_rule: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
@@ -5704,6 +5948,12 @@ async def break_out_of_automation(
     except ACInfinityDeviceError as e:
         logger.warning("Device error in break_out_of_automation (%s): %s", device_id, e)
         return json.dumps({"error": str(e)})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in break_out_of_automation (device=%s): %s", device_id, e)
+        return json.dumps({
+            "error": _WRITE_TIMEOUT_MSG,
+            "detail": "see server logs",
+        })
     except Exception as e:
         logger.error("Unexpected error in break_out_of_automation: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})

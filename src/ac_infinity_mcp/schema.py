@@ -46,6 +46,18 @@ _AUTH_ERROR_MSG = (
 )
 
 
+# Timeout error for write operations. The AC Infinity server may have processed the
+# write before the timeout, so we do NOT retry to avoid double-applying state.
+# The caller should check the device manually and retry only after verifying the
+# current state — a second write to an already-applied command could cause issues.
+_WRITE_TIMEOUT_MSG = (
+    "The request timed out waiting for the AC Infinity server to respond. "
+    "The server may have processed the change before the timeout, so I have not "
+    "retried to avoid double-applying state. Please check your device to verify "
+    "the current state, then retry with dry_run=False if needed."
+)
+
+
 # ============ Advance Automation Constants ============
 
 # modeType value that indicates a port is under Advance Automation control.

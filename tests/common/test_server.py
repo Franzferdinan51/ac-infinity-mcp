@@ -9137,14 +9137,14 @@ MOCK_WRITE_DRY_SPEED = {
 
 
 async def test_set_port_on_empty_port_warning(mock_client):
-    """set_port_on: default-named zero-load port gets advisory."""
+    """set_port_on: default-named zero-load port gets alert (issue #187)."""
     mock_client.set_port_mode.return_value = MOCK_WRITE_DRY
     mock_client.get_devices.return_value = [_make_device_with_empty_port(7)]
     result = await set_port_on("C58ZA", 7)
     data = json.loads(result)
-    assert "advisory" in data
-    assert "Port 7" in data["advisory"]
-    assert "connected" in data["advisory"]
+    assert "alert" in data
+    assert "Port 7" in data["alert"]
+    assert "connected" in data["alert"]
 
 
 async def test_set_port_on_connected_port_no_warning(mock_client):
@@ -9157,13 +9157,13 @@ async def test_set_port_on_connected_port_no_warning(mock_client):
 
 
 async def test_set_port_off_empty_port_warning(mock_client):
-    """set_port_off: default-named zero-load port gets advisory."""
+    """set_port_off: default-named zero-load port gets alert (issue #187)."""
     mock_client.set_port_mode.return_value = MOCK_WRITE_DRY
     mock_client.get_devices.return_value = [_make_device_with_empty_port(7)]
     result = await set_port_off("C58ZA", 7)
     data = json.loads(result)
-    assert "advisory" in data
-    assert "connected" in data["advisory"]
+    assert "alert" in data
+    assert "connected" in data["alert"]
 
 
 async def test_set_port_off_connected_port_no_warning(mock_client):
@@ -9176,26 +9176,26 @@ async def test_set_port_off_connected_port_no_warning(mock_client):
 
 
 async def test_set_port_speed_empty_port_warning(mock_client):
-    """set_port_speed: default-named zero-load port gets advisory."""
+    """set_port_speed: default-named zero-load port gets alert (issue #187)."""
     mock_client.set_port_mode.return_value = MOCK_WRITE_DRY_SPEED
     mock_client.get_devices.return_value = [_make_device_with_empty_port(7)]
     result = await set_port_speed("C58ZA", 7, 5)
     data = json.loads(result)
-    assert "advisory" in data
-    assert "connected" in data["advisory"]
+    assert "alert" in data
+    assert "connected" in data["alert"]
 
 
 async def test_set_port_speed_connected_port_no_warning(mock_client):
-    """set_port_speed: custom-named port has no empty-port advisory."""
+    """set_port_speed: custom-named port has no empty-port alert (issue #187)."""
     mock_client.set_port_mode.return_value = MOCK_WRITE_DRY_SPEED
     mock_client.get_devices.return_value = [_make_device_with_connected_port(4)]
     result = await set_port_speed("C58ZA", 4, 5)
     data = json.loads(result)
-    assert "advisory" not in data
+    assert "alert" not in data
 
 
 async def test_set_port_speed_off_mode_and_empty_port_both_warned(mock_client):
-    """set_port_speed: OFF-mode warning and empty-port advisory are separate keys."""
+    """set_port_speed: OFF-mode warning and empty-port alert are separate keys (issue #187)."""
     off_mode_dry = {**MOCK_WRITE_DRY_SPEED, "prior_mode_type": 1}  # atType=1 = OFF
     mock_client.set_port_mode.return_value = off_mode_dry
     mock_client.get_devices.return_value = [_make_device_with_empty_port(7)]
@@ -9203,8 +9203,8 @@ async def test_set_port_speed_off_mode_and_empty_port_both_warned(mock_client):
     data = json.loads(result)
     assert "warning" in data
     assert "OFF mode" in data["warning"]
-    assert "advisory" in data
-    assert "connected" in data["advisory"]
+    assert "alert" in data
+    assert "connected" in data["alert"]
 
 
 async def test_set_vpd_automation_empty_port_warning(mock_client):
@@ -9292,14 +9292,14 @@ async def test_set_port_mode_connected_port_no_warning(mock_client):
 # ============ Read-tool empty-port advisory (issue #165) ============
 
 async def test_get_port_status_empty_port_note(mock_client):
-    """get_port_status: default-named zero-load port gets advisory."""
+    """get_port_status: default-named zero-load port gets alert (issue #187)."""
     dev = _make_device_with_empty_port(7)
     mock_client.get_devices.return_value = [dev]
     result = await get_port_status("C58ZA", 7)
     data = json.loads(result)
-    assert "advisory" in data
-    assert "Port 7" in data["advisory"]
-    assert "connected" in data["advisory"]
+    assert "alert" in data
+    assert "Port 7" in data["alert"]
+    assert "connected" in data["alert"]
 
 
 async def test_get_port_status_connected_port_no_note(mock_client):
@@ -9312,7 +9312,7 @@ async def test_get_port_status_connected_port_no_note(mock_client):
 
 
 async def test_get_port_status_portresistance_65535_custom_name_note(mock_client):
-    """portResistance=65535 + custom-named port → advisory fires on get_port_status (#183)."""
+    """portResistance=65535 + custom-named port → alert fires on get_port_status (#183, #187)."""
     dev = copy.deepcopy(MOCK_DEVICE_LEGACY)
     dev["deviceInfo"]["ports"] = [
         {"port": 1, "portName": "Humidifier", "speak": 0, "portsLoad": 0,
@@ -9321,8 +9321,8 @@ async def test_get_port_status_portresistance_65535_custom_name_note(mock_client
     mock_client.get_devices.return_value = [dev]
     result = await get_port_status("C58ZA", 1)
     data = json.loads(result)
-    assert "advisory" in data
-    assert "connected" in data["advisory"]
+    assert "alert" in data
+    assert "connected" in data["alert"]
 
 
 async def test_get_port_settings_empty_port_note(mock_client):
@@ -9369,7 +9369,7 @@ async def test_get_port_settings_empty_port_note_advance_path(mock_client):
 # ============ devType=18 empty-port advisory integration (issue #165) ============
 
 async def test_set_port_on_devtype18_default_name_warns(mock_client):
-    """devType=18 (Willie's Tent): default-named port triggers advisory."""
+    """devType=18 (Willie's Tent): default-named port triggers alert (issue #187)."""
     mock_client.set_port_mode.return_value = MOCK_WRITE_DRY
     dev = copy.deepcopy(MOCK_DEVICE_LEGACY)
     dev["devType"] = 18
@@ -9380,7 +9380,7 @@ async def test_set_port_on_devtype18_default_name_warns(mock_client):
     mock_client.get_devices.return_value = [dev]
     result = await set_port_on("C58ZA", 7)
     data = json.loads(result)
-    assert "advisory" in data
+    assert "alert" in data
 
 
 async def test_set_port_on_devtype18_custom_name_no_warning(mock_client):
@@ -9402,7 +9402,7 @@ async def test_set_port_on_devtype18_custom_name_no_warning(mock_client):
 
 
 async def test_set_port_on_portresistance_65535_custom_name_warns(mock_client):
-    """portResistance=65535 + custom-named port → advisory fires (core #183 — write-tool level)."""
+    """portResistance=65535 + custom-named port → alert fires (core #183, issue #187)."""
     mock_client.set_port_mode.return_value = MOCK_WRITE_DRY
     dev = copy.deepcopy(MOCK_DEVICE_LEGACY)
     dev["deviceInfo"]["ports"] = [
@@ -9412,8 +9412,8 @@ async def test_set_port_on_portresistance_65535_custom_name_warns(mock_client):
     mock_client.get_devices.return_value = [dev]
     result = await set_port_on("C58ZA", 4)
     data = json.loads(result)
-    assert "advisory" in data
-    assert "connected" in data["advisory"]
+    assert "alert" in data
+    assert "connected" in data["alert"]
 
 
 # ============ _is_port_not_powered helper (issue #178) ============

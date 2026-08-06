@@ -456,6 +456,44 @@ async def test_build_conflict_auth_error_returns_error():
     assert "Authentication failed" in data["error"]
 
 
+async def test_build_conflict_devtype11_break_out_unavailable():
+    """#236: On devType=11 legacy controllers, 1_break_out is marked unavailable.
+
+    devType=11 uses controller-wide automation locking. Per-port release does not work
+    because get_mode_settings does not report modeType=15 for governed ports on this
+    device type. The conflict response should NOT offer per-port break-out as an option.
+    """
+    raw = [_make_raw_entry(101, "Dry", is_on=1, run_state=1, bitmask=8)]  # Port 4
+    client = _make_mock_client(raw)
+    # Pass devType=11 device so the function knows this is a legacy-11 controller.
+    device = {"devType": 11, "deviceInfo": {"ports": []}}
+    result = await _build_advance_conflict_response(
+        client, "C58ZA", 123456, 4, "Filter", device=device
+    )
+    data = json.loads(result)
+    assert data["conflict"] == "ADVANCE_AUTOMATION"
+    assert "1_break_out" in data["options"]
+    assert data["options"]["1_break_out"]["available"] is False
+    assert data["options"]["1_break_out"].get("status") == "not supported on this controller type"
+    # Option 2 (disable) must still be available.
+    assert data["options"]["2_disable_automation"]["available"] is True
+
+
+async def test_build_conflict_devtype11_human_summary_mentions_controller_lock():
+    """#236: On devType=11, human_summary explains controller-wide lock limitation."""
+    raw = [_make_raw_entry(101, "Dry", is_on=1, run_state=1, bitmask=8)]
+    client = _make_mock_client(raw)
+    device = {"devType": 11, "deviceInfo": {"ports": []}}
+    result = await _build_advance_conflict_response(
+        client, "C58ZA", 123456, 4, "Filter", device=device
+    )
+    data = json.loads(result)
+    assert (
+        "controller type" in data["human_summary"].lower()
+        or "all ports" in data["human_summary"].lower()
+    )
+
+
 # ============ _decode_rule defensive coercion (buffer/transition) ============
 
 

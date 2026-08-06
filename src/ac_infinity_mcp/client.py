@@ -591,6 +591,7 @@ class ACInfinityClient:
     V2_UPDATE_GROUPS_IS_ON_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/updateGroupsIsOn"
     V2_UPDATE_GROUPS_BY_ID_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/updateGroupsById"
     V2_DEL_BY_ID_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/delByid"
+    V2_GET_ALARMS_ENDPOINT = f"{V2_BASE_URL}/api/version=2.0/dev/getAlarms"
 
     def __init__(self, email: str, password: str):
         self.email = email
@@ -1577,6 +1578,54 @@ class ACInfinityClient:
 
         logger.info("Deleted automation advId=%s (devId=%s)", adv_id, dev_id)
         return result
+
+    def get_alarms(self, dev_id: str) -> list[dict]:
+        """Fetch all alarm/alert configurations for a device.
+
+        Returns:
+            List of raw alarm dicts from the AC Infinity v2.0 API.
+            Each alarm has fields like ``alarmId``, ``alarmName``, ``alarmType``,
+            ``isOn``, ``tempHigh``, ``tempLow``, ``humHigh``, ``humLow``, ``vpdHigh``,
+            ``vpdLow``, and ``isDeviceOnline`` (scope flag).
+
+        Raises:
+            ACInfinityAuthError: If not authenticated or refresh fails.
+            ACInfinityAPIError: If the API returns a non-200, non-401 code.
+            requests.exceptions.Timeout: After tenacity exhausts retries.
+            requests.exceptions.ConnectionError: After tenacity exhausts retries.
+        """
+        return self._call_with_token_refresh(self._get_alarms_inner, dev_id)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+        ),
+        reraise=True,
+    )
+    def _get_alarms_inner(self, dev_id: str) -> list[dict]:
+        if not self.token:
+            raise ACInfinityAuthError("Not authenticated — call authenticate() first")
+        data = {"devId": dev_id}
+        headers = self._v2_headers()
+        resp = self.session.post(
+            self.V2_GET_ALARMS_ENDPOINT, data=data, headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        code = result.get("code")
+        msg = str(result.get("msg", "")).lower()
+        if code == 401 or (code == 403 and "expired" in msg):
+            raise ACInfinityAuthError(f"Token expired: {result.get('msg')}")
+        if result.get("code") != 200:
+            raise ACInfinityAPIError(
+                f"GetAlarms API error {result.get('code')}: {result.get('msg')}"
+            )
+        alarms = result.get("data", [])
+        if not isinstance(alarms, list):
+            alarms = []
+        return alarms
 
     def parse_device_data(self, device_data: dict, role: str | None = None) -> dict:
         """Extract readable values from AC Infinity device response.

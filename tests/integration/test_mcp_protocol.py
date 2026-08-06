@@ -53,6 +53,11 @@ EXPECTED_TOOLS = {
     "add_automation_rule",
     "update_automation_rule",
     "delete_automation_rule",
+    # Phase 2 — New tools
+    "compare_devices",
+    "get_scheduled_automations",
+    "get_power_cost_report",
+    "list_device_alarms",
 }
 
 SCHEMA_CASES: list[tuple[str, list[str], list[str]]] = [
@@ -177,13 +182,15 @@ def _get_tool_schema(name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_all_28_tools_registered() -> None:
+def test_all_32_tools_registered() -> None:
+    """All 32 tools are registered with the MCP server."""
     registered = {t.name for t in mcp_server._tool_manager.list_tools()}  # type: ignore[attr-defined]
     assert registered == EXPECTED_TOOLS
 
 
-def test_tool_count_is_exactly_28() -> None:
-    assert len(mcp_server._tool_manager.list_tools()) == 28  # type: ignore[attr-defined]
+def test_tool_count_is_exactly_32() -> None:
+    """Exactly 32 tools are registered (28 original + 4 Phase 2 new tools)."""
+    assert len(mcp_server._tool_manager.list_tools()) == 32  # type: ignore[attr-defined]
 
 
 def test_mcp_server_name_is_ac_infinity() -> None:
@@ -239,11 +246,12 @@ def test_get_historical_readings_defaults() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_protocol_list_tools_returns_all_28(mock_client: MagicMock) -> None:
+async def test_protocol_list_tools_returns_all_32(mock_client: MagicMock) -> None:
+    """The MCP protocol list_tools response includes all 32 registered tools."""
     async with create_connected_server_and_client_session(srv.mcp_server) as session:
         result = await session.list_tools()
         names = {t.name for t in result.tools}
-        assert len(result.tools) == 28
+        assert len(result.tools) == 32
         assert names == EXPECTED_TOOLS
 
 
@@ -526,7 +534,7 @@ async def test_main_no_api_calls_on_introspection() -> None:
         with patch.object(real_client, "_authenticate_inner") as mock_auth:
             async with create_connected_server_and_client_session(srv.mcp_server) as session:
                 result = await session.list_tools()
-            assert len(result.tools) == 28
+            assert len(result.tools) == 32
             mock_auth.assert_not_called()
     finally:
         srv._aci_client = None

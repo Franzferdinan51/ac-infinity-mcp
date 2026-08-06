@@ -17,7 +17,7 @@ A complete walkthrough of every tool, with real conversation examples.
 9. [Advance Automations](#9-advance-automations)
 10. [Built-in Prompts](#10-built-in-prompts)
 11. [Troubleshooting](#11-troubleshooting)
-12. [Appendix: All 28 Tools at a Glance](#12-appendix-all-28-tools-at-a-glance)
+12. [Appendix: All 32 Tools at a Glance](#12-appendix-all-32-tools-at-a-glance)
 
 ---
 
@@ -677,7 +677,7 @@ See [Taking Back Manual Control](#taking-back-manual-control) in Section 9.
 
 ---
 
-## 12. Appendix: All 28 Tools at a Glance
+## 12. Appendix: All 32 Tools at a Glance
 
 | Tool | Category | Preview mode | What it does |
 |---|---|---|---|
@@ -709,3 +709,7 @@ See [Taking Back Manual Control](#taking-back-manual-control) in Section 9.
 | `update_automation_rule` | Advance Automation | Yes — on by default | Edit one rule in place — change its window, speed, mode, or sensor targets |
 | `delete_automation_rule` | Advance Automation | Yes — on by default | Remove a single rule from a program, leaving the rest intact |
 | `break_out_of_automation` | Advance Automation | Yes — on by default | Release a port from automation control and lock co-governed ports to manual speed |
+| `compare_devices` | Analytics | N/A | Compare live readings across multiple devices side-by-side |
+| `get_scheduled_automations` | Advance Automation | N/A | Weekly calendar view of all Advance Automation schedules for a device |
+| `get_power_cost_report` | Analytics | N/A | kWh consumption and estimated electricity cost over a date range |
+| `list_device_alarms` | Port Status | N/A | List alarm/alert configurations (threshold alarms, offline alerts) for a device |

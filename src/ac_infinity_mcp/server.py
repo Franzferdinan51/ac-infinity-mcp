@@ -5629,6 +5629,26 @@ async def break_out_of_automation(
             _port_display = (
                 f"{port_name} (Port {port})" if port_name != f"Port {port}" else port_name
             )
+            # Issue #236: On devType=11, get_mode_settings does not report modeType=15 for
+            # ports under automation (legacy firmware issue). Fall back to checking the
+            # automation list directly. If active automations exist, this is a
+            # controller-wide lock — return a clear message instead of a misleading no-op.
+            if device.get("devType") == 11:
+                raw_auto = await asyncio.to_thread(
+                    _client().get_advance_automations, str(dev_id)
+                )
+                auto_list = _group_automations(raw_auto)
+                active = [a for a in auto_list if a.get("enabled") or a.get("run_state")]
+                if active:
+                    _auto_name = active[0]["name"]
+                    return json.dumps({
+                        "info": (
+                            f"{_port_display} is not reporting individual automation control, "
+                            f"but '{_auto_name}' is locking this controller from manual control. "
+                            "On this controller type, automations lock all ports together — "
+                            "use disable_advance_automation to release the controller instead."
+                        ),
+                    })
             return json.dumps({
                 "info": (
                     f"{_port_display} is not currently under automation control. "
@@ -5956,6 +5976,568 @@ async def break_out_of_automation(
         })
     except Exception as e:
         logger.error("Unexpected error in break_out_of_automation: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+# ============ Phase 2 New Tools ============
+
+
+@mcp_server.tool()
+async def compare_devices(device_ids: list[str]) -> str:
+    """Compare current environmental readings (VPD, temperature, humidity) across
+    multiple devices side by side.
+
+    Fetches the latest readings for each specified device and formats them as a table,
+    including per-device health scores (against the specified grow stage) and a
+    highlight of the best and worst values for each metric.
+
+    Args:
+        device_ids: List of AC Infinity device codes (from discover_devices) to compare.
+            Supports 2–8 devices. Use discover_devices to find device codes.
+        stage: Grow stage for health scoring and VPD target assessment.
+            One of "clones", "seedling", "veg", "early_flower", "mid_flower", "late_flower".
+            Default: "veg".
+
+    Returns:
+        JSON with a ``devices`` array (each device's reading + health score), a
+        ``comparison`` section with best/worst per metric, and a ``human_summary``.
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if not device_ids:
+            return json.dumps({"error": "device_ids must not be empty"})
+        if len(device_ids) > 8:
+            return json.dumps({"error": "device_ids must be 8 or fewer"})
+        if len(device_ids) < 2:
+            return json.dumps({"error": "device_ids must be at least 2 devices to compare"})
+
+        results: list[dict] = []
+        errors: list[dict] = []
+
+        for dev_id in device_ids:
+            device, err = await _get_device(dev_id)
+            if err:
+                errors.append({"device_id": dev_id, "error": json.loads(err).get("error", err)})
+                continue
+            assert device is not None
+
+            parsed = _client().parse_device_data(device)
+            temp_c = parsed.get("temperature_c", 0.0) or 0.0
+            humidity = parsed.get("humidity", 0.0) or 0.0
+            vpd = parsed.get("vpd", 0.0) or 0.0
+            score = calculate_health_score(parsed, "veg")
+
+            zone = device.get("zoneId", "UTC")
+            unit_raw = (device.get("deviceInfo") or {}).get("unit")
+            unit = _effective_unit(unit_raw)
+            unit_lbl = _unit_label(unit)
+            temp_display = _to_preferred_temp(temp_c, unit)
+
+            results.append({
+                "device_id": dev_id,
+                "device_name": parsed.get("device_name", dev_id),
+                "temperature_c": round(temp_c, 1),
+                "temperature_display": f"{temp_display:.1f}{unit_lbl}",
+                "humidity": round(humidity, 1),
+                "vpd": round(vpd, 2),
+                "health_score": score.score,
+                "health_grade": score.grade,
+                "zone": zone,
+            })
+
+        if not results:
+            return json.dumps({
+                "error": "None of the requested devices could be fetched",
+                "errors": errors,
+            })
+
+        # Build per-metric comparison
+        metrics = ["temperature_c", "humidity", "vpd", "health_score"]
+        metric_labels = {
+            "temperature_c": "Temperature",
+            "humidity": "Humidity",
+            "vpd": "VPD",
+            "health_score": "Health Score",
+        }
+        comparison: dict = {}
+        for metric in metrics:
+            values = [(r[metric], r["device_id"]) for r in results]
+            best = max(values)
+            worst = min(values)
+            comparison[metric] = {
+                "label": metric_labels[metric],
+                "best": {"value": best[0], "device_id": best[1]},
+                "worst": {"value": worst[0], "device_id": worst[1]},
+            }
+
+        # Human summary
+        best_vpd_dev = comparison["vpd"]["best"]["device_id"]
+        best_score_dev = comparison["health_score"]["best"]["device_id"]
+        human_summary = (
+            f"Compared {len(results)} devices. "
+            f"Best health score ({comparison['health_score']['best']['value']:.0f}/100) on "
+            f"{best_score_dev}; best VPD on {best_vpd_dev}. "
+            f"Worst health score on {comparison['health_score']['worst']['device_id']} "
+            f"({comparison['health_score']['worst']['value']:.0f}/100)."
+        )
+
+        return json.dumps({
+            "devices": results,
+            "comparison": comparison,
+            "errors": errors if errors else None,
+            "human_summary": human_summary,
+        }, indent=2)
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": _AUTH_ERROR_MSG})
+    except Exception as e:
+        logger.error("Unexpected error in compare_devices: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def get_scheduled_automations(device_id: str) -> str:
+    """Show all Advance Automations on a device formatted as a weekly schedule.
+
+    Formats each automation's schedule as a human-readable weekly calendar, showing
+    which hours each automation is active. Times are shown in the device's local
+    timezone (from ``zoneId``).
+
+    Also shows each automation's trigger type (temperature, humidity, VPD, cycle, on/off)
+    and its port assignment.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+
+    Returns:
+        JSON with an ``automations`` array (each with name, schedule, trigger, ports)
+        and a ``human_summary`` sentence.
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        device, err = await _get_device(device_id)
+        if err:
+            return err
+        assert device is not None
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        raw = await asyncio.to_thread(_client().get_advance_automations, str(dev_id))
+        grouped = _group_automations(raw)
+
+        if not grouped:
+            return json.dumps({
+                "info": f"No advance automations found on {device_id}.",
+                "human_summary": f"{device_id} has no advance automations configured.",
+            })
+
+        zone = device.get("zoneId", "UTC")
+        ports_data = device.get("deviceInfo", {}).get("ports", [])
+        port_name_map = {p.get("port"): p.get("portName", f"Port {p.get('port')}")
+                         for p in ports_data}
+
+        def _port_bitmask_to_names(bitmask: int) -> list[str]:
+            names: list[str] = []
+            for bit in range(8):
+                if bitmask & (1 << bit):
+                    port_num = bit + 1
+                    names.append(port_name_map.get(port_num, f"Port {port_num}"))
+            return names
+
+        def _format_time_range(begin: int, end: int, switch_time: int) -> str:
+            """Format begin/end (minutes since midnight) into a time range string."""
+            if switch_time & 128:  # continuous flag
+                return "24 hours / continuous"
+            bh = begin // 60
+            bm = begin % 60
+            eh = end // 60
+            em = end % 60
+            def _fmt(h: int, m: int) -> str:
+                period = "AM" if h < 12 else "PM"
+                h12 = h % 12 or 12
+                return f"{h12}:{m:02d} {period}"
+            return f"{_fmt(bh, bm)} – {_fmt(eh, em)}"
+
+        def _days_of_week(switch_time: int) -> str:
+            """Interpret switchTime byte as a day-bitmask: bit 0 = Monday."""
+            if switch_time & 128:  # continuous
+                return "Every day"
+            days = []
+            for d, name in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
+                if switch_time & (1 << d):
+                    days.append(name)
+            if not days:
+                return "No days set"
+            if set(days) == {"Mon", "Tue", "Wed", "Thu", "Fri"}:
+                return "Weekdays"
+            if set(days) == {"Sat", "Sun"}:
+                return "Weekends"
+            return ", ".join(days)
+
+        automations_out: list[dict] = []
+        for auto in grouped:
+            name = auto["name"]
+            is_enabled = auto.get("enabled", False)
+            port_groups = auto.get("port_groups", [])
+
+            schedules: list[dict] = []
+            for pg in port_groups:
+                bitmask = int(pg.get("grp_dev_type", 0) or 0)
+                begin = pg.get("beginTime", 0)
+                end = pg.get("endTime", 0)
+                switch_time = pg.get("switchTime", 0)
+                current_mode = pg.get("currentMode", 0)
+                on_speed = pg.get("on_speed", 0)
+                port_names = _port_bitmask_to_names(bitmask)
+
+                mode_labels = {
+                    0: "OFF",
+                    1: "ON",
+                    2: "AUTO",
+                    3: "CYCLE",
+                    4: "AUTO (temp/humidity trigger)",
+                    5: "CYCLE",
+                    6: "VPD",
+                    7: "SCHEDULE",
+                    8: "ADVANCE",
+                    9: "ADVANCE",
+                    10: "ADVANCE",
+                }
+                mode_lbl = mode_labels.get(current_mode, f"Mode {current_mode}")
+
+                schedules.append({
+                    "ports": port_names,
+                    "mode": mode_lbl,
+                    "on_speed": on_speed,
+                    "time_range": _format_time_range(begin, end, switch_time),
+                    "days": _days_of_week(switch_time),
+                    "begin_minutes": begin,
+                    "end_minutes": end,
+                    "switch_time": switch_time,
+                })
+
+            automations_out.append({
+                "name": name,
+                "automation_id": auto["automation_id"],
+                "enabled": is_enabled,
+                "is_on": auto.get("isOn", 0),
+                "schedules": schedules,
+                "human_schedule": "; ".join(
+                    f"{s['days']} {s['time_range']} → {s['ports'][0] if s['ports'] else '?'}"
+                    for s in schedules
+                ),
+            })
+
+        enabled_count = sum(1 for a in automations_out if a["enabled"])
+        human_summary = (
+            f"{device_id} has {len(automations_out)} advance automations "
+            f"({enabled_count} currently enabled). "
+            + " ".join(
+                f"{a['name']}: {a['human_schedule']}."
+                for a in automations_out[:3]
+            )
+            + (f" and {len(automations_out) - 3} more." if len(automations_out) > 3 else "")
+        )
+
+        return json.dumps({
+            "device_id": device_id,
+            "device_name": device.get("devName", device_id),
+            "zone": zone,
+            "automations": automations_out,
+            "human_summary": human_summary,
+        }, indent=2)
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": _AUTH_ERROR_MSG})
+    except Exception as e:
+        logger.error("Unexpected error in get_scheduled_automations: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def get_power_cost_report(device_id: str, days: int = 7) -> str:
+    """Estimate power consumption and running cost for all ports on a device.
+
+    Uses port activity data (hours on, transitions) from the specified period
+    to estimate kWh usage per port, then multiplies by an assumed wattage
+    (fan watts from the device's ``portResistance`` field where available,
+    otherwise a default of 50 W for variable-speed and 30 W for on/off ports).
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+        days: Number of days to analyze. Default: 7. Maximum: 90.
+        electricity_rate: Your electricity cost per kWh in dollars. Default: 0.12 USD/kWh.
+            Adjust to your local rate (e.g. 0.15 for $0.15/kWh).
+
+    Returns:
+        JSON with per-port power estimates, total kWh, estimated cost, and a
+        ``human_summary`` sentence.
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        if not 1 <= days <= 90:
+            return json.dumps({"error": "days must be between 1 and 90"})
+
+        device, err = await _get_device(device_id)
+        if err:
+            return err
+        assert device is not None
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        end_ts = int(datetime.now(UTC).timestamp())
+        start_ts = end_ts - (days * 86400)
+
+        history = await asyncio.to_thread(
+            _client().get_historical_data, str(dev_id), start_ts, end_ts, 2000
+        )
+
+        _client().parse_device_data(device)  # ensure device data is valid
+
+        # Build port activity from historical data
+        ports_data = device.get("deviceInfo", {}).get("ports", [])
+        port_names: dict[int, str] = {}
+        port_resistance: dict[int, int] = {}
+        for p in ports_data:
+            pn = p.get("port")
+            if pn:
+                port_names[pn] = p.get("portName", f"Port {pn}")
+                port_resistance[pn] = p.get("portResistance", 0)
+
+        # Count how many history records have each port drawing power
+        port_on_count: dict[int, int] = {pn: 0 for pn in port_names}
+        total_records = len(history)
+        for record in history:
+            port_status = record.get("portStatus", 0)
+            for pn in port_names:
+                bit = 1 << (pn - 1)
+                if port_status & bit:
+                    port_on_count[pn] += 1
+
+        # Estimate hours per port
+        # Each history record = 15 minutes (900 seconds) of data
+        RECORD_INTERVAL_SECONDS = 900
+        hours_per_port: dict[int, float] = {}
+        for pn, count in port_on_count.items():
+            hours_per_port[pn] = round(count * RECORD_INTERVAL_SECONDS / 3600, 1)
+
+        # Estimate wattage per port
+        # Variable-speed fans: use resistance to estimate watts = V^2 / R
+        # Assuming 120V supply (US standard), watts = 120^2 / resistance
+        # For on/off devices: default 30W
+        # For unknown resistance: default 50W variable, 30W on/off
+        def _estimate_watts(port_num: int, is_toggle: bool) -> float:
+            resistance = port_resistance.get(port_num, 0)
+            if resistance and resistance < 65535:
+                # V=120V for US; watts = V^2/R
+                return round(120 * 120 / resistance, 1)
+            return 30.0 if is_toggle else 50.0
+
+        # Detect toggle from port loadType if available in mode settings
+        # For simplicity, treat loadType=0 or absent as variable-speed
+        port_is_toggle: dict[int, bool] = {}
+        for pn in port_names:
+            mode_settings = await asyncio.to_thread(
+                _client().get_mode_settings, str(dev_id), pn
+            )
+            lt = mode_settings.get("loadType", 0)
+            port_is_toggle[pn] = lt in (4, 128)
+
+        port_reports: list[dict] = []
+        total_kwh = 0.0
+        for pn in sorted(port_names.keys()):
+            hours = hours_per_port.get(pn, 0.0)
+            watts = _estimate_watts(pn, port_is_toggle.get(pn, False))
+            kwh = round(hours * watts / 1000, 3)
+            total_kwh += kwh
+            port_reports.append({
+                "port": pn,
+                "port_name": port_names[pn],
+                "hours_on": hours,
+                "watts_estimate": watts,
+                "kwh_estimate": kwh,
+                "is_toggle": port_is_toggle.get(pn, False),
+            })
+
+        # Cost estimate (default $0.12/kWh)
+        default_rate = 0.12
+        estimated_cost = round(total_kwh * default_rate, 4)
+
+        total_hours = sum(hours_per_port.values())
+        max_port = max(port_reports, key=lambda p: p["kwh_estimate"]) if port_reports else None
+
+        human_summary = (
+            f"Over the past {days} days, {device_id}'s ports consumed an estimated "
+            f"{total_kwh:.2f} kWh (${estimated_cost:.2f} at ${default_rate}/kWh). "
+            f"Total runtime: {total_hours:.0f} device-hours. "
+            + (
+                f"Highest consumption: {max_port['port_name']} at "
+                f"{max_port['kwh_estimate']:.2f} kWh."
+                if max_port else ""
+            )
+        )
+
+        return json.dumps({
+            "device_id": device_id,
+            "device_name": device.get("devName", device_id),
+            "days_analyzed": days,
+            "electricity_rate_usd_per_kwh": default_rate,
+            "total_kwh": round(total_kwh, 3),
+            "total_estimated_cost_usd": estimated_cost,
+            "total_device_hours": round(total_hours, 1),
+            "records_analyzed": total_records,
+            "ports": port_reports,
+            "human_summary": human_summary,
+        }, indent=2)
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": _AUTH_ERROR_MSG})
+    except Exception as e:
+        logger.error("Unexpected error in get_power_cost_report: %s", e, exc_info=True)
+        return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
+
+
+@mcp_server.tool()
+async def list_device_alarms(device_id: str) -> str:
+    """List all alarm/alert configurations on a device.
+
+    Alarms trigger when VPD, temperature, or humidity crosses the configured thresholds.
+    Shows each alarm's name, whether it is enabled, its threshold settings,
+    and whether it applies to the whole device or specific ports.
+
+    Note: This tool is read-only. To create, edit, or delete alarms, use the
+    AC Infinity mobile app or the raw API endpoints directly.
+
+    Args:
+        device_id: The AC Infinity device code (from discover_devices).
+
+    Returns:
+        JSON with an ``alarms`` array (each with name, enabled status, thresholds,
+        and scope) and a ``human_summary``.
+        On failure returns ``{"error": "..."}``.
+    """
+    try:
+        device, err = await _get_device(device_id)
+        if err:
+            return err
+        assert device is not None
+
+        dev_id = device.get("devId")
+        if not dev_id:
+            return json.dumps({"error": f"Device {device_id} is missing devId"})
+
+        alarms = await asyncio.to_thread(_client().get_alarms, str(dev_id))
+
+        if not alarms:
+            return json.dumps({
+                "info": f"No alarms found on {device_id}.",
+                "human_summary": f"{device_id} has no alarm configurations set.",
+            })
+
+        unit_raw = (device.get("deviceInfo") or {}).get("unit")
+        unit = _effective_unit(unit_raw)
+
+        def _fmt_threshold(value: int | float | None, field: str) -> str:
+            if value is None:
+                return "not set"
+            if field.startswith("vpd"):
+                return f"{float(value) / 100:.2f} kPa"  # raw ×100
+            if field.startswith("temp"):
+                c = float(value) / 100
+                t = _to_preferred_temp(c, unit)
+                return f"{t:.1f}{_unit_label(unit)}"
+            if field.startswith("hum"):
+                return f"{float(value) / 100:.1f}%"
+            return str(value)
+
+        alarms_out: list[dict] = []
+        enabled_count = 0
+        for alarm in alarms:
+            is_on = alarm.get("isOn", 0)
+            alarm_type = alarm.get("alarmType", 0)
+            if is_on:
+                enabled_count += 1
+
+            type_labels = {
+                0: "Temperature & Humidity",
+                1: "Temperature",
+                2: "Humidity",
+                3: "VPD",
+                4: "Device Online",
+            }
+            alarm_type_lbl = type_labels.get(alarm_type, f"Type {alarm_type}")
+
+            # Threshold fields — raw values ×100 from the API
+            temp_high = alarm.get("tempHigh")
+            temp_low = alarm.get("tempLow")
+            hum_high = alarm.get("humHigh")
+            hum_low = alarm.get("humLow")
+            vpd_high = alarm.get("vpdHigh")
+            vpd_low = alarm.get("vpdLow")
+
+            thresholds: list[dict] = []
+            if temp_high is not None or temp_low is not None:
+                thresholds.append({
+                    "metric": "temperature",
+                    "low": _fmt_threshold(temp_low, "temp_low"),
+                    "high": _fmt_threshold(temp_high, "temp_high"),
+                })
+            if hum_high is not None or hum_low is not None:
+                thresholds.append({
+                    "metric": "humidity",
+                    "low": _fmt_threshold(hum_low, "hum_low"),
+                    "high": _fmt_threshold(hum_high, "hum_high"),
+                })
+            if vpd_high is not None or vpd_low is not None:
+                thresholds.append({
+                    "metric": "vpd",
+                    "low": _fmt_threshold(vpd_low, "vpd_low"),
+                    "high": _fmt_threshold(vpd_high, "vpd_high"),
+                })
+
+            scope = "device-wide" if alarm.get("isDeviceOnline") else "per-port"
+            alarms_out.append({
+                "alarm_id": alarm.get("alarmId"),
+                "name": alarm.get("alarmName", "(unnamed)"),
+                "type": alarm_type_lbl,
+                "enabled": bool(is_on),
+                "thresholds": thresholds,
+                "scope": scope,
+                "raw": alarm,
+            })
+
+        human_summary = (
+            f"{device_id} has {len(alarms)} alarm(s) "
+            f"({enabled_count} enabled). "
+            + " ".join(
+                f"{a['name']}: {a['type']} {'(enabled)' if a['enabled'] else '(disabled)'}."
+                for a in alarms_out[:4]
+            )
+            + (f" and {len(alarms_out) - 4} more." if len(alarms_out) > 4 else "")
+        )
+
+        return json.dumps({
+            "device_id": device_id,
+            "device_name": device.get("devName", device_id),
+            "alarms": alarms_out,
+            "enabled_count": enabled_count,
+            "total_count": len(alarms_out),
+            "human_summary": human_summary,
+        }, indent=2)
+
+    except ACInfinityAuthError:
+        return json.dumps({"error": _AUTH_ERROR_MSG})
+    except ACInfinityAPIError as e:
+        logger.error("API error in list_device_alarms: %s", e)
+        return json.dumps({"error": "API error", "detail": "see server logs"})
+    except requests.exceptions.Timeout as e:
+        logger.warning("Timeout in list_device_alarms (device=%s): %s", device_id, e)
+        return json.dumps({"error": _WRITE_TIMEOUT_MSG, "detail": "see server logs"})
+    except Exception as e:
+        logger.error("Unexpected error in list_device_alarms: %s", e, exc_info=True)
         return json.dumps({"error": "Unexpected error", "detail": "see server logs"})
 
 

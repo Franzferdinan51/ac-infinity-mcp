@@ -459,6 +459,10 @@ async def _build_advance_conflict_response(
             None,
         )
         _is_toggle = _port_entry is not None and _port_entry.get("loadType") in (4, 128)
+        # Issue #236: On devType=11 legacy controllers, automations lock the controller
+        # controller-wide. get_mode_settings does not report modeType=15 for governed ports,
+        # so break_out_of_automation would no-op even though the port IS under control.
+        _is_legacy_11 = (device or {}).get("devType") == 11
         summary = (
             f"While '{auto_name}' automation is running, all ports on this controller"
             " are locked from manual control."
@@ -471,6 +475,8 @@ async def _build_advance_conflict_response(
                 " Changing its state by hand repeatedly can throw off the pattern the controller"
                 " is learning for your grow, so I've left it on automation."
                 " To make manual adjustments, you need to resolve this automation conflict first."
+                + (" On this controller type, automations lock all ports — use disable instead."
+                   if _is_legacy_11 else "")
             )
         else:
             human_summary = (
@@ -479,46 +485,76 @@ async def _build_advance_conflict_response(
                 " Changing its speed by hand repeatedly can throw off the pattern the"
                 " controller is learning for your grow, so I've left it on automation."
                 " To make manual adjustments, you need to resolve this automation conflict first."
+                + (" On this controller type, automations lock all ports — use disable instead."
+                   if _is_legacy_11 else "")
             )
         if requested_speed is not None:
             if _is_toggle:
                 suggested_reply = (
                     f"'{auto_name}' automation is controlling this port right now (target: on)."
-                    " The easiest fix is to update the automation to target on instead —"
-                    " the automation stays active, just with the new target."
-                    f" Alternatively, I can release {port_display} from the automation"
-                    f" so you can control it manually — but that will also release all other ports"
-                    f" currently on '{auto_name}'."
-                    " What would you prefer?"
+                    + (
+                        " The per-port release is not supported on this controller type —"
+                        " use option 2 to disable the automation and release all ports at once."
+                        if _is_legacy_11 else
+                        " The easiest fix is to update the automation to target on instead —"
+                        " the automation stays active, just with the new target."
+                        f" Alternatively, I can release {port_display} from the automation"
+                        f" so you can control it manually —"
+                        f" but that will also release all other ports"
+                        f" currently on '{auto_name}'."
+                    )
+                    + " What would you prefer?"
                 )
             else:
                 suggested_reply = (
                     f"'{auto_name}' automation is controlling this port right now"
                     f" (target speed: {current_auto_speed})."
-                    " The easiest fix is to update the automation to run at a different speed"
-                    f" instead — the automation stays active, just at the new speed."
-                    f" Alternatively, I can release {port_display} from the automation"
-                    f" so you can control it manually — but that will also release all other ports"
-                    f" currently on '{auto_name}'."
-                    " What would you prefer?"
+                    + (
+                        " The per-port release is not supported on this controller type —"
+                        " use option 2 to disable the automation and release all ports at once."
+                        if _is_legacy_11 else
+                        " The easiest fix is to update the automation to run at a different speed"
+                        f" instead — the automation stays active, just at the new speed."
+                        f" Alternatively, I can release {port_display} from the automation"
+                        f" so you can control it manually —"
+                        f" but that will also release all other ports"
+                        f" currently on '{auto_name}'."
+                    )
+                    + " What would you prefer?"
                 )
         else:
             if _is_toggle:
                 suggested_reply = (
                     f"'{auto_name}' automation is controlling this port right now (target: on)."
-                    f" I can release {port_display} from the automation so you can control it"
-                    f" manually — but note this will also release all other ports currently on"
-                    f" '{auto_name}'. Alternatively, I could update the automation's target"
-                    " instead. What would you prefer?"
+                    + (
+                        " The per-port release is not supported on this controller type —"
+                        " use option 2 to disable the automation and release all ports at once."
+                        if _is_legacy_11 else
+                        f" I can release {port_display} from the automation so you can control it"
+                        f" manually — but note this will also release all other ports currently on"
+                        f" '{auto_name}'. Alternatively, I could update the automation's target"
+                        " instead."
+                    )
+                    + " What would you prefer?"
                 )
             else:
                 suggested_reply = (
                     f"'{auto_name}' automation is controlling this port right now"
-                    f" (target speed: {current_auto_speed}). I can release this port from the"
-                    f" automation — but note this will also release all other ports currently on"
-                    f" '{auto_name}'. Alternatively, I could update the automation's speed"
-                    " settings instead. What would you prefer?"
+                    f" (target speed: {current_auto_speed})."
+                    + (
+                        " The per-port release is not supported on this controller type —"
+                        " use option 2 to disable the automation and release all ports at once."
+                        if _is_legacy_11 else
+                        f" I can release {port_display} from the automation — but note this"
+                        f" will also release all other ports currently on '{auto_name}'."
+                        f" Alternatively, I could update the automation's speed settings instead."
+                    )
+                    + " What would you prefer?"
                 )
+        # Issue #236: On devType=11 legacy controllers, automations lock the controller
+        # controller-wide (not per-port). get_mode_settings does not report modeType=15
+        # for governed ports on this device type, so break_out_of_automation would no-op
+        # even though the port IS under automation control. Mark the option unavailable.
         opt1: dict = {
             "description": (
                 f"Release {port_display} from '{auto_name}' to regain manual control."
@@ -528,7 +564,13 @@ async def _build_advance_conflict_response(
                 f"Ask me to release {port_display} from the '{auto_name}'"
                 " automation so you can control it manually."
             ),
-            "available": governing.get("enabled", False) or governing.get("run_state", False),
+            "available": not _is_legacy_11 and (
+                governing.get("enabled", False) or governing.get("run_state", False)
+            ),
+            **(
+                {"status": "not supported on this controller type"}
+                if _is_legacy_11 else {}
+            ),
         }
         opt2: dict = {
             "description": (
@@ -598,9 +640,19 @@ async def _build_advance_conflict_response(
                     + " What would you prefer?"
                 )
             else:
-                suggested_reply = suggested_reply.replace(
+                # Replace " Alternatively," with the power note; if not found (e.g. devType=11
+                # legacy message that doesn't mention " Alternatively,"), append the power note.
+                new_reply = suggested_reply.replace(
                     " Alternatively,", power_note_nospeed + " Alternatively,", 1
                 )
+                if new_reply == suggested_reply:
+                    suggested_reply = (
+                        suggested_reply.removesuffix(" What would you prefer?")
+                        + power_note_nospeed
+                        + " What would you prefer?"
+                    )
+                else:
+                    suggested_reply = new_reply
 
     elif not api_call_failed and has_active:
         # SUB-PATH B — active automations exist, but none has a bitmask covering this port.

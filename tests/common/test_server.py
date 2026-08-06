@@ -6511,13 +6511,58 @@ async def test_delete_advance_automation_auth_error(mock_client, caplog):
 # ============ break_out_of_automation ============
 
 async def test_break_out_not_advance_port(mock_client):
-    """Port not under automation (modeType != 15) → idempotent info response."""
+    """Port not under automation (modeType != 15) → idempotent info response.
+
+    On devType=11, break_out_of_automation also checks the automation list even when
+    modeType != 15. Explicitly set no active automations to verify the no-op path.
+    """
     mock_client.get_mode_settings.return_value = {"modeType": 3, "onSpead": 5}
+    mock_client.get_advance_automations.return_value = []  # no active automations
     result = await break_out_of_automation("C58ZA", port=1, dry_run=True)
     data = json.loads(result)
     assert "info" in data
     assert "not currently under automation" in data["info"]
-    mock_client.get_advance_automations.assert_not_called()
+
+
+async def test_break_out_devtype11_controller_wide_lock(mock_client):
+    """#236: On devType=11, get_mode_settings returns modeType != 15 for governed ports
+    (legacy firmware issue). break_out_of_automation must check the automation list and
+    return a clear controller-wide lock message instead of a misleading no-op."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["devType"] = 11  # ensure legacy-11 type
+    mock_client.get_devices.return_value = [device]
+    # get_mode_settings returns modeType != 15 (the legacy firmware bug)
+    mock_client.get_mode_settings.return_value = {"modeType": 3, "onSpead": 5}
+    # But active automations DO exist → controller-wide lock
+    _auto = copy.deepcopy(MOCK_ADVANCE_AUTOMATIONS_LIST[0])
+    _auto["isOn"] = 1
+    _auto["runState"] = 1
+    mock_client.get_advance_automations.return_value = [_auto]
+    result = await break_out_of_automation("C58ZA", port=1, dry_run=True)
+    data = json.loads(result)
+    assert "info" in data
+    # Must NOT return the misleading no-op
+    assert "not currently under automation control" not in data["info"]
+    # Must return the controller-wide lock message
+    assert (
+        "automations lock all ports" in data["info"]
+        or "disable_advance_automation" in data["info"]
+    )
+
+
+async def test_break_out_devtype11_no_active_automations(mock_client):
+    """#236: On devType=11 with no active automations → returns the normal no-op."""
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["devType"] = 11
+    mock_client.get_devices.return_value = [device]
+    mock_client.get_mode_settings.return_value = {"modeType": 3, "onSpead": 5}
+    mock_client.get_advance_automations.return_value = []  # no active automations
+    result = await break_out_of_automation("C58ZA", port=1, dry_run=True)
+    data = json.loads(result)
+    assert "info" in data
+    assert "not currently under automation control" in data["info"]
 
 
 @pytest.mark.asyncio
@@ -6532,6 +6577,9 @@ async def test_break_out_not_advance_port_default_name_no_redundancy(mock_client
     )
     mock_client.get_devices.return_value = [device]
     mock_client.get_mode_settings.return_value = {"modeType": 3, "onSpead": 0}
+    # No active automations — port is genuinely free (not in controller-wide lock state).
+    # This avoids triggering the devType=11 controller-wide-lock path.
+    mock_client.get_advance_automations.return_value = []
     result = await break_out_of_automation("C58ZA", port=7, dry_run=True)
     data = json.loads(result)
     assert "info" in data
@@ -7044,7 +7092,12 @@ async def test_conflict_response_option_1_is_break_out(mock_client):
 
     Port 4 is used because MOCK_ADVANCE_AUTOMATIONS_LIST has grouptDevType=8 (Port 4),
     so the bitmask lookup yields Sub-path A and 1_break_out is offered.
+    Uses devType=18 (not 11) so the normal per-port break-out path is available.
     """
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["devType"] = 18  # legacy-18: per-port break-out works normally
+    mock_client.get_devices.return_value = [device]
     mock_client.set_port_mode.side_effect = ACInfinityAdvanceConflictError("advance")
     mock_client.get_advance_automations.return_value = MOCK_ADVANCE_AUTOMATIONS_LIST
     result = await set_port_off("C58ZA", port=4, dry_run=False)
@@ -7074,10 +7127,17 @@ async def test_conflict_response_option_1_available_includes_run_state(
     automation but then mark opt1 as unavailable — preventing break_out_of_automation
     from being offered even though it would work.
 
+    Uses devType=18 so the normal per-port break-out path is available (devType=11
+    intentionally disables per-port break-out — tested separately in #236).
+
     Note: the all-disabled boundary guard
     (test_conflict_response_all_automations_disabled_uses_all_disabled_path) still relies
     on both isOn=0 and runState=0 — that test must continue to pass unchanged.
     """
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["devType"] = 18  # legacy-18: per-port break-out works normally
+    mock_client.get_devices.return_value = [device]
     mock_client.set_port_mode.side_effect = ACInfinityAdvanceConflictError("advance")
     automations = copy.deepcopy(MOCK_ADVANCE_AUTOMATIONS_LIST)
     # Mutate the first entry (Moderate Airflow group lead) to the desired state.
@@ -8044,7 +8104,12 @@ async def test_conflict_response_sub_path_a_break_out_offered(mock_client):
 
     Port 4 maps to grouptDevType=8 (advId=2179295, on_speed=1 in MOCK_ADVANCE_AUTOMATIONS_LIST).
     The conflict response should read speed=1, not speed=2 from port_groups[0].
+    Uses devType=18 so the normal per-port break-out path is available.
     """
+    import copy
+    device = copy.deepcopy(MOCK_DEVICE_LEGACY)
+    device["devType"] = 18  # legacy-18: per-port break-out works normally
+    mock_client.get_devices.return_value = [device]
     mock_client.set_port_mode.side_effect = ACInfinityAdvanceConflictError("advance")
     mock_client.get_advance_automations.return_value = MOCK_ADVANCE_AUTOMATIONS_LIST
     result = await set_port_off("C58ZA", port=4, dry_run=False)

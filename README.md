@@ -67,6 +67,10 @@
 | 🤖 **Advance Automation** | `update_automation_rule` | Edit one rule in place — change its window, speed, mode, or sensor targets (`dry_run=True` by default) |
 | 🤖 **Advance Automation** | `delete_automation_rule` | Remove a single rule from a program, leaving the rest intact (`dry_run=True` by default) |
 | 🤖 **Advance Automation** | `break_out_of_automation` | Safely break a port out of automation control and lock co-governed ports to manual speed (`dry_run=True` by default) |
+| 📊 **Analytics** | `compare_devices` | Compare live readings across multiple devices side-by-side |
+| 📊 **Analytics** | `get_scheduled_automations` | Weekly calendar view of all Advance Automation schedules for a device |
+| 📊 **Analytics** | `get_power_cost_report` | kWh consumption and estimated electricity cost over a date range |
+| ⚙️ **Port Status** | `list_device_alarms` | List alarm/alert configurations (threshold alarms, offline alerts) for a device |
 
 > ✦ All write tools (Write, Automation, and Intelligence categories) default to `dry_run=True` — they return the exact payload they *would* send without making any changes to your equipment. Pass `dry_run=False` only when you're ready to execute.
 
